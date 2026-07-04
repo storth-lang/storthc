@@ -1,0 +1,8 @@
+# The error handeling is done via return of -1.
+I still am too lazy to do perror style erroring to check for errors so later down the line we will infact change it but for now lemme be lazy.
+
+- Compiler
+
+This is a bit of a rough implementation in C to boot strap and self host the compiler.
+I will initaially only support linux. As windows C development is just hostile.
+
