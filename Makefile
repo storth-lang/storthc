@@ -1,6 +1,7 @@
 CC ?= cc
 
 CFLAGS := -std=c99 -Wall -Wextra -Wpedantic -fsanitize=address -g
+LDFLAGS:= -lm
 
 TARGET := bin/storthc
 
@@ -12,10 +13,10 @@ OBJ := $(patsubst src/%.c,obj/%.o,$(SRC))
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | bin
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 obj/%.o: src/%.c | obj
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ $(LDFLAGS)
 
 obj:
 	mkdir -p obj

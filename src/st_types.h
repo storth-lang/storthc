@@ -15,6 +15,8 @@ typedef uint64_t u64;
 typedef int64_t i64;
 typedef i32 b32;
 typedef i64 b64;
+typedef float f32;
+typedef double f64;
 
 #define ST_da_append(arr, item)                                         \
     do {                                                                \
@@ -28,7 +30,7 @@ typedef i64 b64;
         (arr)->items[(arr)->count++] = item;                            \
     } while(0)
 
-#define st_foreach(it, arr) \
+#define ST_foreach(it, arr) \
     for (u32 i = 0; i < (arr)->count; i++) \
         for (void *it = (void *)(arr)->items[i]; ; it = 0)
 
@@ -42,5 +44,11 @@ typedef i64 b64;
     } while (0)
 
 #define ST_unused(item) (void)(item)
+
+#define ST_todo(msg)                            \
+    do {                                        \
+        fprintf(stderr, "TODO: %s\n", msg);     \
+        abort();                                \
+} while(0)
 
 #endif
