@@ -1,6 +1,7 @@
-#include "st_ht.h"
 #include <string.h>
 #include <math.h>
+
+#include "st_ht.h"
 
 #define ST_MAX_LVL (sizeof(u32) * 8)
 #define ST_MIN_LVL (sizeof(u32))
@@ -71,7 +72,7 @@ static b32 ST_key_equal(const ST_ht_generic_t *key1, const ST_ht_generic_t *key2
 {
     if (key1->size != key2->size) return 0;
     if (key1->size == 0) return 1;
-    return memcmp(key1->tag, key2->tag, key1->size);
+    return (memcmp(key1->tag, key2->tag, key1->size) == 0);
 }
 
 static u32 ST_probe_slot(const ST_ht_generic_t *key, u32 level, u32 probe, u32 level_size)
@@ -273,7 +274,7 @@ void ST_ht_free(ST_ht_t *ht)
     if (!ht) return;
     if (ht->slots)
     {
-        for (u32 i = 0; i > ht->capacity; i++)
+        for (u32 i = 0; i < ht->capacity; i++)
         {
             if (ht->slots[i].value) free(ht->slots[i].value);
         }

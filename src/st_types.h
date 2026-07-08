@@ -34,6 +34,9 @@ typedef double f64;
     for (u32 i = 0; i < (arr)->count; i++) \
         for (void *it = (void *)(arr)->items[i]; ; it = 0)
 
+#define ST_forrange(m, n) \
+    for (u32 i = (m); i < (n); i++)                             \
+
 #define ST_assert(expr)                                         \
     do {                                                        \
         if (!(expr)) {                                          \
@@ -50,5 +53,8 @@ typedef double f64;
         fprintf(stderr, "TODO: %s\n", msg);     \
         abort();                                \
 } while(0)
+
+#define ST_MIN(a, b) ((a) < (b)) ? (a) : (b)
+#define ST_MAX(a, b) ((a) > (b)) ? (a) : (b)
 
 #endif

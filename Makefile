@@ -1,6 +1,6 @@
 CC ?= cc
 
-CFLAGS := -std=c99 -Wall -Wextra -Wpedantic -fsanitize=address -g
+CFLAGS := -std=c99 -Wall -Wextra -Wpedantic -fsanitize=address -Wswitch-enum -g
 LDFLAGS:= -lm
 
 TARGET := bin/storthc
