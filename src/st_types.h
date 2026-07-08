@@ -5,6 +5,18 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#define ST_COLOR_BOLD      "\x1b[1m"
+#define ST_COLOR_RED       "\x1b[31m"
+#define ST_COLOR_BLUE      "\x1b[34m"
+#define ST_COLOR_CYAN      "\x1b[36m"
+#define ST_COLOR_YELLOW    "\x1b[33m"
+#define ST_COLOR_RESET     "\x1b[0m"
+#define ST_COLOR_DIM       "\x1b[2m"
+#define ST_COLOR_WHITE     "\x1b[97m"
+#define ST_COLOR_GREY      "\x1b[90m"
+#define ST_COLOR_BOLD_RED  "\x1b[1m\x1b[31m"
+
+
 typedef uint8_t u8;
 typedef int8_t i8;
 typedef uint16_t u16;
@@ -32,7 +44,7 @@ typedef double f64;
 
 #define ST_foreach(it, arr) \
     for (u32 i = 0; i < (arr)->count; i++) \
-        for (void *it = (void *)(arr)->items[i]; ; it = 0)
+        for (void *it = (void *)(arr)->items[i]; it; it = 0)
 
 #define ST_forrange(m, n) \
     for (u32 i = (m); i < (n); i++)
