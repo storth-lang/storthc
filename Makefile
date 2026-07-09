@@ -1,28 +1,32 @@
 CC ?= cc
 
-CFLAGS := -std=c99 -Wall -Wextra -Wpedantic -fsanitize=address -Wswitch-enum -g
-LDFLAGS:= -lm
+SRCROOT := src
+OBJROOT := obj
+BINDIR := bin
 
-TARGET := bin/storthc
+CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wpedantic -fsanitize=address -Wswitch-enum -Warray-bounds=2 -g
+LDLIBS := -lm
+TARGET := $(BINDIR)/storthc
 
-SRC := $(wildcard src/*.c)
-OBJ := $(patsubst src/%.c,obj/%.o,$(SRC))
+SRC := $(shell find $(SRCROOT) -name '*.c')
+OBJ := $(patsubst $(SRCROOT)/%.c,$(OBJROOT)/%.o,$(SRC))
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ) | bin
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJ) | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
-obj/%.o: src/%.c | obj
-	$(CC) $(CFLAGS) -c $< -o $@ $(LDFLAGS)
+$(OBJROOT)/%.o: $(SRCROOT)/%.c | $(OBJROOT)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-obj:
-	mkdir -p obj
+$(BINDIR):
+	mkdir -p $(BINDIR)
 
-bin:
-	mkdir -p bin
+$(OBJROOT):
+	mkdir -p $(OBJROOT)
 
 clean:
-	rm -rf obj bin
+	rm -rf $(OBJROOT) $(BINDIR)

@@ -1,31 +1,21 @@
-#import "Io"
-#import "String"
-#import "Json"
-
-struct Person
-{
-    name: string,
-    age: i32,
-    score: f64,
-    admin: bool,
-    langs: [..]any,
+struct Foo {
+    f: u32;
+    g: string;
 }
 
 fn main() -> i32 {
-    var := 444 
-    xs := type_of(var)
-    println("{}", xs)
-
-    src := "{ \"name\": \"Ada Lovelace\", \"age\": 36, \"score\": 99.5, \"admin\": true, \"langs\": [ \"Ada\", \"Urmom\", 30, true, null] }"
-    root, ok := json_parse(src);
-    if !ok {
-        json_report();
-        return 1
+    if "urmom" {
+        case "Test": { println("Hello"); }
+        case "Foo": { println("Hello"); }
     }
-    p : Person;
-    println("{}", p)
-    p = json_into(p, root)
-    println("{}", p)
-    // dump_node(root)
-    return 0
+    f := 20;
+    f++;
+    f := Foo{30, "Urmom"};
+    foo();
+    return 0;
+}
+
+fn foo() -> u32 {
+    xs := 20 + 20;
+    return xs;
 }

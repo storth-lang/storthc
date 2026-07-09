@@ -3,7 +3,7 @@
 
 #include "st_arena.h"
 
-#define ST_DEFAULT_CHUNK_SIZE (1024 * 4)
+#define ST_DEFAULT_CHUNK_SIZE 4096
 #define ST_is_allign(x, y) ((x & (y - 1)) == 0)
 
 static u64 ST_allign_mem(u64 pos, u64 size)
