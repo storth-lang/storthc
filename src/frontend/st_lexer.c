@@ -93,46 +93,46 @@ static char ST_lx_peek_char_n(ST_lexer_t *l, u32 n)
     return l->pos + n < l->src.len ? (char)l->src.data[l->pos + n] : 0;
 }
 
-static b32 ST_isdigit(char c)
+static b8 ST_isdigit(char c)
 {
     return c >= '0' && c <= '9';
 }
 
-static b32 ST_ishex(char c)
+static b8 ST_ishex(char c)
 {
     return ST_isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-static b32 ST_isalpha(char c)
+static b8 ST_isalpha(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
-static b32 ST_isident(char c)
+static b8 ST_isident(char c)
 {
     return ST_isalpha(c) || ST_isdigit(c);
 }
 
-b32 ST_iswhitespace(char c)
+b8 ST_iswhitespace(char c)
 {
     static char buf[] = { '\r', '\n', '\t', ' ' };
     ST_forrange(0, sizeof(buf))  if (c == buf[i]) return 1;
     return 0;
 }
 
-b32 ST_is_keyword(ST_string_t s)
+b8 ST_is_keyword(ST_string_t s)
 {
     ST_forrange(0, ST_KEYWORD_COUNT) if (ST_string_eq_cstr(s, ST_keyword_names[i])) return 1;
     return 0;
 }
 
-b32 ST_is_primitive(ST_string_t s)
+b8 ST_is_primitive(ST_string_t s)
 {
    ST_forrange(0, ST_TYPE_COUNT) if (ST_string_eq_cstr(s, ST_type_names[i])) return 1;
    return 0;
 }
 
-b32 ST_is_symbol(ST_string_t s)
+b8 ST_is_symbol(ST_string_t s)
 {
     if (s.len == 1)
     {
@@ -140,7 +140,7 @@ b32 ST_is_symbol(ST_string_t s)
             if ((char)s.data[0] == ST_single_symbols[i]) return 1;
         return 0;
     }
-    ST_forrange(0, sizeof(ST_multi_symbols) / sizeof(*ST_multi_symbols))
+    ST_forrange(0, ST_array_len(ST_multi_symbols))
         if (ST_string_eq_cstr(s, ST_multi_symbols[i])) return 1;
     return 0;
 }
@@ -211,7 +211,7 @@ static void ST_lx_skip_line(ST_lexer_t *l)
         ST_lx_advance_char(l);
 }
 
-static b32 ST_lx_skip_block_comment(ST_lexer_t *l)
+static b8 ST_lx_skip_block_comment(ST_lexer_t *l)
 {
     u32 line = l->line, col = l->col, pos = l->pos;
     ST_lx_advance_char(l);
@@ -246,7 +246,7 @@ static b32 ST_lx_skip_block_comment(ST_lexer_t *l)
     return 1;
 }
 
-static b32 ST_lx_escape(ST_lexer_t *l, ST_sb_t *sb, u32 line, u32 col, u32 pos)
+static b8 ST_lx_escape(ST_lexer_t *l, ST_sb_t *sb, u32 line, u32 col, u32 pos)
 {
     char e = ST_lx_advance_char(l);
     switch (e)
@@ -279,7 +279,7 @@ static b32 ST_lx_escape(ST_lexer_t *l, ST_sb_t *sb, u32 line, u32 col, u32 pos)
     }
 }
 
-static b32 ST_lx_string(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_string(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
     ST_lx_advance_char(l);
@@ -316,7 +316,7 @@ static b32 ST_lx_string(ST_lexer_t *l, ST_token_t *t)
     return 1;
 }
 
-static b32 ST_lx_char(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_char(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
     ST_lx_advance_char(l);
@@ -362,12 +362,12 @@ static b32 ST_lx_char(ST_lexer_t *l, ST_token_t *t)
     return 1;
 }
 
-static b32 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
     char buf[128];
     u32 n = 0;
-    b32 is_float = 0;
+    b8 is_float = 0;
 
     char c = ST_lx_peek_char(l);
     char c2 = ST_lx_peek_char_n(l, 1);
@@ -467,7 +467,7 @@ static b32 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
     return 1;
 }
 
-static b32 ST_lx_ident(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_ident(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
     while (ST_isident(ST_lx_peek_char(l))) ST_lx_advance_char(l);
@@ -482,7 +482,7 @@ static b32 ST_lx_ident(ST_lexer_t *l, ST_token_t *t)
     return 1;
 }
 
-static b32 ST_lx_doc_comment(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_doc_comment(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
     ST_lx_advance_char(l);
@@ -501,7 +501,7 @@ static b32 ST_lx_doc_comment(ST_lexer_t *l, ST_token_t *t)
     return 1;
 }
 
-static b32 ST_lx_symbol(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_symbol(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
 
@@ -516,7 +516,7 @@ static b32 ST_lx_symbol(ST_lexer_t *l, ST_token_t *t)
         return 1;
     }
 
-    ST_forrange(0, sizeof(ST_multi_symbols) / sizeof(*ST_multi_symbols))
+    ST_forrange(0, ST_array_len(ST_multi_symbols))
     {
         u32 len = (u32)strlen(ST_multi_symbols[i]);
         if (l->pos + len <= l->src.len &&
@@ -547,7 +547,7 @@ static b32 ST_lx_symbol(ST_lexer_t *l, ST_token_t *t)
     return 0;
 }
 
-static b32 ST_lx_next(ST_lexer_t *l, ST_token_t *t)
+static b8 ST_lx_next(ST_lexer_t *l, ST_token_t *t)
 {
     for (;;)
     {

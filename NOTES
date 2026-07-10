@@ -1,11 +1,28 @@
 # The error handeling is done via return of -1.
 I still am too lazy to do perror style erroring to check for errors so later down the line we will infact change it but for now lemme be lazy.
 
-- Compiler
+# Compiler
 
 This is a bit of a rough implementation in C to boot strap and self host the compiler.
 I will initaially only support linux. As windows C development is just hostile.
 
+# So far
+ - We got basic semantics working on the analyzer meaning we can just work on type checker when we do reflections.
+
+date: Thu Jul  9 21:31:17 2026
+ - Type checker is done smh. However the semantic analyzer does not adopt the type saftey from the type checker meaning that it is fully not merged how ever since the type checker is done for a fact we can merge it together.
+ - I will start on the semnatic analyzer to migrate it from the unchecked typed to the checked type.
+
 # Fixes
 
 - Use b8 as a return range instead of b32.
+
+# Bugs:
+
+- Right now to make things a bit easier I do not support compile time directives. I want to finish the semantic analysis first with a much better error description. With that it is easy to do a bunch of architecture ontop of it. More on the semantic analysis so that unterminated default case instead of it getting recognized as a declaration it should error out with unterminated if - case.
+
+- Work on type checker. Meaning type reflection info The type reflection should have an intrinsic type_info struct that is castable by the user at compile time so that they could do manipluation of the type information that we will recieve.
+
+- Work on SSA IR we have no intermediate representations yet.
+
+

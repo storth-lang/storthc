@@ -19,7 +19,7 @@ typedef struct
     u32 no_struct_lit;
 } ST_parser_t;
 
-b32 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src,
+b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src,
              ST_string_t file, ST_program_t *out);
 
 #endif

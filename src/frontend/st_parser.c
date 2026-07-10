@@ -11,33 +11,33 @@ static ST_token_t *ST_tok_at(ST_parser_t *p, u32 i)
 static ST_token_t *ST_peek(ST_parser_t *p)  { return ST_tok_at(p, p->pos); }
 static ST_token_t *ST_peek2(ST_parser_t *p) { return ST_tok_at(p, p->pos + 1); }
 
-static b32 ST_tok_is_symbol(ST_token_t *t, const char *s)
+static b8 ST_tok_is_symbol(ST_token_t *t, const char *s)
 {
     return t && t->kind == ST_TSYMBOL && ST_string_eq_cstr(t->text, s);
 }
 
-static b32 ST_tok_is_keyword(ST_token_t *t, const char *s)
+static b8 ST_tok_is_keyword(ST_token_t *t, const char *s)
 {
     return t && t->kind == ST_TKEYWORD && ST_string_eq_cstr(t->text, s);
 }
 
-static b32 ST_tok_is_ident(ST_token_t *t) { return t && t->kind == ST_TIDENT; }
+static b8 ST_tok_is_ident(ST_token_t *t) { return t && t->kind == ST_TIDENT; }
 
-static b32 ST_at_symbol(ST_parser_t *p, const char *s)
+static b8 ST_at_symbol(ST_parser_t *p, const char *s)
 {
     return ST_tok_is_symbol(ST_peek(p), s);
 }
 
-static b32 ST_at_keyword(ST_parser_t *p, const char *s)
+static b8 ST_at_keyword(ST_parser_t *p, const char *s)
 {
     return ST_tok_is_keyword(ST_peek(p), s);
 }
 
-static b32 ST_tok_is_compound_assign(ST_token_t *t)
+static b8 ST_tok_is_compound_assign(ST_token_t *t)
 {
     static const char *ops[] = { "+=","-=","*=","/=","%=","&=","|=","^=","<<=",">>=" };
     if (!t || t->kind != ST_TSYMBOL) return 0;
-    ST_forrange(0, sizeof(ops) / sizeof(*ops))
+    ST_forrange(0, ST_array_len(ops))
         if (ST_string_eq_cstr(t->text, ops[i])) return 1;
     return 0;
 }
@@ -160,7 +160,7 @@ static void ST_sync_decl(ST_parser_t *p)
     }
 }
 
-static b32 ST_expect_sym(ST_parser_t *p, const char *s)
+static b8 ST_expect_sym(ST_parser_t *p, const char *s)
 {
     if (ST_at_symbol(p, s))
     {
@@ -177,7 +177,7 @@ static b32 ST_expect_sym(ST_parser_t *p, const char *s)
     return 0;
 }
 
-static b32 ST_expect_semi(ST_parser_t *p)
+static b8 ST_expect_semi(ST_parser_t *p)
 {
     if (ST_at_symbol(p, ";"))
     {
@@ -205,7 +205,7 @@ static ST_string_t ST_expect_ident(ST_parser_t *p, const char *what)
 
 static ST_expr_t *ST_parse_expr(ST_parser_t *p);
 static ST_stmt_t *ST_parse_stmt(ST_parser_t *p);
-static b32 ST_parse_body(ST_parser_t *p, ST_stmts_t *out);
+static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out);
 
 static ST_tyexpr_t *ST_parse_type(ST_parser_t *p)
 {
@@ -293,7 +293,7 @@ static ST_expr_t *ST_parse_struct_lit(ST_parser_t *p, ST_string_t type_name,
     return e;
 }
 
-static b32 ST_parse_call_args(ST_parser_t *p, ST_args_t *out)
+static b8 ST_parse_call_args(ST_parser_t *p, ST_args_t *out)
 {
     while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens)
     {
@@ -375,7 +375,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p)
         || (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "align_of")
             && ST_tok_is_symbol(ST_peek2(p), "(")))
     {
-        b32 is_align = ST_tok_is_ident(t);
+        b8 is_align = ST_tok_is_ident(t);
         p->pos++;
         if (!ST_expect_sym(p, "(")) return NULL;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_SIZEOF, t->line, t->col);
@@ -422,7 +422,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p)
     if (ST_tok_is_ident(t) && ST_tok_is_symbol(ST_peek2(p), "(")
         && (ST_string_eq_cstr(t->text, "kind") || ST_string_eq_cstr(t->text, "cstr")))
     {
-        b32 is_kind = ST_string_eq_cstr(t->text, "kind");
+        b8 is_kind = ST_string_eq_cstr(t->text, "kind");
         p->pos += 2;
         ST_expr_t *e = ST_expr_new(p->arena, is_kind ? ST_EX_KIND : ST_EX_CSTR,
                                    t->line, t->col);
@@ -505,7 +505,7 @@ static ST_expr_t *ST_parse_postfix(ST_parser_t *p)
             c->call.callee = e;
             u32 save = p->no_struct_lit;
             p->no_struct_lit = 0;
-            b32 ok = ST_parse_call_args(p, &c->call.args);
+            b8 ok = ST_parse_call_args(p, &c->call.args);
             p->no_struct_lit = save;
             if (!ok) return NULL;
             e = c;
@@ -566,7 +566,7 @@ static const ST_prec_level_t ST_prec[] = {
     { { "*", "/", "%" } },
 };
 
-#define ST_N_PREC (sizeof(ST_prec) / sizeof(*ST_prec))
+#define ST_N_PREC ST_array_len(ST_prec)
 
 static const char *ST_match_binop(ST_parser_t *p, u32 level)
 {
@@ -575,7 +575,7 @@ static const char *ST_match_binop(ST_parser_t *p, u32 level)
     for (u32 k = 0; ST_prec[level].ops[k]; k++)
     {
         const char *op = ST_prec[level].ops[k];
-        b32 is_word = (op[0] >= 'a' && op[0] <= 'z');
+        b8 is_word = (op[0] >= 'a' && op[0] <= 'z');
         if (is_word ? ST_tok_is_keyword(t, op) : ST_tok_is_symbol(t, op))
             return op[0] == 'o' && op[1] == 'r' ? "||"
                  : is_word && op[0] == 'a' ? "&&"
@@ -631,7 +631,7 @@ static ST_expr_t *ST_parse_cond(ST_parser_t *p)
     return e;
 }
 
-static b32 ST_is_lvalue(ST_expr_t *e)
+static b8 ST_is_lvalue(ST_expr_t *e)
 {
     switch (e->kind)
     {
@@ -682,8 +682,8 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p)
         {
             if (ST_at_symbol(p, ";")) { p->pos++; continue; }
             ST_token_t *ct = ST_peek(p);
-            b32 is_case = ST_tok_is_keyword(ct, "case");
-            b32 is_default = ST_tok_is_keyword(ct, "default");
+            b8 is_case = ST_tok_is_keyword(ct, "case");
+            b8 is_default = ST_tok_is_keyword(ct, "default");
             if (!is_case && !is_default)
             {
                 ST_perr(p, ct->line, ct->col,
@@ -749,7 +749,7 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p)
 
     if (ST_at_symbol(p, "..") || ST_at_symbol(p, "..="))
     {
-        b32 inclusive = ST_at_symbol(p, "..=");
+        b8 inclusive = ST_at_symbol(p, "..=");
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_FOR_RANGE, t->line, t->col);
         s->for_range.iter = iter;
@@ -933,7 +933,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
 
     if (ST_tok_is_keyword(t, "break") || ST_tok_is_keyword(t, "continue"))
     {
-        b32 is_break = ST_tok_is_keyword(t, "break");
+        b8 is_break = ST_tok_is_keyword(t, "break");
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena,
             is_break ? ST_ST_BREAK : ST_ST_CONTINUE, t->line, t->col);
@@ -943,7 +943,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
 
     if (ST_tok_is_keyword(t, "label") || ST_tok_is_keyword(t, "godown"))
     {
-        b32 is_label = ST_tok_is_keyword(t, "label");
+        b8 is_label = ST_tok_is_keyword(t, "label");
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena,
             is_label ? ST_ST_LABEL : ST_ST_GODOWN, t->line, t->col);
@@ -974,7 +974,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
         if (ST_tok_is_symbol(t2, ","))
         {
             u32 scan = p->pos;
-            b32 is_multi = 0;
+            b8 is_multi = 0;
             while (scan < p->n_tokens)
             {
                 if (!ST_tok_is_ident(ST_tok_at(p, scan))) break;
@@ -999,7 +999,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
     if (!e) return NULL;
 
     ST_token_t *op = ST_peek(p);
-    b32 plain = ST_tok_is_symbol(op, "=") && !ST_tok_is_symbol(ST_peek2(p), "=");
+    b8 plain = ST_tok_is_symbol(op, "=") && !ST_tok_is_symbol(ST_peek2(p), "=");
     if (plain || ST_tok_is_compound_assign(op))
     {
         if (!ST_is_lvalue(e))
@@ -1029,7 +1029,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
                     ST_sv_args(op->text));
             return NULL;
         }
-        b32 inc = ST_tok_is_symbol(op, "++");
+        b8 inc = ST_tok_is_symbol(op, "++");
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_ASSIGN, op->line, op->col);
         s->assign.lhs = e;
@@ -1047,7 +1047,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p)
     return s;
 }
 
-static b32 ST_parse_body(ST_parser_t *p, ST_stmts_t *out)
+static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out)
 {
     while (p->pos < p->n_tokens && !ST_at_symbol(p, "}"))
     {
@@ -1066,7 +1066,7 @@ static b32 ST_parse_body(ST_parser_t *p, ST_stmts_t *out)
 static ST_decl_t *ST_parse_struct_decl(ST_parser_t *p, ST_string_t name,
                                        u32 line, u32 col);
 
-static b32 ST_parse_struct_fields(ST_parser_t *p, ST_field_specs_t *out)
+static b8 ST_parse_struct_fields(ST_parser_t *p, ST_field_specs_t *out)
 {
     while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens)
     {
@@ -1115,7 +1115,7 @@ static ST_decl_t *ST_parse_struct_decl(ST_parser_t *p, ST_string_t name,
     return d;
 }
 
-static ST_decl_t *ST_parse_enum_decl(ST_parser_t *p, b32 is_flag,
+static ST_decl_t *ST_parse_enum_decl(ST_parser_t *p, b8 is_flag,
                                      u32 line, u32 col)
 {
     ST_decl_t *d = ST_decl_new(p->arena, ST_DE_ENUM, line, col);
@@ -1168,7 +1168,7 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col)
     return d;
 }
 
-static b32 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b32 is_extern)
+static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern)
 {
     if (!ST_expect_sym(p, "(")) return 0;
     while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens)
@@ -1257,7 +1257,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p)
 {
     ST_token_t *t = ST_peek(p);
     if (!t) return NULL;
-    b32 is_pub = 0;
+    b8 is_pub = 0;
     if (ST_tok_is_keyword(t, "pub"))
     {
         is_pub = 1;
@@ -1281,7 +1281,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p)
     }
     if (ST_tok_is_keyword(t, "enum") || ST_tok_is_keyword(t, "enum_flag"))
     {
-        b32 is_flag = ST_tok_is_keyword(t, "enum_flag");
+        b8 is_flag = ST_tok_is_keyword(t, "enum_flag");
         p->pos++;
         ST_decl_t *d = ST_parse_enum_decl(p, is_flag, t->line, t->col);
         if (d) d->is_pub = is_pub;
@@ -1390,7 +1390,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p)
     return NULL;
 }
 
-b32 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src,
+b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src,
              ST_string_t file, ST_program_t *out)
 {
     ST_parser_t parser = {0};
