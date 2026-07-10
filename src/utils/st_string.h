@@ -1,7 +1,7 @@
 #ifndef ST_STRING_H
 #define ST_STRING_H
 
-#include "st_types.h"
+#include "st_helper.h"
 #include "st_arena.h"
 
 #define ST_sv_fmt "%.*s"

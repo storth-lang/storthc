@@ -1,6 +1,6 @@
 #include "st_lexer.h"
-#include "st_types.h"
-#include "st_string.h"
+#include "../utils/st_types.h"
+#include "../utils/st_string.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -74,10 +74,10 @@ static char ST_lx_advance_char(ST_lexer_t *l)
     if (l->pos >= l->src.len) return 0;
     char c = (char)l->src.data[l->pos++];
     if (c == '\n') {
-        l->line += 1;
+        l->line++;
         l->col = 1;
     } else {
-        l->col += 1;
+        l->col++;
     }
 
     return c;
@@ -88,9 +88,9 @@ static char ST_lx_peek_char(ST_lexer_t *l)
     return l->pos < l->src.len ? (char)l->src.data[l->pos] : 0;
 }
 
-static char ST_lx_peek_char2(ST_lexer_t *l)
+static char ST_lx_peek_char_n(ST_lexer_t *l, u32 n)
 {
-    return l->pos + 1 < l->src.len ? (char)l->src.data[l->pos + 1] : 0;
+    return l->pos + n < l->src.len ? (char)l->src.data[l->pos + n] : 0;
 }
 
 static b32 ST_isdigit(char c)
@@ -220,7 +220,7 @@ static b32 ST_lx_skip_block_comment(ST_lexer_t *l)
     while (l->pos < l->src.len && depth > 0)
     {
         char c = ST_lx_peek_char(l);
-        char c2 = ST_lx_peek_char2(l);
+        char c2 = ST_lx_peek_char_n(l, 1);
         if (c == '/' && c2 == '*')
         {
             depth++;
@@ -261,7 +261,7 @@ static b32 ST_lx_escape(ST_lexer_t *l, ST_sb_t *sb, u32 line, u32 col, u32 pos)
     case '"':  ST_sb_char_push(sb, '"');  return 1;
     case 'x': {
         char h1 = ST_lx_peek_char(l);
-        char h2 = ST_lx_peek_char2(l);
+        char h2 = ST_lx_peek_char_n(l, 1);
         if (!ST_ishex(h1) || !ST_ishex(h2))
         {
             ST_lx_error(l, line, col, pos, "invalid hex escape, expected \\xNN");
@@ -370,7 +370,7 @@ static b32 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
     b32 is_float = 0;
 
     char c = ST_lx_peek_char(l);
-    char c2 = ST_lx_peek_char2(l);
+    char c2 = ST_lx_peek_char_n(l, 1);
 
     if (c == '0' && (c2 == 'x' || c2 == 'X'))
     {
@@ -413,7 +413,7 @@ static b32 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
             char d = ST_lx_advance_char(l);
             if (d != '_' && n < sizeof(buf) - 1) buf[n++] = d;
         }
-        if (ST_lx_peek_char(l) == '.' && ST_isdigit(ST_lx_peek_char2(l)))
+        if (ST_lx_peek_char(l) == '.' && ST_isdigit(ST_lx_peek_char_n(l, 1)))
         {
             is_float = 1;
             if (n < sizeof(buf) - 1) buf[n++] = ST_lx_advance_char(l);
@@ -426,7 +426,7 @@ static b32 ST_lx_number(ST_lexer_t *l, ST_token_t *t)
         char e = ST_lx_peek_char(l);
         if (e == 'e' || e == 'E')
         {
-            char sign = ST_lx_peek_char2(l);
+            char sign = ST_lx_peek_char_n(l, 1);
             u32 save_pos = l->pos, save_line = l->line, save_col = l->col;
             if (n < sizeof(buf) - 1) buf[n++] = ST_lx_advance_char(l);
             if (sign == '+' || sign == '-')
@@ -505,7 +505,7 @@ static b32 ST_lx_symbol(ST_lexer_t *l, ST_token_t *t)
 {
     u32 line = l->line, col = l->col, start = l->pos;
 
-    if (ST_lx_peek_char(l) == '#' && ST_isalpha(ST_lx_peek_char2(l)))
+    if (ST_lx_peek_char(l) == '#' && ST_isalpha(ST_lx_peek_char_n(l, 1)))
     {
         ST_lx_advance_char(l);
         while (ST_isident(ST_lx_peek_char(l))) ST_lx_advance_char(l);
@@ -555,8 +555,8 @@ static b32 ST_lx_next(ST_lexer_t *l, ST_token_t *t)
             ST_lx_advance_char(l);
         if (l->pos >= l->src.len) return 0;
 
-        char c = ST_lx_peek_char(l);
-        char c2 = ST_lx_peek_char2(l);
+        char c  = ST_lx_peek_char(l);
+        char c2 = ST_lx_peek_char_n(l, 1);
 
         memset(t, 0, sizeof(*t));
         t->file = l->file;

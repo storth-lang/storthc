@@ -2,7 +2,7 @@
 #define ST_HT_H
 
 // NOTE: Paper used for this hash table: https://arxiv.org/pdf/2501.02305
-#include "st_types.h"
+#include "st_helper.h"
 #include "st_arena.h"
 
 typedef struct

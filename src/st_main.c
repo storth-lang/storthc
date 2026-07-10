@@ -1,6 +1,8 @@
-#include "st_types.h"
-#include "st_string.h"
-#include "st_lexer.h"
+#include "./utils/st_types.h"
+#include "./utils/st_string.h"
+#include "./frontend/st_lexer.h"
+#include "./frontend/st_ast.h"
+#include "./frontend/st_parser.h"
 
 int main(int argc, char **argv)
 {
@@ -21,9 +23,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ST_dump_token(tokens);
+    ST_program_t prog = {0};
+    b32 ok = ST_parse(arena, tokens, sv, ST_abs_path(arena, path), &prog);
+    if (ok) ST_dump_program(stdout, &prog);
 
     free(tokens.items);
     ST_arena_free(arena);
-    return 0;
+    return ok ? 0 : 1;
 }
