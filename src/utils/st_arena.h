@@ -3,7 +3,7 @@
 
 #include <string.h>
 
-#include "st_helper.h"
+#include "./st_helper.h"
 
 typedef struct ST_arena_chunk_t ST_arena_chunk_t;
 

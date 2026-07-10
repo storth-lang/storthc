@@ -71,7 +71,7 @@ static u64 ST_fnv1a(const void *data, u32 len, u64 seed)
     return h;
 }
 
-static b32 ST_key_equal(const ST_ht_generic_t *key1, const ST_ht_generic_t *key2)
+static b8 ST_key_equal(const ST_ht_generic_t *key1, const ST_ht_generic_t *key2)
 {
     if (key1->size != key2->size) return 0;
     if (key1->size == 0) return 1;
@@ -157,7 +157,7 @@ static u32 st_count_free(ST_ht_t *ht, ST_level_t lvl)
     return free_count;
 }
 
-static b32 st_try_place(ST_ht_t *ht, ST_level_t lvl, ST_ht_generic_t *key, ST_ht_generic_t value, u32 level_index, u32 budget)
+static b8 st_try_place(ST_ht_t *ht, ST_level_t lvl, ST_ht_generic_t *key, ST_ht_generic_t value, u32 level_index, u32 budget)
 {
     if (budget > lvl.size) budget = lvl.size;
 

@@ -1,21 +1,19 @@
 struct Foo {
     f: u32;
-    g: string;
+    g: i32;
 }
 
-fn main() -> i32 {
+fn foo() -> (i32, string) {
     if "urmom" {
         case "Test": { println("Hello"); }
         case "Foo": { println("Hello"); }
     }
     f := 20;
     f++;
-    f := Foo{30, "Urmom"};
-    foo();
-    return 0;
+    return 0, "string";
 }
 
-fn foo() -> u32 {
-    xs := 20 + 20;
-    return xs;
+fn main() -> i32 {
+    x, y := foo();
+    return 0;
 }

@@ -37,7 +37,7 @@ typedef struct
 
     ST_token_t *items;
     u32 count, capacity;
-    b32 ok;
+    b8 ok;
 } ST_tokens_t;
 
 typedef struct
@@ -47,7 +47,7 @@ typedef struct
     ST_string_t src;
     ST_string_t file;
     u32 pos, line, col;
-    b32 failed;
+    b8 failed;
 } ST_lexer_t;
 
 ST_string_t ST_token_kind_to_string(ST_token_kind_t kind);
@@ -56,10 +56,10 @@ void ST_token_error(ST_string_t src);
 ST_token_t ST_lexer_advance(ST_lexer_t *l);
 ST_token_t ST_lexer_peek(ST_lexer_t *l);
 
-b32 ST_iswhitespace(char c);
-b32 ST_is_primitive(ST_string_t s);
-b32 ST_is_keyword(ST_string_t s);
-b32 ST_is_symbol(ST_string_t s);
+b8 ST_iswhitespace(char c);
+b8 ST_is_primitive(ST_string_t s);
+b8 ST_is_keyword(ST_string_t s);
+b8 ST_is_symbol(ST_string_t s);
 
 ST_tokens_t ST_lex(ST_arena_t *arena, ST_string_t src, ST_string_t file);
 ST_string_t ST_lexer_error(ST_string_t src, u32 col, u32 pos);

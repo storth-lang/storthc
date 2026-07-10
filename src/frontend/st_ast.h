@@ -119,7 +119,7 @@ struct ST_expr_t
         struct {
             ST_tyexpr_t *te;
             ST_expr_t *operand;
-            b32 is_align;
+            b8 is_align;
         } tyop;
     };
 };
@@ -164,7 +164,7 @@ struct ST_stmt_t
             ST_string_t name;
             ST_tyexpr_t *te;
             ST_expr_t *init;
-            b32 is_static;
+            b8 is_static;
         } decl;
         struct {
             ST_expr_t *lhs;
@@ -175,7 +175,7 @@ struct ST_stmt_t
             ST_string_t *names;
             u32 n_names;
             ST_exprs_t values;
-            b32 declare;
+            b8 declare;
         } multi;
         struct {
             ST_expr_t *cond;
@@ -193,7 +193,7 @@ struct ST_stmt_t
         struct {
             ST_string_t iter;
             ST_expr_t *lo, *hi;
-            b32 inclusive;
+            b8 inclusive;
             ST_stmts_t body;
         } for_range;
         struct {
@@ -263,15 +263,15 @@ typedef struct
 {
     ST_params_t params;
     ST_tyexprs_t rets;
-    b32 has_ret_ann;
-    b32 is_variadic;
+    b8 has_ret_ann;
+    b8 is_variadic;
 } ST_fn_sig_t;
 
 struct ST_decl_t
 {
     ST_decl_kind_t kind;
     ST_string_t name;
-    b32 is_pub;
+    b8 is_pub;
     u32 line, col;
     union {
         struct {
@@ -279,7 +279,7 @@ struct ST_decl_t
             ST_field_specs_t fields;
         } struct_;
         struct {
-            b32 is_flag;
+            b8 is_flag;
             ST_variant_specs_t variants;
         } enum_;
         struct {
@@ -297,7 +297,7 @@ struct ST_decl_t
         struct {
             ST_fn_sig_t sig;
             ST_stmts_t body;
-            b32 is_prototype;
+            b8 is_prototype;
         } fn;
     };
 };
