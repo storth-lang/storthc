@@ -4,6 +4,7 @@ static ST_ty_t *ST_ty_alloc(ST_ty_ctx_t *ctx, ST_ty_kind_t kind, u32 width, u32 
 {
     ST_ty_t *t = ST_arena_push_zeroed(ctx->arena, sizeof(*t));
     t->kind = kind;
+    t->size = width;
     t->width = width;
     t->align = align;
     return t;
@@ -21,7 +22,7 @@ static ST_ty_t *ST_ty_int(ST_ty_ctx_t *ctx, u32 width, b8 is_signed)
 static ST_ty_t *ST_ty_float(ST_ty_ctx_t *ctx, u32 width)
 {
     u32 size  = width / 8;
-    ST_ty_t *t = ST_ty_alloc(ctx, ST_TY_INT, size, size);
+    ST_ty_t *t = ST_ty_alloc(ctx, ST_TY_FLOAT, size, size);
     t->width = width;
     return t;
 }
@@ -120,8 +121,8 @@ ST_ty_t *ST_ty_ptr(ST_ty_ctx_t *ctx, ST_ty_t *inner)
 ST_ty_t *ST_ty_array(ST_ty_ctx_t *ctx, ST_ty_t *inner, u64 count)
 {
     u32 align = inner->align ? inner->align : 1;
-    return ST_ty_intern(ctx, ST_TY_ARRAY, inner,
-                        (u32)(inner->size * count), 8, align);
+    return ST_ty_intern(ctx, ST_TY_ARRAY, inner, count,
+                        (u32)(inner->size * count), align);
     
 }
 
@@ -201,7 +202,7 @@ b8 ST_ty_is_numeric(ST_ty_t *t)
 
 b8 ST_ty_is_untyped(ST_ty_t *t)
 {
-    return t && (t->kind == ST_TY_UNTYPED_INT || t->kind == ST_TY_UNTYPED_INT);
+    return t && (t->kind == ST_TY_UNTYPED_INT || t->kind == ST_TY_UNTYPED_FLOAT);
 }
 
 static void ST_ty_dump(ST_sb_t *sb, ST_ty_t *t)
