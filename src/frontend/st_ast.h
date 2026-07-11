@@ -280,6 +280,7 @@ struct ST_decl_t
         } struct_;
         struct {
             b8 is_flag;
+            ST_tyexpr_t *ty;
             ST_variant_specs_t variants;
         } enum_;
         struct {

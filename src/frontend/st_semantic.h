@@ -46,6 +46,6 @@ typedef struct
 } ST_sema_t;
 
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src,
-                ST_string_t file);
+               ST_string_t file, ST_sema_t *out);
 
 #endif

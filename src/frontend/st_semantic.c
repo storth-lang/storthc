@@ -1577,26 +1577,26 @@ static void ST_sema_check(ST_sema_t *se, ST_program_t *prog)
     }
 }
 
-b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src,
-                ST_string_t file)
+ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src,
+                ST_string_t file, ST_sema_t *out)
 {
-    ST_sema_t se = {0};
-    se.arena = arena;
-    se.diag.src = src;
-    se.diag.file = file;
-    se.diag.max_errors = ST_SEMA_MAX_ERRORS;
-    ST_ht_init(arena, &se.globals, 64);
-    ST_ty_ctx_init(&se.tys, arena);
-
-    ST_forrange(0, ST_array_len(ST_builtin_fns))
-    {
-        ST_string_t name = ST_cstr_to_str((char *)ST_builtin_fns[i]);
-        ST_sym_insert(&se, &se.globals,
-                      ST_sym_new(&se, ST_SYM_FN, name, NULL, NULL, 0, 0));
-    }
-
-    ST_sema_collect(&se, prog);
-    ST_sema_types(&se, prog);
-    ST_sema_check(&se, prog);
-    return se.diag.n_errors == 0;
+    ST_sema_t *se = out;
+    *se = (ST_sema_t){0};
+    se->arena = arena;
+    se->diag.src = src;
+    se->diag.file = file;
+    se->diag.max_errors = ST_SEMA_MAX_ERRORS;
+    ST_ht_init(arena, &se->globals, 64);
+    ST_ty_ctx_init(&se->tys, arena);
+   ST_forrange(0, ST_array_len(ST_builtin_fns))
+   {
+       ST_string_t name = ST_cstr_to_str((char *)ST_builtin_fns[i]);
+       ST_sym_insert(se, &se->globals,
+                     ST_sym_new(se, ST_SYM_FN, name, NULL, NULL, 0, 0));
+   }
+   ST_sema_collect(se, prog);
+   ST_sema_types(se, prog);
+   ST_sema_check(se, prog);
+   return se->diag.n_errors == 0;
 }
+ 

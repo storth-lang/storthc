@@ -1122,10 +1122,16 @@ static ST_decl_t *ST_parse_enum_decl(ST_parser_t *p, b8 is_flag,
     d->enum_.is_flag = is_flag;
     d->name = ST_expect_ident(p, "an enum name");
     if (!d->name.len) return NULL;
+    if (ST_at_symbol(p, ":") && !ST_tok_is_symbol(ST_peek2(p), "{"))
+    {
+        p->pos++;
+        d->enum_.ty = ST_parse_type(p);
+        if (!d->enum_.ty) return NULL;
+    }
     if (!ST_expect_sym(p, "{")) return NULL;
     while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens)
     {
-        if (ST_at_symbol(p, ";") || ST_at_symbol(p, ",")) { p->pos++; continue; }
+        if (ST_at_symbol(p, ",") || ST_at_symbol(p, ";")) { p->pos++; continue; }
         ST_token_t *vt = ST_peek(p);
         ST_variant_spec_t v = { .line = vt->line, .col = vt->col };
         v.name = ST_expect_ident(p, "a variant name");
