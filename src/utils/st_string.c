@@ -86,6 +86,12 @@ b8 ST_string_eq_cstr(ST_string_t a, const char *b)
 
 ST_string_t ST_abs_path(ST_arena_t *arena, const char *path)
 {
+    if (!path) {
+        return (ST_string_t) {
+            .data = NULL,
+            .len = 0,
+        };
+    }
     char buf[4096];
     const char *resolved = realpath(path, buf) ? buf : path;
     u32 len = (u32)strlen(resolved);

@@ -1,3 +1,4 @@
+// cc -I../src -o 
 #include "frontend/st_ast.h"
 #include "frontend/st_types.h"
 #include "frontend/st_semantic.h"
@@ -29,7 +30,7 @@ int main(void)
 
     // fn add(a: i32, b: i32) -> i32 { x := a + b; return x }
     ST_decl_t *add = ST_decl_new(arena, ST_DE_FN, 1, 1);
-    add->name = ST_cstr_to_str("mult");
+    add->name = ST_cstr_to_str("add");
 
     ST_tyexpr_t *te_i32_a = ST_tyexpr_new(arena, ST_TE_NAME, 1, 1);
     te_i32_a->name = ST_cstr_to_str("i32");
@@ -47,15 +48,15 @@ int main(void)
 
     ST_expr_t *a_id = mk_ident(arena, ST_cstr_to_str("a"), i32);
     ST_expr_t *b_id = mk_ident(arena, ST_cstr_to_str("b"), i32);
-    ST_expr_t *a_mult_b = ST_expr_new(arena, ST_EX_BINARY, 2, 1);
-    a_mult_b->bin.op = ST_cstr_to_str("*");
-    a_mult_b->bin.l = a_id;
-    a_mult_b->bin.r = b_id;
-    a_mult_b->ty = i32;
+    ST_expr_t *a_plus_b = ST_expr_new(arena, ST_EX_BINARY, 2, 1);
+    a_plus_b->bin.op = ST_cstr_to_str("+");
+    a_plus_b->bin.l = a_id;
+    a_plus_b->bin.r = b_id;
+    a_plus_b->ty = i32;
 
     ST_stmt_t *x_decl = ST_stmt_new(arena, ST_ST_DECL, 2, 1);
     x_decl->decl.name = ST_cstr_to_str("x");
-    x_decl->decl.init = a_mult_b;
+    x_decl->decl.init = a_plus_b;
     ST_da_append_arena(arena, &add->fn.body, x_decl);
 
     ST_expr_t *x_id_for_ret = mk_ident(arena, ST_cstr_to_str("x"), i32);
@@ -71,7 +72,7 @@ int main(void)
     ST_da_append_arena(arena, &main_fn->fn.sig.rets, te_i32_main_ret);
     main_fn->fn.sig.has_ret_ann = 1;
 
-    ST_expr_t *callee = mk_ident(arena, ST_cstr_to_str("mult"), NULL);
+    ST_expr_t *callee = mk_ident(arena, ST_cstr_to_str("add"), NULL);
     ST_expr_t *call = ST_expr_new(arena, ST_EX_CALL, 6, 1);
     call->call.callee = callee;
     ST_arg_t arg1 = { .value = mk_int(arena, &tys, 1) };

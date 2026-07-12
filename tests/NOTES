@@ -1,0 +1,120 @@
+# Spec: Sat Jul 11 2026 - sth snapshot test framework
+
+A snapshot test framework. Single self contained program, no dependencies
+beyond a shell and sha256sum
+
+The record data is a binary blob of its own so people can not modify it
+as they please. Any casual edit breaks the padding markers and the file
+is rejected as corrupt.
+
+## File format (record.sth)
+
+All integers are little endian. Every variable length field is a u32
+byte length followed by that many bytes (no length prefix means the
+format can not be parsed back, since results may contain any bytes
+including the padding markers).
+
+Everything after the 8 byte magic is XORed with a keystream so that
+catting the file shows no readable content. The keystream is xorshift32
+seeded with 0x53544831; each output byte is the low byte of the state
+after one round:
+
+    state ^= state << 13
+    state ^= state >> 17
+    state ^= state << 5
+    byte = state & 0xFF
+
+Reset the state to the seed right after the magic on both read and
+write. Encode and decode are the same operation. This is obfuscation,
+not encryption: it keeps the blob opaque to cat/strings and casual
+editing, nothing more.
+
+    header:  magic "STHREC01" (8 bytes) | u32 entry-count
+    entry:   u8  state
+             [file-name] || [cmd] | [sha256-hash] | [expected-return-status] | [result] ||
+
+    |  -> 4 byte padding, bytes 00 FF 00 FF
+    || -> 8 byte padding, bytes 00 FF 00 FF 00 FF 00 FF
+
+The padding is an integrity marker: on read, every pad must match
+exactly after decoding or the file is reported corrupt. All tests are
+stored in this one file.
+
+*state*: u8. 0 = SET (registered via -set, not yet recorded),
+ 1 = RECORDED (has a valid hash, status and result snapshot).
+
+*file-name*: length prefixed char[] storing the path of the file the
+ test checks.
+
+*cmd*: length prefixed char[] storing the build command, e.g.
+ "gcc -Isrc/ -Wall -Wpedantic $file -o $file.exe". Every occurrence of
+ $file is expanded to file-name at run time, not at set time. The cmd
+ must produce <file-name>.exe. It is a build step only; the framework
+ runs the exe itself.
+
+*sha256-hash*: 65 bytes fixed (64 hex chars + nul), the sha256 of
+ file-name taken at record time. On verify, a hash mismatch means the
+ source file was modified or is missing, which is a failure telling the
+ user to rerecord. Zeroed while state is SET.
+
+*expected-return-status*: i32 storing the exit status of the exe from
+ the initial record, so that when the user reruns the test it checks if
+ the status is still the expected one.
+
+*result*: length prefixed char[] storing the combined stdout+stderr of
+ the exe from the initial record. On verify the fresh output is compared
+ byte for byte against this; any mismatch is reported as a per line diff
+ (- expected / + got, with line numbers).
+
+## Execution model
+
+record (per entry):
+  1. hash file-name, store it
+  2. run cmd with $file expanded; nonzero build status = record failure,
+     show the build output
+  3. run <file-name>.exe, capture stdout+stderr and exit status as the
+     snapshot
+  4. delete the exe
+  5. mark entry RECORDED
+
+verify (per recorded entry):
+  1. hash file-name, compare against stored hash; mismatch = FAIL
+  2. build; build failure = FAIL, show build output
+  3. run the exe, capture output and status
+  4. delete the exe
+  5. compare status and output against the snapshot; report [ OK ] or
+     [FAIL] with the status mismatch and/or line diff
+  6. after all entries print "N ran, M failed", exit 0 if none failed,
+     else 1
+
+The exe runs from the framework's working directory, so relative paths
+inside the tested program (data files it opens etc.) resolve relative
+to where the framework is invoked. Run record and verify from the same
+directory.
+
+## Command line flags
+
+./program -set -f file_name -cmd 'gcc -I../src/ $file -o $file.exe'
+    Register file_name with a build cmd, or replace the cmd of an
+    existing entry. Quote the cmd in single quotes so the shell does
+    not expand $file before the program sees it.
+
+./program -record
+    Find all set-but-unrecorded entries in record.sth and record them.
+
+./program
+    Read record.sth, run every recorded test and report any mismatch.
+
+./program -rerecord -f file_name <optional cmd>
+    Rerecord one test, refreshing hash, status and result. If cmd is
+    not provided it uses the cmd from the -set flag, otherwise the new
+    cmd replaces it.
+
+./program -rerecord -all
+    Rerecord all pre-existing test cases, setting new expected results
+    and hashes while keeping the file-names and cmds.
+
+./program -help
+    Print all commands with descriptions to stdout, exit 0.
+
+Bad or missing arguments print a short usage to stderr and exit 1.c

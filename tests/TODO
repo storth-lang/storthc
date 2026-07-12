@@ -1,0 +1,12 @@
+# TODO
+
+- [ ] Use absolute path instead of relative path.
+- [ ] Make tasks parallel so I should be able to run them in parallel with -j$(nproc).
+- [ ] Save all the errors to a file if needed.
+- [ ] When set is null that a file does not exist. It means just run the command.
+
+# Bugs
+
+- [ ] This makes tracking it in git version very hard.
+- [ ] Absolute path vs relative path.
+- [ ] File validation if file does not exist.
