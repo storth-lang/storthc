@@ -10,3 +10,7 @@
 - [ ] This makes tracking it in git version very hard.
 - [ ] Absolute path vs relative path.
 - [ ] File validation if file does not exist.
+
+# Compiler command:
+
+ - ./st_tester -set -f ./c-tests/st_lex.c -cmd 'gcc -I../src -Wall -Wextra $file -o $file.exe $(find ../src -type f -name "*.[ch]" ! -name st_main.c) -lm'
