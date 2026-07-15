@@ -1,7 +1,15 @@
-fn add(a: i64, y: i64) -> i64 {
-    return x + y;
+struct Foo {
+    x : i64;
+    y : i64;
 }
 
-fn main() -> i32 {
-    return add(34, 35) #as i32;
+fn add(f: *i64) -> void {
+    *f = 20;
+    *f += 20;
+}
+
+fn main() -> i64 {
+    a : i64;
+    add(&a);
+    return 0;
 }
