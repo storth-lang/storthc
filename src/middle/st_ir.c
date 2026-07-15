@@ -58,6 +58,7 @@ static void ST_ir_replace_all_uses(ST_ir_fn_t *fn, ST_ir_inst_t *old, ST_ir_inst
         ST_ir_block_t *blk = fn->blocks.items[i];
         for (ST_ir_inst_t *inst = blk->first; inst; inst = inst->next)
         {
+
             switch (inst->kind)
             {
             case ST_IR_ADD: case ST_IR_SUB: case ST_IR_MUL:
@@ -88,6 +89,7 @@ static void ST_ir_replace_all_uses(ST_ir_fn_t *fn, ST_ir_inst_t *old, ST_ir_inst
                 ST_forrange(0, inst->call_ind.args.count)
                     if (inst->call_ind.args.items[i] == old) inst->call_ind.args.items[i] = new_;
                 break;
+
             case ST_IR_PHI:
                 ST_forrange(0, inst->phi.values.count)
                     if (inst->phi.values.items[i] == old) inst->phi.values.items[i] = new_;
@@ -305,6 +307,58 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_
     return inst;
 }
 
+ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p,
+                           u32 line, u32 col)
+{
+    ST_assert(fn->entry != NULL);
+    ST_ir_inst_t *inst = ST_ir_emit(fn->entry, ST_IR_ALLOCA, ST_ty_ptr(ctx, p), line, col);
+    inst->alloca_.size = p->width;
+    inst->alloca_.align = p->align;
+    return inst;
+}
+
+ST_ir_inst_t *ST_ir_load(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr,
+                         u32 line, u32 col)
+{
+    ST_assert(ty->kind != ST_TY_STRUCT || ty->kind != ST_TY_ENUM || 
+            ty->kind != ST_TY_TAG_UNION || ty->kind != ST_TY_ARRAY);
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_LOAD, ty, line, col);
+    inst->load.addr = addr;
+    return inst;
+}
+
+ST_ir_inst_t *ST_ir_store(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr, ST_ir_inst_t *v,
+                          u32 line, u32 col)
+{
+    ST_assert(ty->kind != ST_TY_STRUCT || ty->kind != ST_TY_ENUM || 
+            ty->kind != ST_TY_TAG_UNION || ty->kind != ST_TY_ARRAY);
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_STORE, ty, line, col);
+    inst->store.addr = addr;
+    inst->store.v = v;
+    return inst;
+}
+
+ST_ir_inst_t *ST_ir_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_ir_inst_t *base,
+                         ST_ir_inst_t *index, u32 scale, i32 offset,
+                         u32 line, u32 col)
+{
+    ST_assert(!index || scale != 0);
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_ADDR, ptr_ty, line, col);
+    inst->addr.base= base;
+    inst->addr.index = index;
+    inst->addr.scale = scale;
+    inst->addr.offset = offset;
+    return inst;
+}
+
+ST_ir_inst_t *ST_ir_global_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_string_t name,
+                                u32 line, u32 col)
+{
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_GLOBAL_ADDR, ptr_ty, line, col);
+    inst->global_name = name;
+    return inst;
+}
+
 void ST_ir_term_ret(ST_ir_block_t *b, ST_ir_inst_t **vals, u32 n_vals, u32 line, u32 col)
 {
     ST_assert(b->term.kind == ST_IR_TERM_NONE);
@@ -350,6 +404,7 @@ void ST_ir_term_unreachable(ST_ir_block_t *b, u32 line, u32 col)
 
 static const char *ST_ir_op_name(ST_ir_op_t op)
 {
+    _Static_assert(ST_IR_COUNT == 48, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
     switch (op)
     {
     case ST_IR_CONST_INT: return "const_int";
@@ -376,6 +431,11 @@ static const char *ST_ir_op_name(ST_ir_op_t op)
     case ST_IR_CALL: return "call";
     case ST_IR_CALL_INDIRECT: return "call_indirect";
     case ST_IR_PHI: return "phi";
+    case ST_IR_ALLOCA: return "ST_IR_ALLOCA";
+    case ST_IR_LOAD: return "ST_IR_LOAD";
+    case ST_IR_STORE: return "ST_IR_STORE";
+    case ST_IR_ADDR: return "ST_IR_ADDR";
+    case ST_IR_GLOBAL_ADDR: return "ST_IR_GLOBAL_ADDR";
     case ST_IR_COUNT: break;
     }
     return "<?>";
@@ -425,6 +485,8 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn)
             fprintf(out, "    ");
             ST_ir_dump_val(out, inst);
             fprintf(out, " = %s", ST_ir_op_name(inst->kind));
+
+            _Static_assert(ST_IR_COUNT == 48, "IR is exceeded");
             switch (inst->kind)
             {
             case ST_IR_CONST_INT: fprintf(out, " %lld", (long long)inst->const_int); break;
@@ -451,6 +513,33 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn)
                     ST_ir_dump_val(out, inst->phi.values.items[i]);
                     fprintf(out, "]");
                 }
+                break;
+            case ST_IR_ALLOCA:
+                fprintf(out, " size=%u align=%u", inst->alloca_.size, inst->alloca_.align);
+                break;
+            case ST_IR_LOAD:
+                fprintf(out, " ");
+                ST_ir_dump_val(out, inst->load.addr);
+                break;
+            case ST_IR_STORE:
+                fprintf(out, " ");
+                ST_ir_dump_val(out, inst->store.v);
+                fprintf(out, " -> ");
+                ST_ir_dump_val(out, inst->store.addr);
+                break;
+            case ST_IR_ADDR:
+                fprintf(out, " ");
+                ST_ir_dump_val(out, inst->addr.base);
+                if (inst->addr.index)
+                {
+                    fprintf(out, " + ");
+                    ST_ir_dump_val(out, inst->addr.index);
+                    fprintf(out, "*%u", inst->addr.scale);
+                }
+                if (inst->addr.offset) fprintf(out, " %+d", inst->addr.offset);
+                break;
+            case ST_IR_GLOBAL_ADDR:
+                fprintf(out, " &" ST_sv_fmt, ST_sv_args(inst->global_name));
                 break;
             case ST_IR_CAST: ST_ir_dump_val(out, inst->cast.v); break;
             case ST_IR_NEG: case ST_IR_FNEG: case ST_IR_NOT:

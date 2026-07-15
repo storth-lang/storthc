@@ -11,12 +11,18 @@ typedef struct
     ST_ir_fn_t *fn;
     ST_ir_block_t *cur;
     ST_ht_t scope;
+    ST_ht_t addr_taken;
 } ST_lower_ctx_t;
+
+typedef enum 
+{
+    ST_BIND_SSA,
+    ST_BIND_ADDR,
+} ST_bind_kind_t;
 
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
-
 
 static void ST_lower_scope_bind(ST_lower_ctx_t *c, ST_string_t name, void *key)
 {
@@ -60,6 +66,7 @@ static void *ST_lower_find_named_decl(ST_program_t *prog_name, ST_string_t name)
 static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te)
 {
     if (!te) return NULL;
+
     switch (te->kind)
     {
     case ST_TE_NAME: {
