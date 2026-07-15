@@ -31,3 +31,7 @@ date: Thu Jul  9 21:31:17 2026
 - SSA IR paper: https://c9x.me/compile/bib/braun13cc.pdf
 
 Temporarily I still did not implement any backend for my language or added flag parsing how ever it is relatively easy to add those refer the todo.
+
+# Ideas:
+
+- Use raw mmap syscalls for the dynamic array.
