@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <sys/wait.h>
 
 #define RECORD_DB_PATH "record.sth"
@@ -179,12 +180,11 @@ static bool read_pad(FILE *f, const uint8_t *pad, size_t n)
     return read_bytes(f, b, n) && memcmp(b, pad, n) == 0;
 }
 
-static bool db_load(test_db_t *db)
+static bool db_load(const char *db_path, test_db_t *db)
 {
     memset(db, 0, sizeof(*db));
-
-    FILE *f = fopen(RECORD_DB_PATH, "rb");
-    if (!f) return true;
+    FILE *f = fopen(db_path, "rb");
+    if (!f) return false;
 
     char magic[8];
     uint32_t count;
@@ -229,12 +229,12 @@ static bool db_load(test_db_t *db)
     return true;
 }
 
-static bool db_save(test_db_t *db)
+static bool db_save(const char *path, test_db_t *db)
 {
-    FILE *f = fopen(RECORD_DB_PATH, "wb");
+    FILE *f = fopen(path, "wb");
     if (!f)
     {
-        fprintf(stderr, "error: could not open %s for writing\n", RECORD_DB_PATH);
+        fprintf(stderr, "error: could not open %s for writing\n", path);
         return false;
     }
 
@@ -258,7 +258,7 @@ static bool db_save(test_db_t *db)
           && write_bytes(f, pad8, 8);
     }
     if (fclose(f) != 0) ok = false;
-    if (!ok) fprintf(stderr, "error: failed writing %s\n", RECORD_DB_PATH);
+    if (!ok) fprintf(stderr, "error: failed writing %s\n", path);
     return ok;
 }
 
@@ -377,7 +377,7 @@ static bool record_file(test_entry_t *e)
     return true;
 }
 
-static bool cmd_set(test_db_t *db, const char *file_name, const char *cmd)
+static bool cmd_set(test_db_t *db, const char *path, const char *file_name, const char *cmd)
 {
     test_entry_t *e = test_entry_find(db, file_name);
     if (!e)
@@ -393,10 +393,10 @@ static bool cmd_set(test_db_t *db, const char *file_name, const char *cmd)
     }
     e->cmd = strdup(cmd);
     printf("set: %s -> `%s`\n", file_name, cmd);
-    return db_save(db);
+    return db_save(path, db);
 }
 
-static bool cmd_record(test_db_t *db)
+static bool cmd_record(const char *path, test_db_t *db)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < db->count; i++)
@@ -412,10 +412,10 @@ static bool cmd_record(test_db_t *db)
         printf("record: nothing to do (no set-but-unrecorded files)\n");
         return true;
     }
-    return db_save(db);
+    return db_save(path, db);
 }
 
-static bool cmd_rerecord(test_db_t *db, const char *file_name, const char *new_cmd)
+static bool cmd_rerecord(test_db_t *db, const char *path, const char *file_name, const char *new_cmd)
 {
     if (file_name)
     {
@@ -436,7 +436,7 @@ static bool cmd_rerecord(test_db_t *db, const char *file_name, const char *new_c
     {
         for (uint32_t i = 0; i < db->count; i++) record_file(&db->items[i]);
     }
-    return db_save(db);
+    return db_save(path, db);
 }
 
 static bool cmd_verify(test_db_t *db)
@@ -539,43 +539,57 @@ static void help(const char *prog)
 
 int main(int argc, char *argv[])
 {
-    test_db_t db;
-    if (!db_load(&db)) return 1;
+    test_db_t db = {0};
+    bool ok;
+    const char *path = RECORD_DB_PATH;
+    int i = 1;
 
-    bool ok = false;
+    if (i + 1 < argc && strcmp(argv[i], "-dir") == 0) {
+        if (chdir(argv[i + 1]) != 0) return 1;
+        i += 2;
+    }
+    else if (i + 1 < argc && strcmp(argv[i], "-file") == 0) {
+        path = argv[i + 1];
+        i += 2;
+    }
 
-    if (argc == 1) ok = cmd_verify(&db);
+    if (i >= argc) {
+        if (!db_load(path, &db)) return 1;
+        ok = cmd_verify(&db);
+    }
 
     else if (strcmp(argv[1], "-set") == 0)
     {
         const char *file = NULL;
         const char *cmd = NULL;
+
+        if (!db_load(path, &db)) return 1;
         for (int i = 2; i < argc - 1; i++)
         {
             if (strcmp(argv[i], "-f") == 0) file = argv[++i];
             if (strcmp(argv[i], "-cmd") == 0) cmd = argv[++i];
         }
         if (!file || !cmd) usage(argv[0]);
-        else ok = cmd_set(&db, file, cmd);
+        else ok = cmd_set(&db, path, file, cmd);
     }
     else if (strcmp(argv[1], "-help") == 0)
     {
         help(argv[0]);
         ok = true;
     }
-    else if (strcmp(argv[1], "-record") == 0) ok = cmd_record(&db);
+    else if (strcmp(argv[1], "-record") == 0) ok = cmd_record(path, &db);
     else if (strcmp(argv[1], "-rerecord") == 0)
     {
         if (argc >= 3 && strcmp(argv[2], "-all") == 0)
-            ok = cmd_rerecord(&db, NULL, NULL);
+            ok = cmd_rerecord(&db, path, NULL, NULL);
 
         else if (argc >= 4 && strcmp(argv[2], "-f") == 0)
-            ok = cmd_rerecord(&db, argv[3], argc >= 5 ? argv[4] : NULL);
+            ok = cmd_rerecord(&db, path, argv[3], argc >= 5 ? argv[4] : NULL);
 
         else usage(argv[0]);
     }
     else usage(argv[0]);
 
     db_free(&db);
-    return ok ? 0 : 1;
+    return ok ? -1 : 0;
 }
