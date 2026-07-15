@@ -1,0 +1,32 @@
+# Storth Programming Language
+
+2026:07:15
+- Added support for structs.
+- The intermediate representation correctly will auto dereference struct members.
+  so then they are accessible via values.
+  ```
+  struct Fo {
+     y : string;
+     z : i32;
+  }
+
+  fn init_foo(f: *Fo) -> void {
+     f.y = "Irmom";
+     f.z = 32;
+  }
+
+  fn main() -> i64 {
+     x : Fo;
+     init_foo(&x);
+     return 0;
+  }
+  ```
+- Internal alloca api that will store the frame in the middle-end so that when used
+  by the backend it will know the size.
+
+- Another bug fix was storing p->width instead of p->size for stack size of variable.
+  This would have led my assembly size cry because I was just storing how many width will it
+  fit in into the stack frame instead of the actual size.
+
+- Fixed my test framework to store information of after set because initially after being set
+  it does reset the data base instead of appending to it in the end.

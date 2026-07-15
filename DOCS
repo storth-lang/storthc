@@ -1,0 +1,192 @@
+# DOCS
+
+## Introduction
+
+This is the storth programming language docs. This file will contain all the information you need of
+how to use and program in storth programming language.To begin with it is an AOT time compiler.
+It uses its own backend(except assembler) with SSA IR. Do note that for now it only supports linux x86_64 machine.
+
+## Syntax
+The simplest program you can have is an empty main function. This main function will contain just the return.
+Semi colons are mandatory.
+`src_code
+fn main() -> i32 {
+    return 0;
+}
+`
+To compile it you would just call `storthc filename.st`.
+Refer to the help of the compiler by running storthc --help to see what you can do.
+Basic syntax is driven by expressions. To define variable you would use go style syntax.
+
+`src_code
+x := 20; // This is defining a variable x of type i64.
+`
+To do type change in declaration you would specify the type after the colon.
+`src_code
+x : u32 = 20; // This is defining a variable x of type u32.
+`
+
+Refer to the types section to see all the available primitive types and how they work and also inspect their sizes.
+
+### Structs
+
+Structs are also defined the using the same concept.
+`src_code
+struct Foo {
+    name: string;
+    age: u32;
+}
+`
+
+To create an instance of that strcture you would do:
+`src_code
+f := Foo{}; // This will initalize all the members to be 0.
+f := Foo{"Urmom", 20}; // This is deseganted initalizer from C.
+f := Foo{age = 20, name = "Aboba"}; // This is named initialization 
+`
+Type declaration will also memset the members to 0 meaning puttin `{}` is optional;
+
+`src_code
+f : Foo; // This is the same as f := Foo{};
+`
+Refer the type section to see all of the alignment and memory layout of structures.
+
+### Tag Union
+Tag union and structs have the same declaration but fundamentally operate differently.
+
+`src_code
+tag_union Foo {
+    name: string;
+    age: u32;
+}
+`
+
+In tag unions the concept comes from rust where we have an intrinsic tag(refer to intrinsics) 
+that will store the id of the active member to make it so that inactive member is inaccessible.
+
+`src_code
+f : tag_union;
+f.tag = Foo.age;  // This will make name inaccessible member
+f.name = "Urmom"; // This is an invalid code because you are trying to access an inactive tag name
+                  // while age is the acctive one meaning only f.age is accessible.
+`
+
+### Enums and Enum_Flags
+Enums work the exact same way enums from C work. They are completely identical.
+The `: u32` is optional it means we can have optional specifier of types of enum by default it will be i64 but it is customizable.
+
+`src_code
+enum Foo : u32 {
+    Name;
+    Age;
+}
+
+f := Name;
+`
+
+Enum flags are one time set unchangable option we use so we can have enums are return code without modifying their value
+`src_code
+enum_flag Foo : u32 {
+    Name := 30;
+    Age := 40; // Invalid it must be kept in order so that later down the line we do not add a
+               // member and modify the pre existing value.
+}
+
+f := Foo.Name;
+`
+
+
+### Functions
+
+This is the simplest function we can write. The arrow will denote the return type.
+
+`src_code
+fn add(x: i32, y: u32) -> i64 {
+    return x #as i64 + y #as i64;
+}
+`
+
+We can have multiple returns from a function.
+
+`src_code
+fn foo() -> (string, u32) {
+    return "Foo", 60;
+}
+`
+
+A function modifies it state. We can accept values via pointer to modify the existing state of a variable.
+
+`src_code
+struct Foo {
+    name: string;
+    age: u32;
+}
+
+fn foo(f: *Foo) -> void {
+    f.name = "Urmom";
+    f.age = 20 #as u32;
+}
+
+fn main() -> i32 {
+    f : Foo;
+    foo(&f);
+}
+`
+This is the simplest way we can modify struct values do note that the `.` operator does auto dereferencing.
+Fundamentally functions are the same thing you would expect them to be however there is a notion of scoped function.
+How many times have you done this in C you want a function declare it as static so it can be reused in a function.
+That does not prevent it or is nicely usable to the level of defning the function inside.
+So storth have the freedom of defining functions with in functions.
+`src_code
+fn foo() -> void {
+   fn bar() -> i32 {
+      return 69;
+   }
+
+   x := bar();
+   y := bar();
+}
+`
+This function bar is completely inacessible by functions of the outside world making it truely local to that specific defintion.
+Functions can also have default parameters. These default params can be named parameters to be modfied.
+The idea of positionally named argument is that the compiler already knows what variable is associated with
+which argument so hard locking on the argument position is stupid for that regard.
+
+`src_code
+fn foo(name := "String", age : u32 = 32) -> void {
+   print("%", name);
+}
+
+fn main() -> i32 {
+   foo();
+   foo("Aboba");
+   foo(age = 40 #as u32, name = "Testing");
+   return 0;
+}
+`
+Functions are just reusable code that means for functions we do not understand the type it is important for us to have
+generalization and for that we infact do have templates. Refer to the temnplate section to see what they are.
+
+## Operators
+We talked about functions now lets discuss the type of operatator you have. The operators and their presidence is coming from
+C where all the operators have their own symbol and meaning.
+
+### Single sign operations
+
+Operator + : is used for addition.
+Operator - : is used for subtraction.
+Operator / : is used for division.
+Operator * : is used for multiplication. If called from type specifier then it will become a pointer to that memory.
+Operator & : is used for reference. So that we can do x := 20 then have p := &x.
+
+
+### Double sign operations
+
+Operator == : is used for comparision and checks if the comprands are equal.
+Operator != : is used for comparision and checks if the comprands are not equal.
+Operator ++ : is used for for incrementation and only post incrementation is valid preincrement is invalid.
+Operator -- : is used for for decrementation and only post decrementation is valid predecrement is invalid.
+Operator += : is used for for decrementation and only post decrementation is valid predecrement is invalid.
+Operator -= : is used for for decrementation and only post decrementation is valid predecrement is invalid.
+Operator *= : is used for for decrementation and only post decrementation is valid predecrement is invalid.
+Operator /= : is used for for decrementation and only post decrementation is valid predecrement is invalid.
