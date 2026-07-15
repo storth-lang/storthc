@@ -1,9 +1,14 @@
 # TODO
 
-- [ ] Use absolute path instead of relative path.
+- [x] Use absolute path instead of relative path.
 - [ ] Make tasks parallel so I should be able to run them in parallel with -j$(nproc).
 - [ ] Save all the errors to a file if needed.
 - [ ] When set is null that a file does not exist. It means just run the command.
+- [x] Add support to change directory with -dir flag.
+- [x] Add support to specify the record file with -file flag.
+- [ ] Use getopt so that we can have subflags that interact with eachother instead of on by one parsing
+- [ ] Add support for subflag -show to list the files with their respective cmd optionally with their output.
+- [ ] Hash the actual file path not just record.sth slice from string.
 
 # Bugs
 
@@ -12,5 +17,4 @@
 - [ ] File validation if file does not exist.
 
 # Compiler command:
-
  - ./st_tester -set -f ./c-tests/st_lex.c -cmd 'gcc -I../src -Wall -Wextra $file -o $file.exe $(find ../src -type f -name "*.[ch]" ! -name st_main.c) -lm'

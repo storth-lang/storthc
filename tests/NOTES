@@ -99,6 +99,16 @@ directory.
     existing entry. Quote the cmd in single quotes so the shell does
     not expand $file before the program sees it.
 
+./program -file
+    Instead of hard coding the path for record.sth to be only in current.
+    working directory we can also make use of providing the path for the
+    record.sth making moved file still work.
+
+./program -dir
+    Change the current working directory into the specified directory.
+    Use that dir as basedir for finding record.sth and running all the
+    test cases that are required.
+
 ./program -record
     Find all set-but-unrecorded entries in record.sth and record them.
 
