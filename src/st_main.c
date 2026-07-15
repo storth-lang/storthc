@@ -1,9 +1,9 @@
+// cc -I../src -o 
 #include "frontend/st_ast.h"
 #include "frontend/st_types.h"
 #include "frontend/st_semantic.h"
 #include "middle/st_lower.h"
 #include "utils/st_types.h"
-#include "backend/st_nasm.h"
 
 static ST_expr_t *mk_int(ST_arena_t *a, ST_ty_ctx_t *tys, i64 v)
 {
@@ -48,15 +48,15 @@ int main(void)
 
     ST_expr_t *a_id = mk_ident(arena, ST_cstr_to_str("a"), i32);
     ST_expr_t *b_id = mk_ident(arena, ST_cstr_to_str("b"), i32);
-    ST_expr_t *a_mult_b = ST_expr_new(arena, ST_EX_BINARY, 2, 1);
-    a_mult_b->bin.op = ST_cstr_to_str("+");
-    a_mult_b->bin.l = a_id;
-    a_mult_b->bin.r = b_id;
-    a_mult_b->ty = i32;
+    ST_expr_t *a_plus_b = ST_expr_new(arena, ST_EX_BINARY, 2, 1);
+    a_plus_b->bin.op = ST_cstr_to_str("+");
+    a_plus_b->bin.l = a_id;
+    a_plus_b->bin.r = b_id;
+    a_plus_b->ty = i32;
 
     ST_stmt_t *x_decl = ST_stmt_new(arena, ST_ST_DECL, 2, 1);
     x_decl->decl.name = ST_cstr_to_str("x");
-    x_decl->decl.init = a_mult_b;
+    x_decl->decl.init = a_plus_b;
     ST_da_append_arena(arena, &add->fn.body, x_decl);
 
     ST_expr_t *x_id_for_ret = mk_ident(arena, ST_cstr_to_str("x"), i32);
@@ -75,8 +75,8 @@ int main(void)
     ST_expr_t *callee = mk_ident(arena, ST_cstr_to_str("add"), NULL);
     ST_expr_t *call = ST_expr_new(arena, ST_EX_CALL, 6, 1);
     call->call.callee = callee;
-    ST_arg_t arg1 = { .value = mk_int(arena, &tys, 34) };
-    ST_arg_t arg2 = { .value = mk_int(arena, &tys, 35) };
+    ST_arg_t arg1 = { .value = mk_int(arena, &tys, 1) };
+    ST_arg_t arg2 = { .value = mk_int(arena, &tys, 2) };
     ST_da_append_arena(arena, &call->call.args, arg1);
     ST_da_append_arena(arena, &call->call.args, arg2);
     call->ty = i32;
@@ -103,11 +103,8 @@ int main(void)
     ST_string_t src = ST_cstr_to_str("");
     b8 ok = ST_lower_program(arena, &prog, &sema, src, prog.file, &mod);
 
-    // ST_ir_dump_module(stdout, &mod);
-    // fprintf(stderr, "\nlower ok = %d\n", ok);
-
-    if (!ST_nasm_generate(stdout, &mod, src,
-                    prog.file, 1)) return -1;
+    ST_ir_dump_module(stdout, &mod);
+    fprintf(stderr, "\nlower ok = %d\n", ok);
 
     ST_arena_free(arena);
     return ok ? 0 : 1;

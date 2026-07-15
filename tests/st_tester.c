@@ -591,5 +591,5 @@ int main(int argc, char *argv[])
     else usage(argv[0]);
 
     db_free(&db);
-    return ok ? -1 : 0;
+    return ok ? 0 : 1;
 }
