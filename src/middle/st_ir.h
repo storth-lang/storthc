@@ -48,6 +48,13 @@ typedef enum
     ST_IR_CALL,
     ST_IR_CALL_INDIRECT,
     ST_IR_PHI,
+    
+    // NOTE: This is for loading and storing data
+    ST_IR_ALLOCA,
+    ST_IR_LOAD,
+    ST_IR_STORE,
+    ST_IR_ADDR,
+    ST_IR_GLOBAL_ADDR,
  
     ST_IR_COUNT,
 } ST_ir_op_t;
@@ -100,6 +107,23 @@ struct ST_ir_inst_t
             ST_ir_insts_t values;
             ST_ir_blocks_t preds;
         } phi;
+        struct {
+            u32 size, align;
+        } alloca_;
+        struct {
+            ST_ir_inst_t *addr;
+        } load;
+        struct {
+            ST_ir_inst_t *addr;
+            ST_ir_inst_t *v;
+        } store;
+        struct {
+            ST_ir_inst_t *base;
+            ST_ir_inst_t *index;
+            u32 scale;
+            i32 offset; 
+        } addr;
+        ST_string_t global_name;
     };
 
 };
@@ -173,6 +197,17 @@ ST_ir_inst_t *ST_ir_call(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_string_t callee_n
                           ST_ir_fn_t *callee, ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
 ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *callee_ptr,
                                    ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
+ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p,
+                           u32 line, u32 col);
+ST_ir_inst_t *ST_ir_load(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr,
+                         u32 line, u32 col);
+ST_ir_inst_t *ST_ir_store(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr, ST_ir_inst_t *v,
+                          u32 line, u32 col);
+ST_ir_inst_t *ST_ir_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_ir_inst_t *base,
+                         ST_ir_inst_t *index, u32 scale, i32 offset,
+                         u32 line, u32 col);
+ST_ir_inst_t *ST_ir_global_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_string_t name,
+                                u32 line, u32 col);
 
 void ST_ir_term_ret(ST_ir_block_t *b, ST_ir_inst_t **vals, u32 n_vals, u32 line, u32 col);
 void ST_ir_term_br(ST_ir_block_t *b, ST_ir_block_t *target, u32 line, u32 col);
