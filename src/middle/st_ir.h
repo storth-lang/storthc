@@ -109,6 +109,7 @@ struct ST_ir_inst_t
         } phi;
         struct {
             u32 size, align;
+            u32 frame_off;
         } alloca_;
         struct {
             ST_ir_inst_t *addr;

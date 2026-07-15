@@ -627,7 +627,7 @@ ST_tokens_t ST_lex(ST_arena_t *arena, ST_string_t src, ST_string_t file)
     l.col = 1;
 
     ST_token_t t;
-    while (ST_lx_next(&l, &t)) ST_da_append(&l.tokens, t);
+    while (ST_lx_next(&l, &t)) ST_da_append_arena(arena, &l.tokens, t);
 
     l.tokens.ok = !l.failed;
     return l.tokens;

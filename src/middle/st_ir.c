@@ -312,7 +312,7 @@ ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p,
 {
     ST_assert(fn->entry != NULL);
     ST_ir_inst_t *inst = ST_ir_emit(fn->entry, ST_IR_ALLOCA, ST_ty_ptr(ctx, p), line, col);
-    inst->alloca_.size = p->width;
+    inst->alloca_.size = p->size;
     inst->alloca_.align = p->align;
     return inst;
 }
@@ -320,8 +320,8 @@ ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p,
 ST_ir_inst_t *ST_ir_load(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr,
                          u32 line, u32 col)
 {
-    ST_assert(ty->kind != ST_TY_STRUCT || ty->kind != ST_TY_ENUM || 
-            ty->kind != ST_TY_TAG_UNION || ty->kind != ST_TY_ARRAY);
+    ST_assert(ty->kind != ST_TY_STRUCT && ty->kind != ST_TY_TAG_UNION &&
+              ty->kind != ST_TY_ARRAY && ty->kind != ST_TY_DYN_ARRAY);
     ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_LOAD, ty, line, col);
     inst->load.addr = addr;
     return inst;
@@ -330,8 +330,8 @@ ST_ir_inst_t *ST_ir_load(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr,
 ST_ir_inst_t *ST_ir_store(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr, ST_ir_inst_t *v,
                           u32 line, u32 col)
 {
-    ST_assert(ty->kind != ST_TY_STRUCT || ty->kind != ST_TY_ENUM || 
-            ty->kind != ST_TY_TAG_UNION || ty->kind != ST_TY_ARRAY);
+    ST_assert(ty->kind != ST_TY_STRUCT && ty->kind != ST_TY_TAG_UNION &&
+              ty->kind != ST_TY_ARRAY && ty->kind != ST_TY_DYN_ARRAY);
     ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_STORE, ty, line, col);
     inst->store.addr = addr;
     inst->store.v = v;
@@ -431,11 +431,11 @@ static const char *ST_ir_op_name(ST_ir_op_t op)
     case ST_IR_CALL: return "call";
     case ST_IR_CALL_INDIRECT: return "call_indirect";
     case ST_IR_PHI: return "phi";
-    case ST_IR_ALLOCA: return "ST_IR_ALLOCA";
-    case ST_IR_LOAD: return "ST_IR_LOAD";
-    case ST_IR_STORE: return "ST_IR_STORE";
-    case ST_IR_ADDR: return "ST_IR_ADDR";
-    case ST_IR_GLOBAL_ADDR: return "ST_IR_GLOBAL_ADDR";
+    case ST_IR_ALLOCA: return "alloca";
+    case ST_IR_LOAD: return "load";
+    case ST_IR_STORE: return "store";
+    case ST_IR_ADDR: return "addr";
+    case ST_IR_GLOBAL_ADDR: return "global_addr";
     case ST_IR_COUNT: break;
     }
     return "<?>";
@@ -541,8 +541,9 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn)
             case ST_IR_GLOBAL_ADDR:
                 fprintf(out, " &" ST_sv_fmt, ST_sv_args(inst->global_name));
                 break;
-            case ST_IR_CAST: ST_ir_dump_val(out, inst->cast.v); break;
+            case ST_IR_CAST: fprintf(out, " "); ST_ir_dump_val(out, inst->cast.v); break;
             case ST_IR_NEG: case ST_IR_FNEG: case ST_IR_NOT:
+                fprintf(out, " ");
                 ST_ir_dump_val(out, inst->unary.v);
                 break;
             default:

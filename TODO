@@ -31,7 +31,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 
 - Expand the IR to support the following
 
- - [ ] Structs.
+ - [x] Structs.
  - [ ] Enums.
  - [ ] Unions.
  - [ ] Multiple return.
