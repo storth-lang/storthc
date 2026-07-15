@@ -184,7 +184,7 @@ static bool db_load(const char *db_path, test_db_t *db)
 {
     memset(db, 0, sizeof(*db));
     FILE *f = fopen(db_path, "rb");
-    if (!f) return false;
+    if (!f) return true;
 
     char magic[8];
     uint32_t count;
@@ -311,22 +311,27 @@ static void exe_path_of(const char *file_name, char *out, size_t n)
     else snprintf(out, n, "./%s.exe", file_name);
 }
 
-static bool build_entry(test_entry_t *e)
+static bool run_build(test_entry_t *e, bool *have_exe,
+                      int32_t *status, char **out, uint32_t *out_len)
 {
     char *cmd = cmd_expand(e->cmd, e->file_name);
-    char *build_out;
-    uint32_t build_len;
-    int32_t status = run_cmd(cmd, &build_out, &build_len);
-    if (status != 0)
+    *status = run_cmd(cmd, out, out_len);
+
+    char exe[512];
+    exe_path_of(e->file_name, exe, sizeof(exe));
+    *have_exe = access(exe, F_OK) == 0;
+
+    if (*have_exe && *status != 0)
     {
         fprintf(stderr, "  [FAIL] %s: build failed (status %d): `%s`\n%s",
-                e->file_name, status, cmd, build_out);
+                e->file_name, *status, cmd, *out);
         free(cmd);
-        free(build_out);
+        free(*out);
+        *out = NULL;
+        remove(exe);
         return false;
     }
     free(cmd);
-    free(build_out);
     return true;
 }
 
@@ -366,12 +371,27 @@ static bool record_file(test_entry_t *e)
         return false;
     }
 
-    if (!build_entry(e)) return false;
+    bool have_exe;
+    int32_t status;
+    char *out;
+    uint32_t out_len;
+    if (!run_build(e, &have_exe, &status, &out, &out_len)) return false;
 
     free(e->result);
-    e->expected_status = run_exe(e->file_name, &e->result, &e->result_len);
-    printf("  [REC ] %s -> status %d, %u bytes of output\n",
-           e->file_name, e->expected_status, e->result_len);
+    if (have_exe)
+    {
+        free(out);
+        e->expected_status = run_exe(e->file_name, &e->result, &e->result_len);
+    }
+    else
+    {
+        e->expected_status = status;
+        e->result = out;
+        e->result_len = out_len;
+    }
+    printf("  [REC ] %s -> status %d, %u bytes of output%s\n",
+           e->file_name, e->expected_status, e->result_len,
+           have_exe ? "" : " (command output)");
 
     e->kind = ENTRY_RECORDED;
     return true;
@@ -390,6 +410,7 @@ static bool cmd_set(test_db_t *db, const char *path, const char *file_name, cons
     else
     {
         free(e->cmd);
+        e->kind = ENTRY_SET;
     }
     e->cmd = strdup(cmd);
     printf("set: %s -> `%s`\n", file_name, cmd);
@@ -399,11 +420,12 @@ static bool cmd_set(test_db_t *db, const char *path, const char *file_name, cons
 static bool cmd_record(const char *path, test_db_t *db)
 {
     uint32_t n = 0;
+    bool all_ok = true;
     for (uint32_t i = 0; i < db->count; i++)
     {
         if (db->items[i].kind == ENTRY_SET)
         {
-            record_file(&db->items[i]);
+            if (!record_file(&db->items[i])) all_ok = false;
             n++;
         }
     }
@@ -412,7 +434,7 @@ static bool cmd_record(const char *path, test_db_t *db)
         printf("record: nothing to do (no set-but-unrecorded files)\n");
         return true;
     }
-    return db_save(path, db);
+    return db_save(path, db) && all_ok;
 }
 
 static bool cmd_rerecord(test_db_t *db, const char *path, const char *file_name, const char *new_cmd)
@@ -458,15 +480,21 @@ static bool cmd_verify(test_db_t *db)
             continue;
         }
 
-        if (!build_entry(e))
+        bool have_exe;
+        int32_t status;
+        char *out;
+        uint32_t out_len;
+        if (!run_build(e, &have_exe, &status, &out, &out_len))
         {
             failed++;
             continue;
         }
 
-        char *out;
-        uint32_t out_len;
-        int32_t status = run_exe(e->file_name, &out, &out_len);
+        if (have_exe)
+        {
+            free(out);
+            status = run_exe(e->file_name, &out, &out_len);
+        }
 
         bool status_ok = status == e->expected_status;
         bool output_ok = out_len == e->result_len && memcmp(out, e->result, out_len) == 0;
@@ -540,52 +568,63 @@ static void help(const char *prog)
 int main(int argc, char *argv[])
 {
     test_db_t db = {0};
-    bool ok;
+    bool ok = false;
     const char *path = RECORD_DB_PATH;
     int i = 1;
 
-    if (i + 1 < argc && strcmp(argv[i], "-dir") == 0) {
-        if (chdir(argv[i + 1]) != 0) return 1;
-        i += 2;
-    }
-    else if (i + 1 < argc && strcmp(argv[i], "-file") == 0) {
-        path = argv[i + 1];
-        i += 2;
+    for (;;)
+    {
+        if (i + 1 < argc && strcmp(argv[i], "-dir") == 0)
+        {
+            if (chdir(argv[i + 1]) != 0)
+            {
+                fprintf(stderr, "error: cannot chdir to %s\n", argv[i + 1]);
+                return 1;
+            }
+            i += 2;
+        }
+        else if (i + 1 < argc && strcmp(argv[i], "-file") == 0)
+        {
+            path = argv[i + 1];
+            i += 2;
+        }
+        else break;
     }
 
-    if (i >= argc) {
-        if (!db_load(path, &db)) return 1;
+    if (!db_load(path, &db)) return 1;
+
+    if (i >= argc)
+    {
         ok = cmd_verify(&db);
     }
-
-    else if (strcmp(argv[1], "-set") == 0)
+    else if (strcmp(argv[i], "-set") == 0)
     {
         const char *file = NULL;
         const char *cmd = NULL;
-
-        if (!db_load(path, &db)) return 1;
-        for (int i = 2; i < argc - 1; i++)
+        for (int k = i + 1; k < argc - 1; k++)
         {
-            if (strcmp(argv[i], "-f") == 0) file = argv[++i];
-            if (strcmp(argv[i], "-cmd") == 0) cmd = argv[++i];
+            if (strcmp(argv[k], "-f") == 0) file = argv[++k];
+            if (strcmp(argv[k], "-cmd") == 0) cmd = argv[++k];
         }
         if (!file || !cmd) usage(argv[0]);
         else ok = cmd_set(&db, path, file, cmd);
     }
-    else if (strcmp(argv[1], "-help") == 0)
+    else if (strcmp(argv[i], "-help") == 0)
     {
         help(argv[0]);
         ok = true;
     }
-    else if (strcmp(argv[1], "-record") == 0) ok = cmd_record(path, &db);
-    else if (strcmp(argv[1], "-rerecord") == 0)
+    else if (strcmp(argv[i], "-record") == 0)
     {
-        if (argc >= 3 && strcmp(argv[2], "-all") == 0)
+        ok = cmd_record(path, &db);
+    }
+    else if (strcmp(argv[i], "-rerecord") == 0)
+    {
+        if (i + 1 < argc && strcmp(argv[i + 1], "-all") == 0)
             ok = cmd_rerecord(&db, path, NULL, NULL);
-
-        else if (argc >= 4 && strcmp(argv[2], "-f") == 0)
-            ok = cmd_rerecord(&db, path, argv[3], argc >= 5 ? argv[4] : NULL);
-
+        else if (i + 2 < argc && strcmp(argv[i + 1], "-f") == 0)
+            ok = cmd_rerecord(&db, path, argv[i + 2],
+                              i + 3 < argc ? argv[i + 3] : NULL);
         else usage(argv[0]);
     }
     else usage(argv[0]);
