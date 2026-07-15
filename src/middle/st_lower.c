@@ -263,6 +263,205 @@ static b8 ST_lower_ty_is_scalar(ST_ty_t *t)
     }
 }
 
+static b8 ST_lower_field_find(ST_ty_t *st, ST_string_t name, ST_ty_t **fty, u32 *off)
+{
+    ST_forrange(0, st->fields.count)
+    {
+        if (ST_string_eq(st->fields.items[i].name, name))
+        {
+            *fty = st->fields.items[i].ty;
+            *off = st->fields.items[i].offset;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static ST_ir_inst_t *ST_lower_field_ptr(ST_lower_ctx_t *c, ST_ir_inst_t *base,
+                                        i32 off, ST_ty_t *fty, u32 line, u32 col)
+{
+    ST_ty_t *pty = ST_ty_ptr(&c->sema->tys, fty);
+    return ST_ir_addr(c->cur, pty, base, NULL, 0, off, line, col);
+}
+
+static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                 ST_ty_t *st, u32 line, u32 col)
+{
+    ST_forrange(0, st->fields.count)
+    {
+        ST_ty_field_t *f = &st->fields.items[i];
+        i32 foff = off + (i32)f->offset;
+        if (f->ty->kind == ST_TY_STRUCT)
+        {
+            ST_lower_struct_zero(c, base, foff, f->ty, line, col);
+        }
+        else if (ST_lower_ty_is_scalar(f->ty))
+        {
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, foff, f->ty, line, col);
+            ST_ir_inst_t *z = ST_ty_is_float(f->ty)
+                ? ST_ir_const_float(c->cur, f->ty, 0.0)
+                : ST_ir_const_int(c->cur, f->ty, 0);
+            ST_ir_store(c->cur, f->ty, fp, z, line, col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, line, col,
+                          "internal: field '" ST_sv_fmt "' has a type that isn't "
+                          "lowered yet (arrays/strings in structs come later)",
+                          ST_sv_args(f->name));
+        }
+    }
+}
+
+static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
+                                 ST_ir_inst_t *src, i32 soff, ST_ty_t *st,
+                                 u32 line, u32 col)
+{
+    ST_forrange(0, st->fields.count)
+    {
+        ST_ty_field_t *f = &st->fields.items[i];
+        if (f->ty->kind == ST_TY_STRUCT)
+        {
+            ST_lower_struct_copy(c, dst, doff + (i32)f->offset,
+                                 src, soff + (i32)f->offset, f->ty, line, col);
+        }
+        else if (ST_lower_ty_is_scalar(f->ty))
+        {
+            ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)f->offset, f->ty, line, col);
+            ST_ir_inst_t *v = ST_ir_load(c->cur, f->ty, sp, line, col);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)f->offset, f->ty, line, col);
+            ST_ir_store(c->cur, f->ty, dp, v, line, col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, line, col,
+                          "internal: field '" ST_sv_fmt "' has a type that isn't "
+                          "lowered yet (arrays/strings in structs come later)",
+                          ST_sv_args(f->name));
+        }
+    }
+}
+
+static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e);
+
+static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                     ST_ty_t *st, ST_expr_t *lit)
+{
+    ST_forrange(0, lit->struct_lit.inits.count)
+    {
+        ST_field_init_t *fi = &lit->struct_lit.inits.items[i];
+        ST_ty_t *fty = NULL;
+        u32 foff = 0;
+
+        if (fi->name.len)
+        {
+            if (!ST_lower_field_find(st, fi->name, &fty, &foff)) continue;
+        }
+        else
+        {
+            if (i >= st->fields.count) break;
+            fty = st->fields.items[i].ty;
+            foff = st->fields.items[i].offset;
+        }
+
+        if (fty->kind == ST_TY_STRUCT)
+        {
+            if (fi->value->kind == ST_EX_STRUCT_LIT)
+                ST_lower_struct_lit_into(c, base, off + (i32)foff, fty, fi->value);
+            else
+            {
+                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, fi->value);
+                if (src)
+                    ST_lower_struct_copy(c, base, off + (i32)foff, src, 0, fty,
+                                         fi->value->line, fi->value->col);
+            }
+        }
+        else if (ST_lower_ty_is_scalar(fty))
+        {
+            ST_ir_inst_t *v = ST_lower_expr(c, fi->value);
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, off + (i32)foff, fty,
+                                                  fi->value->line, fi->value->col);
+            ST_ir_store(c->cur, fty, fp, v, fi->value->line, fi->value->col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, fi->value->line, fi->value->col,
+                          "internal: this field type isn't lowered yet");
+        }
+    }
+}
+
+static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e)
+{
+    switch (e->kind)
+    {
+    case ST_EX_IDENT: {
+        ST_lower_bind_t *bind = ST_lower_scope_find(c, e->name);
+        if (!bind)
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: '" ST_sv_fmt "' is not a known local",
+                          ST_sv_args(e->name));
+            return NULL;
+        }
+        if (bind->kind != ST_BIND_ADDR)
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: '" ST_sv_fmt "' has no memory address "
+                          "(it was kept in SSA form)", ST_sv_args(e->name));
+            return NULL;
+        }
+        return bind->slot;
+    }
+
+    case ST_EX_UNARY:
+        if (ST_string_eq_cstr(e->unary.op, "*"))
+            return ST_lower_expr(c, e->unary.operand);
+        break;
+
+    case ST_EX_FIELD: {
+        ST_expr_t *b = e->field.base;
+        ST_ty_t *bt = b->ty;
+        ST_ir_inst_t *base;
+
+        if (bt && bt->kind == ST_TY_PTR)
+        {
+            base = ST_lower_expr(c, b);
+            bt = bt->inner;
+        }
+        else
+            base = ST_lower_lvalue_addr(c, b);
+
+        if (!base) return NULL;
+        if (!bt || bt->kind != ST_TY_STRUCT)
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: field access on this type isn't lowered yet "
+                          "(array/string members come later)");
+            return NULL;
+        }
+
+        ST_ty_t *fty = NULL;
+        u32 foff = 0;
+        if (!ST_lower_field_find(bt, e->field.name, &fty, &foff))
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: unknown field '" ST_sv_fmt "'",
+                          ST_sv_args(e->field.name));
+            return NULL;
+        }
+        return ST_lower_field_ptr(c, base, (i32)foff, fty, e->line, e->col);
+    }
+
+    default:
+        break;
+    }
+
+    ST_diag_error(&c->diag, e->line, e->col,
+                  "internal: cannot take the address of this expression form yet");
+    return NULL;
+}
+
 static ST_ir_op_t ST_lower_binop(ST_diag_t *diag, ST_expr_t *e, b8 is_f, b8 uns)
 {
     ST_string_t op = e->bin.op;
@@ -329,9 +528,15 @@ static ST_ir_inst_t *ST_lower_addr_of(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *
         return bind->slot;
     }
 
+    if (v->kind == ST_EX_FIELD)
+    {
+        ST_ir_inst_t *a = ST_lower_lvalue_addr(c, v);
+        return a ? a : ST_ir_const_int(c->cur, ptr_ty, 0);
+    }
+
     ST_diag_error(&c->diag, e->line, e->col,
                   "internal: address-of this expression form isn't lowered yet "
-                  "(field/index addressing lands with struct lowering)");
+                  "(array indexing comes with array lowering)");
     return ST_ir_const_int(c->cur, ptr_ty, 0);
 }
 
@@ -432,6 +637,19 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
         return ST_ir_binop(c->cur, op, e->ty, l, r, e->line, e->col);
     }
 
+    case ST_EX_FIELD: {
+        ST_ir_inst_t *a = ST_lower_lvalue_addr(c, e);
+        if (!a) return ST_ir_const_int(c->cur, e->ty, 0);
+        if (!ST_lower_ty_is_scalar(e->ty))
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: using a whole struct field as a value is only "
+                          "lowered in declarations and assignments so far");
+            return ST_ir_const_int(c->cur, e->ty, 0);
+        }
+        return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
+    }
+
     case ST_EX_CALL:
         return ST_lower_call(c, e);
 
@@ -479,11 +697,30 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
             break;
         }
 
-        if (!ST_lower_ty_is_scalar(ty) && taken)
+        if (ty->kind == ST_TY_STRUCT)
+        {
+            ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->line, s->col);
+            ST_lower_struct_zero(c, slot, 0, ty, s->line, s->col);
+            if (s->decl.init)
+            {
+                if (s->decl.init->kind == ST_EX_STRUCT_LIT)
+                    ST_lower_struct_lit_into(c, slot, 0, ty, s->decl.init);
+                else
+                {
+                    ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->decl.init);
+                    if (src)
+                        ST_lower_struct_copy(c, slot, 0, src, 0, ty, s->line, s->col);
+                }
+            }
+            ST_lower_bind_addr(c, s->decl.name, slot, ty);
+            break;
+        }
+
+        if (!ST_lower_ty_is_scalar(ty))
         {
             ST_diag_error(&c->diag, s->line, s->col,
-                          "internal: aggregate locals aren't lowered yet "
-                          "(lands with struct lowering)");
+                          "internal: this declaration type isn't lowered yet "
+                          "(arrays/strings come later)");
             break;
         }
 
@@ -492,15 +729,8 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
             init = ST_lower_expr(c, s->decl.init);
         else if (ST_ty_is_float(ty))
             init = ST_ir_const_float(c->cur, ty, 0.0);
-        else if (ST_lower_ty_is_scalar(ty))
-            init = ST_ir_const_int(c->cur, ty, 0);
         else
-        {
-            ST_diag_error(&c->diag, s->line, s->col,
-                          "internal: uninitialized aggregate declarations aren't lowered yet "
-                          "(lands with struct lowering)");
-            break;
-        }
+            init = ST_ir_const_int(c->cur, ty, 0);
 
         if (taken)
         {
@@ -518,6 +748,37 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
 
     case ST_ST_ASSIGN: {
         ST_expr_t *lhs = s->assign.lhs;
+
+        if (lhs->ty && lhs->ty->kind == ST_TY_STRUCT)
+        {
+            if (!ST_string_eq_cstr(s->assign.op, "="))
+            {
+                ST_diag_error(&c->diag, s->line, s->col,
+                              "internal: compound assignment on struct values isn't a thing");
+                break;
+            }
+            ST_ir_inst_t *dst = ST_lower_lvalue_addr(c, lhs);
+            if (!dst) break;
+            if (s->assign.rhs->kind == ST_EX_STRUCT_LIT)
+            {
+                ST_lower_struct_zero(c, dst, 0, lhs->ty, s->line, s->col);
+                ST_lower_struct_lit_into(c, dst, 0, lhs->ty, s->assign.rhs);
+            }
+            else
+            {
+                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->assign.rhs);
+                if (src)
+                    ST_lower_struct_copy(c, dst, 0, src, 0, lhs->ty, s->line, s->col);
+            }
+            break;
+        }
+
+        if (lhs->kind == ST_EX_FIELD)
+        {
+            ST_ir_inst_t *addr = ST_lower_lvalue_addr(c, lhs);
+            if (addr) ST_lower_store_assign(c, s, lhs->ty, addr);
+            break;
+        }
 
         if (lhs->kind == ST_EX_UNARY && ST_string_eq_cstr(lhs->unary.op, "*"))
         {
@@ -632,6 +893,14 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d)
     {
         ST_param_t *p = &d->fn.sig.params.items[i];
         ST_ty_t *pty = fn_ty->params.items[i];
+        if (pty && !ST_lower_ty_is_scalar(pty))
+        {
+            ST_diag_error(&c->diag, d->line, d->col,
+                          "internal: passing '" ST_sv_fmt "' by value isn't lowered yet "
+                          "(SysV aggregate classification comes later); take a pointer",
+                          ST_sv_args(p->name));
+            continue;
+        }
         ST_ir_inst_t *pv = ST_ir_param(entry, pty, i, p->name);
 
         if (ST_lower_is_addr_taken(c, p->name))
