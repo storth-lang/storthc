@@ -1,6 +1,7 @@
 #include "utils/st_helper.h"
 #include "utils/st_arena.h"
 #include "utils/st_string.h"
+#include "utils/st_process.h"
 #include "frontend/st_lexer.h"
 #include "frontend/st_parser.h"
 #include "frontend/st_semantic.h"
@@ -63,9 +64,21 @@ int main(int argc, char **argv)
     ST_ir_module_t mod = {0};
     rc = ST_lower_program(arena, &prog, &sema, src, file, &mod) ? 0 : 1;
     if (dump_ir) ST_ir_dump_module(stdout, &mod);
-    if (emit_asm) if (!ST_nasm_generate(stdout, &mod, src, file, 1)) goto done;
+    const char *asm_path = "test.asm";
+    FILE *f = fopen(asm_path, "wb");
+    if (emit_asm) if (!ST_nasm_generate(f, &mod, src, file, 1)) goto done;
+
+    ST_procs_t procs = {0};
+    {
+        ST_append_process(&procs, "nasm", "-f", "elf64", asm_path);
+        if (!ST_run_processes(&procs)) goto done;
+
+        ST_append_process(&procs, "ld", "-o", "test", "test.o");
+        if (!ST_run_processes(&procs)) goto done;
+    }
 
 done:
+    ST_free_process(&procs);
     ST_arena_free(arena);
     return rc;
 }

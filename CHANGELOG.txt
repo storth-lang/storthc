@@ -35,6 +35,13 @@
   It is still incomplete will tag union and allocator support however this is more than enough
   to implement rule 110 to test turing completeness.
 
+- Added a process abstraction api header that is completely independent from the platform
+  yes the implementation is platform specific I can now use that as a template to do use it on
+  other OS.
+
+- This process abstraction still lacks some stuff that we need but for what we want it will suffice as
+  we want to start working on the actual generated symbols now.
+
 - Added support for strings on the ir level this does not mean strings do not require modification
   lexically as they have to be decayed into cstring when passed to extern names. This will preserve
   the comaptibilty we need from with in the future and makes it so easy to interact with libc.
