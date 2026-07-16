@@ -30,3 +30,7 @@
 
 - Fixed my test framework to store information of after set because initially after being set
   it does reset the data base instead of appending to it in the end.
+
+- Adding support for pointers in struct and also in getting hexal address of a variable.
+  It is still incomplete will tag union and allocator support however this is more than enough
+  to implement rule 110 to test turing completeness.
