@@ -250,6 +250,24 @@ ST_ir_inst_t *ST_ir_const_float(ST_ir_block_t *b, ST_ty_t *ty, f64 v)
     return inst;
 }
 
+ST_ir_inst_t *ST_ir_const_str(ST_ir_block_t *b, ST_ty_t *ty, u32 index)
+{
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_CONST_STRING, ty, 0, 0);
+    inst->str_index = index;
+    return inst;
+}
+
+u32 ST_ir_module_intern_str(ST_ir_module_t *m, ST_string_t bytes)
+{
+    ST_forrange(0, m->strs.count)
+    {
+        if (ST_string_eq(bytes, m->strs.items[i])) return i;
+    }
+    ST_da_append_arena(m->arena, &m->strs, bytes);
+    return m->strs.count - 1;
+}
+
+
 ST_ir_inst_t *ST_ir_binop(ST_ir_block_t *b, ST_ir_op_t op, ST_ty_t *ty,
                           ST_ir_inst_t *l, ST_ir_inst_t *r, u32 line, u32 col)
 {
@@ -404,11 +422,12 @@ void ST_ir_term_unreachable(ST_ir_block_t *b, u32 line, u32 col)
 
 static const char *ST_ir_op_name(ST_ir_op_t op)
 {
-    _Static_assert(ST_IR_COUNT == 48, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
+    _Static_assert(ST_IR_COUNT == 49, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
     switch (op)
     {
     case ST_IR_CONST_INT: return "const_int";
     case ST_IR_CONST_FLOAT: return "const_float";
+    case ST_IR_CONST_STRING: return "const_string";
     case ST_IR_ADD: return "add"; case ST_IR_SUB: return "sub"; case ST_IR_MUL: return "mul";
     case ST_IR_SDIV: return "sdiv"; case ST_IR_UDIV: return "udiv";
     case ST_IR_SREM: return "srem"; case ST_IR_UREM: return "urem";
@@ -486,11 +505,12 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn)
             ST_ir_dump_val(out, inst);
             fprintf(out, " = %s", ST_ir_op_name(inst->kind));
 
-            _Static_assert(ST_IR_COUNT == 48, "IR is exceeded");
+            _Static_assert(ST_IR_COUNT == 49, "IR is exceeded");
             switch (inst->kind)
             {
             case ST_IR_CONST_INT: fprintf(out, " %lld", (long long)inst->const_int); break;
             case ST_IR_CONST_FLOAT: fprintf(out, " %g", inst->const_float); break;
+            case ST_IR_CONST_STRING: fprintf(out, " str.%u", inst->str_index); break;
             case ST_IR_PARAM: fprintf(out, " %u \"" ST_sv_fmt "\"", inst->params.index, ST_sv_args(inst->params.name)); break;
             case ST_IR_CALL:
                 fprintf(out, " " ST_sv_fmt "(", ST_sv_args(inst->call.callee_name));

@@ -45,7 +45,7 @@ static void ST_mem_store(FILE *out, ST_ty_t *ty)
 
 static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
 {
-    _Static_assert(ST_IR_COUNT == 48, "IR count exceeded");
+    _Static_assert(ST_IR_COUNT == 49, "IR count exceeded");
     if (in->removed) return;
     switch(in->kind)
     {
@@ -53,6 +53,7 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
         fprintf(out, "    mov rax, %ld\n", in->const_int);
     } break;
     case ST_IR_CONST_FLOAT: ST_todo("ST_IR_CONST_FLOAT"); break;
+    case ST_IR_CONST_STRING: ST_todo("ST_IR_CONST_STRING"); break;
     case ST_IR_ADD: {
         ST_load(out, "rax", in->bin.l);
         ST_load(out, "rcx", in->bin.r);

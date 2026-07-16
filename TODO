@@ -13,7 +13,8 @@
 - [ ] Libclang parsing should only be added as a compiler module. Hard depending on build time is stupid.
 - [ ] Majority of the directives feature do not work yet. We will add support for each one.
 - [ ] Make the comptime block interpreterd and also uses byte code.
-- [ ] Type_info to do of any type should work with generic functions as if I call a function I pass it type info the fn is generic it should not fail.
+- [ ] Type_info to do of any type should work with generic functions as if I call a function I pass it
+      type info the fn is generic it should not fail.
 - [ ] Make a menu config like linux kernel to customize the following.
     - [ ] Platforms to support.(default current-only). Adds support for -t flag.
     - [ ] Bake the assembler and the linker into the executable. 
@@ -32,6 +33,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - Expand the IR to support the following
 
  - [x] Structs.
+ - [x] Strings.
  - [ ] Enums.
  - [ ] Unions.
  - [ ] Multiple return.
@@ -55,3 +57,10 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Write debug symbols via dwarf 5 specification
 - [ ] x86_64 linux backend should not use any libc in asm raw syscalls.
 - [ ] Static should basically be in .bss section.
+
+## Strings Asm
+
+- [ ] Use mmap to view strings on the pointer of .len and .data other wise it is impossible.
+- [ ] Strings have to be utf8 so the size of the strings should be validated with in the compiler.
+- [ ] Since strings are views old views that were never constructed should be deleted(TBD)?
+- [ ] Semantically the best way to slice a string is have a slice function on the level of module.

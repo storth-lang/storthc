@@ -34,3 +34,7 @@
 - Adding support for pointers in struct and also in getting hexal address of a variable.
   It is still incomplete will tag union and allocator support however this is more than enough
   to implement rule 110 to test turing completeness.
+
+- Added support for strings on the ir level this does not mean strings do not require modification
+  lexically as they have to be decayed into cstring when passed to extern names. This will preserve
+  the comaptibilty we need from with in the future and makes it so easy to interact with libc.

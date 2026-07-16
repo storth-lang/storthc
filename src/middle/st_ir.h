@@ -30,6 +30,7 @@ typedef enum
 {
     ST_IR_CONST_INT,
     ST_IR_CONST_FLOAT,
+    ST_IR_CONST_STRING,
  
     ST_IR_ADD, ST_IR_SUB, ST_IR_MUL,
     ST_IR_SDIV, ST_IR_UDIV, ST_IR_SREM, ST_IR_UREM,
@@ -90,6 +91,7 @@ struct ST_ir_inst_t
     union {
         i64 const_int;
         f64 const_float;
+        u32 str_index;
         struct { ST_ir_inst_t *l, *r; } bin;
         struct { ST_ir_inst_t *v; } unary;
         struct { ST_ir_inst_t *v; } cast;
@@ -166,12 +168,14 @@ struct ST_ir_fn_t
 
 
 typedef struct { ST_ir_fn_t **items; u32 count, capacity; } ST_ir_fns_t;
+typedef struct { ST_string_t *items; u32 count, capacity; } ST_ir_strs_t;
  
 struct ST_ir_module_t
 {
     ST_arena_t *arena;
     ST_string_t name;
     ST_ir_fns_t fns;
+    ST_ir_strs_t strs;
 };
 
 
@@ -184,12 +188,14 @@ void ST_ir_block_seal(ST_ir_block_t *b);
 void ST_ir_add_edge(ST_ir_block_t *from, ST_ir_block_t *to);
 b8 ST_ir_block_is_terminated(ST_ir_block_t *b);
 
-
 void ST_ir_write_var(ST_ir_block_t *b, void *var, ST_ir_inst_t *val);
 ST_ir_inst_t *ST_ir_read_var(ST_ir_block_t *b, void *var, ST_ty_t *ty);
 
 ST_ir_inst_t *ST_ir_const_int(ST_ir_block_t *b, ST_ty_t *ty, i64 v);
 ST_ir_inst_t *ST_ir_const_float(ST_ir_block_t *b, ST_ty_t *ty, f64 v);
+u32 ST_ir_module_intern_str(ST_ir_module_t *m, ST_string_t bytes);
+ST_ir_inst_t *ST_ir_const_str(ST_ir_block_t *b, ST_ty_t *ty, u32 index);
+
 ST_ir_inst_t *ST_ir_binop(ST_ir_block_t *b, ST_ir_op_t op, ST_ty_t *ty, ST_ir_inst_t *l, ST_ir_inst_t *r, u32 line, u32 col);
 ST_ir_inst_t *ST_ir_unop(ST_ir_block_t *b, ST_ir_op_t op, ST_ty_t *ty, ST_ir_inst_t *v, u32 line, u32 col);
 ST_ir_inst_t *ST_ir_cast(ST_ir_block_t *b, ST_ty_t *to_ty, ST_ir_inst_t *v, u32 line, u32 col);
