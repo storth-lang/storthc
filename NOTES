@@ -35,3 +35,23 @@ Temporarily I still did not implement any backend for my language or added flag 
 # Ideas:
 
 - Use raw mmap syscalls for the dynamic array.
+
+# Strings 
+They are going to be utf8-strings that will be stored in the following layout.
+
+```
+struct string {
+    char *data;
+    u32 len;
+}
+```
+
+On extern function calls from C. They should decay into pointer of *char. Other wise it makes it annoying to do str.data on extern calls.
+Aside from that I also intend to make strings non null terminated. They will have a module of their own for slicing and doing all the stuff that we need however for now lets just make strings be denoted as that *data and the length of the string.
+
+Also the operation == && != should work on strings on the level of not ascii but utf8.
+We should not be able to index a string and modify its char from the data pointer as that is destorying memory.
+Some pitfalls with our strings. Debugging them becomes a bit annoying. We should not care about having interpolation at the level of the compiler.
+Interpolation should be at the level of the module so if some user gets uncomfortable with the interpolation they should be able to override the preexisiting module.
+
+x := "Urmom";
