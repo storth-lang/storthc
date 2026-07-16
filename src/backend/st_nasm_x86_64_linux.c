@@ -14,8 +14,38 @@ static void ST_load(FILE *out, const char *reg, ST_ir_inst_t *v)
     fprintf(out, "    mov %s, [rbp%+d]\n", reg, ST_slot(v));
 }
 
+static void ST_mem_load(FILE *out, ST_ty_t *ty)
+{
+    u32 size = ty && ty->size ? ty->size : 8;
+    b8 _signed = ty && ty->kind == ST_TY_INT && ty->is_signed;
+    switch (size)
+    {
+    case 1: fprintf(out, "    %s rax, byte [rcx]\n", _signed ? "movsx" : "movzx"); break;
+    case 2: fprintf(out, "    %s rax, word [rcx]\n", _signed ? "movsx" : "movzx"); break;
+    case 4: {
+        if (_signed) { fprintf(out, "    movsxd rax, dword [rcx]\n"); break; }
+        else { fprintf(out, "    mov eax, dword [rcx]\n"); break; }
+        break;
+    }
+    default: fprintf(out, "    mov rax, [rcx]\n"); break;
+    }
+}
+
+static void ST_mem_store(FILE *out, ST_ty_t *ty)
+{
+    u32 size = ty && ty->size ? ty->size : 8;
+    switch (size)
+    {
+    case 1: fprintf(out, "    mov [rcx], al\n"); break;
+    case 2: fprintf(out, "    mov [rcx], ax\n"); break;
+    case 4: fprintf(out, "    mov [rcx], eax\n"); break;
+    default: fprintf(out, "    mov [rcx], rax\n"); break;
+    }
+}
+
 static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
 {
+    _Static_assert(ST_IR_COUNT == 48, "IR count exceeded");
     if (in->removed) return;
     switch(in->kind)
     {
@@ -91,6 +121,38 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     case ST_IR_CALL_INDIRECT: ST_todo("ST_IR_CALL_INDIRECT"); break;
     case ST_IR_PHI: ST_todo("ST_IR_PHI"); break;
     case ST_IR_COUNT: ST_todo("ST_IR_COUNT"); break;
+    case ST_IR_ALLOCA: {
+        fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off);
+    } break;
+    case ST_IR_LOAD: {
+        ST_load(out, "rcx", in->store.addr);
+        ST_mem_load(out, in->ty);
+    } break;
+    case ST_IR_STORE: {
+        ST_load(out, "rax", in->store.v);
+        ST_load(out, "rcx", in->store.addr);
+        ST_mem_store(out, in->ty);
+    } break;
+    case ST_IR_ADDR: {
+        ST_load(out, "rax", in->addr.base);
+        if (in->addr.index)
+        {
+            ST_load(out, "rcx", in->addr.index);
+            u32 _scale = in->addr.scale ? in->addr.scale : 1;
+            if (_scale == 1 || _scale == 2 || _scale == 4 || _scale == 8) {
+                fprintf(out, "    lea rax, [rax + rcx-%u]\n", _scale);
+            } else
+            {
+                fprintf(out, "    imul rcx, %u\n", _scale);
+                fprintf(out, "    add rax, rcx\n");
+            }
+            if (in->addr.offset) {
+                fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
+            }
+        }
+    } break;
+    case ST_IR_GLOBAL_ADDR: ST_todo("ST_IR_GLOBAL_ADDR"); break;
+
     default: break;
     }
     if (in->ty && in->ty->kind != ST_TY_VOID) 
