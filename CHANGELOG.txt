@@ -34,3 +34,10 @@
 - Adding support for pointers in struct and also in getting hexal address of a variable.
   It is still incomplete will tag union and allocator support however this is more than enough
   to implement rule 110 to test turing completeness.
+
+- Added a process abstraction api header that is completely independent from the platform
+  yes the implementation is platform specific I can now use that as a template to do use it on
+  other OS.
+
+- This process abstraction still lacks some stuff that we need but for what we want it will suffice as
+  we want to start working on the actual generated symbols now.
