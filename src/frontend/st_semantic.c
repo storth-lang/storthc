@@ -2,9 +2,7 @@
 #include "st_lexer.h"
 
 // Note that this will not be a built in in the future.
-static const char *ST_builtin_fns[] = { "println" };
-
-// Rets list handed back for calls to builtins (void, no checking).
+static const char *ST_builtin_fns[] = { "typeof" };
 static ST_tys_t ST_builtin_rets;
 
 static ST_ht_generic_t ST_name_key(ST_string_t name)
@@ -571,8 +569,20 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e)
     return u;
 }
 
-// Type-checks a call and returns the callee's return-type list.
-// NULL means the callee was unknown/untypeable.
+static void ST_arg_extern_decay(ST_sema_t *se, ST_sym_t *sym, ST_ty_t *pt, ST_arg_t *arg)
+{
+    if (!sym || !sym->decl || sym->decl->kind != ST_DE_EXTERN_FN) return;
+    if (!arg->value->ty || arg->value->ty->kind != ST_TY_STRING) return;
+    if (pt && (pt->kind != ST_TY_PTR
+        || (pt->inner->kind != ST_TY_CHAR && pt->inner->kind != ST_TY_VOID))) return;
+
+    ST_expr_t *cs = ST_expr_new(se->arena, ST_EX_CSTR,
+                                arg->value->line, arg->value->col);
+    cs->tyop.operand = arg->value;
+    cs->ty = ST_ty_ptr(&se->tys, se->tys.prim[ST_tchar]);
+    arg->value = cs;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e)
 {
     ST_expr_t *callee = e->call.callee;
@@ -669,6 +679,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e)
                 idx = pos++;
             if (idx >= fnty->params.count) continue;
             ST_ty_t *pt = fnty->params.items[idx];
+            ST_arg_extern_decay(se, sym, pt, arg);
             ST_ty_t *at = arg->value->ty;
             if (pt && at && !ST_ty_coerces(se, at, pt))
                 ST_diag_error(&se->diag, arg->value->line, arg->value->col,
@@ -716,9 +727,10 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e)
     // positional type checks
     ST_forrange(0, n)
     {
-        if (i >= max_p) break; // variadic tail: already typed above
+        if (i >= max_p) break;
         ST_arg_t *arg = &e->call.args.items[i];
         ST_ty_t *pt = fnty->params.items[i];
+        ST_arg_extern_decay(se, sym, pt, arg); 
         ST_ty_t *at = arg->value->ty;
         if (pt && at && !ST_ty_coerces(se, at, pt))
         {
@@ -730,6 +742,11 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e)
                              "'" ST_sv_fmt "' is declared here",
                              ST_sv_args(sym->name));
         }
+    }
+    if (fnty->is_variadic)
+    {
+        ST_forrange(max_p, n)
+            ST_arg_extern_decay(se, sym, NULL, &e->call.args.items[i]);
     }
     return &fnty->rets;
 }
@@ -1058,6 +1075,23 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s)
     ST_ty_t *lt = ST_type_expr(se, s->assign.lhs);
     ST_ty_t *rt = ST_type_expr(se, s->assign.rhs);
     if (!lt || !rt) return;
+    ST_expr_t *lhs = s->assign.lhs;
+    if (lhs->kind == ST_EX_INDEX && lhs->index.base->ty
+        && lhs->index.base->ty->kind == ST_TY_STRING)
+    {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "strings are immutable; cannot assign into a string");
+        return;
+    }
+    if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty
+        && lhs->field.base->ty->kind == ST_TY_STRING)
+    {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "'" ST_sv_fmt "' of a string is read-only; "
+                      "reassign the whole string instead",
+                      ST_sv_args(lhs->field.name));
+        return;
+    }
     ST_string_t op = s->assign.op;
 
     if (ST_string_eq_cstr(op, "="))
