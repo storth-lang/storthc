@@ -2,53 +2,43 @@
 #include "utils/st_arena.h"
 #include "utils/st_string.h"
 #include "utils/st_process.h"
+#include "utils/st_flag.h"
 #include "frontend/st_lexer.h"
 #include "frontend/st_parser.h"
 #include "frontend/st_semantic.h"
 #include "middle/st_lower.h"
 #include "backend/st_nasm.h"
 
-static void ST_usage(const char *prog)
-{
-    fprintf(stderr, "usage: %s [--emit-asm] [--dump-ir] [--dump-tokens] [--dump-ast] <file.st>\n", prog);
-}
-
 int main(int argc, char **argv)
 {
-    const char *path = NULL;
     b8 dump_tokens = 0, dump_ast = 0, dump_ir = 0, emit_asm = 0;
-
-    for (int i = 1; i < argc; i++)
-    {
-        if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = 1;
-        else if (strcmp(argv[i], "--dump-ast") == 0) dump_ast = 1;
-        else if (strcmp(argv[i], "--dump-ir") == 0) dump_ir = 1;
-        else if (strcmp(argv[i], "--emit-asm") == 0) emit_asm = 1;
-        else if (argv[i][0] == '-')
-        {
-            ST_usage(argv[0]);
-            return 1;
-        }
-        else path = argv[i];
-    }
-    if (!path)
-    {
-        ST_usage(argv[0]);
-        return 1;
-    }
+    char *path = NULL;
 
     ST_arena_t *arena = ST_arena_alloc();
-    ST_string_t file = ST_abs_path(arena, path);
+    ST_flag_parser_t *fp = ST_flag_init(arena);
+    ST_procs_t procs = {0};
+    int rc = 1;
 
+    ST_flag_bool(fp, "dump_tokens", "Dump the tokens of storth source code", &dump_tokens);
+    ST_flag_bool(fp, "dump_ast", "Dump the ast of storth source code", &dump_ast);
+    ST_flag_bool(fp, "dump_ir", "Print out the intermediate representation of storth source code with its custom IR", &dump_ir);
+    ST_flag_bool(fp, "emit-asm", "Emit the assembly instruction that is generated from the IR(nasm)", &emit_asm);
+    ST_flag_alias(fp, "emit-asm", 's');
+    ST_flag_positional(fp, "input", "Path to the storth source file to compile", &path, 1);
+
+    if (!ST_flag_parse(fp, argc, argv))
+    {
+        ST_flag_usage(fp);
+        goto done;
+    }
+
+    ST_string_t file = ST_abs_path(arena, path);
     ST_string_t src = {0};
     if (!ST_read_entire_file(arena, &src, path))
     {
         fprintf(stderr, "error: could not read '%s'\n", path);
-        ST_arena_free(arena);
-        return 1;
+        goto done;
     }
-
-    int rc = 1;
 
     ST_tokens_t tokens = ST_lex(arena, src, file);
     if (!tokens.ok) goto done;
@@ -64,18 +54,24 @@ int main(int argc, char **argv)
     ST_ir_module_t mod = {0};
     rc = ST_lower_program(arena, &prog, &sema, src, file, &mod) ? 0 : 1;
     if (dump_ir) ST_ir_dump_module(stdout, &mod);
+    if (rc != 0) goto done;
+
     const char *asm_path = "test.asm";
     FILE *f = fopen(asm_path, "wb");
-    if (emit_asm) if (!ST_nasm_generate(f, &mod, src, file, 1)) goto done;
-
-    ST_procs_t procs = {0};
+    if (emit_asm)
     {
-        ST_append_process(&procs, "nasm", "-f", "elf64", asm_path);
-        if (!ST_run_processes(&procs)) goto done;
-
-        ST_append_process(&procs, "ld", "-o", "test", "test.o");
-        if (!ST_run_processes(&procs)) goto done;
+        if (!ST_nasm_generate(f, &mod, src, file, 1))
+        {
+            fclose(f);
+            goto done;
+        }
     }
+    fclose(f);
+
+    ST_append_process(&procs, "nasm", "-f", "elf64", asm_path);
+    if (!ST_run_processes(&procs)) goto done;
+    ST_append_process(&procs, "ld", "-o", "test", "test.o");
+    if (!ST_run_processes(&procs)) goto done;
 
 done:
     ST_free_process(&procs);
