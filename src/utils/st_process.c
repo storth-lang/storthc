@@ -42,7 +42,7 @@ b8 ST_wait_process(ST_proc_t *proc)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// Todo make customizable with reset or no reset.
+// TODO make customizable with reset or no reset.
 b8 ST_run_processes(ST_procs_t *procs)
 {
     b8 ok = 1;

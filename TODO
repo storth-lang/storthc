@@ -2,10 +2,10 @@
 
 # General TODOs
 
-- [ ] Fix pipeline to accept command line arguments.
+- [x] Fix pipeline to accept command line arguments.
 - [ ] Add support for x86_64 linux and windows via nasm.
 - [ ] Should users be able to customize the assembler they choose(TBD)?
-- [ ] Use ld linker for linking.
+- [x] Use ld linker for linking.
 - [ ] Have an interface for creating and executing process between windows and linux.
 - [x] Have tester.c with its own test framework with sha256 and custom file format
 - [ ] Make the linker and assembler bakeable programs.
