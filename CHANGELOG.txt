@@ -45,3 +45,9 @@
 - Added support for strings on the ir level this does not mean strings do not require modification
   lexically as they have to be decayed into cstring when passed to extern names. This will preserve
   the comaptibilty we need from with in the future and makes it so easy to interact with libc.
+
+2026:07:17
+
+- Added a flag parser api that is OS agnositc in the level of the api this will still obviously require
+  more work with very nice error handeling and also using the color system but for at the very least
+  having some sort of an api it is nice.
