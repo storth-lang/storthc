@@ -63,6 +63,15 @@ static void ST_generate_strs(FILE *out, ST_ir_module_t *m)
     }
 }
 
+static void ST_icmp(FILE *out, ST_ir_inst_t *in, const char *setcc)
+{
+    ST_load(out, "rax", in->bin.l);
+    ST_load(out, "rcx", in->bin.r);
+    fprintf(out, "    cmp rax, rcx\n");
+    fprintf(out, "    %s al\n", setcc);
+    fprintf(out, "    movzx rax, al\n");
+}
+
 static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
 {
     _Static_assert(ST_IR_COUNT == 49, "IR count exceeded");
@@ -108,22 +117,16 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     case ST_IR_LSHR: ST_todo("ST_IR_LSHR"); break;
     case ST_IR_ASHR: ST_todo("ST_IR_ASHR"); break;
     case ST_IR_NOT: ST_todo("ST_IR_NOT"); break;
-    case ST_IR_ICMP_EQ: ST_todo("ST_IR_ICMP_EQ"); break;
-    case ST_IR_ICMP_NE: ST_todo("ST_IR_ICMP_NE"); break;
-    case ST_IR_ICMP_SLT: {
-        ST_load(out, "rax", in->bin.l);
-        ST_load(out, "rcx", in->bin.r);
-        fprintf(out, "    cmp rax, rcx\n");
-        fprintf(out, "    setl al\n");
-        fprintf(out, "    movzx rax, al\n");
-    } break;
-    case ST_IR_ICMP_SLE: ST_todo("ST_IR_ICMP_SLE"); break;
-    case ST_IR_ICMP_SGT: ST_todo("ST_IR_ICMP_SGT"); break;
-    case ST_IR_ICMP_SGE: ST_todo("ST_IR_ICMP_SGE"); break;
-    case ST_IR_ICMP_ULT: ST_todo("ST_IR_ICMP_ULT"); break;
-    case ST_IR_ICMP_ULE: ST_todo("ST_IR_ICMP_ULE"); break;
-    case ST_IR_ICMP_UGT: ST_todo("ST_IR_ICMP_UGT"); break;
-    case ST_IR_ICMP_UGE: ST_todo("ST_IR_ICMP_UGE"); break;
+    case ST_IR_ICMP_EQ: ST_icmp(out, in, "sete"); break;
+    case ST_IR_ICMP_NE: ST_icmp(out, in, "setne"); break;
+    case ST_IR_ICMP_SLT: ST_icmp(out, in, "setl"); break;
+    case ST_IR_ICMP_SLE: ST_icmp(out, in, "setle"); break;
+    case ST_IR_ICMP_SGT: ST_icmp(out, in, "setg"); break;
+    case ST_IR_ICMP_SGE: ST_icmp(out, in, "setge"); break;
+    case ST_IR_ICMP_ULT: ST_icmp(out, in, "setb"); break;
+    case ST_IR_ICMP_ULE: ST_icmp(out, in, "setbe"); break;
+    case ST_IR_ICMP_UGT: ST_icmp(out, in, "seta"); break;
+    case ST_IR_ICMP_UGE: ST_icmp(out, in, "setae"); break;
     case ST_IR_FCMP_EQ: ST_todo("ST_IR_FCMP_EQ"); break;
     case ST_IR_FCMP_NE: ST_todo("ST_IR_FCMP_NE"); break;
     case ST_IR_FCMP_LT: ST_todo("ST_IR_FCMP_LT"); break;
@@ -145,7 +148,7 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     case ST_IR_PHI: ST_todo("ST_IR_PHI"); break;
     case ST_IR_COUNT: ST_todo("ST_IR_COUNT"); break;
     case ST_IR_ALLOCA: {
-        fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off);
+        fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off); 
     } break;
     case ST_IR_LOAD: {
         ST_load(out, "rcx", in->store.addr);

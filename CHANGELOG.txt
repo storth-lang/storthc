@@ -61,3 +61,5 @@
   with this in place I can implement rule 110. Obviously once I add support in the assembly.
 
 - Added some test cases just to see how well the compiler does from what we have now.
+
+- Added ==, >=, <=, !=, >, < with variable working in the backend of nasm.
