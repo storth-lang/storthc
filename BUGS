@@ -1,0 +1,17 @@
+2026:07:19
+
+```
+./bin/storthc -r main.st 
+/home/segfault/Programming/segfault/storthc/main.st:6:37: error: unexpected ';'; expected an expression
+   4 |         printf("Urmom is a ping\n");
+   5 |     } else if  {
+   6 |         printf("Urmom is a horse\n");
+     |                                     ^
+/home/segfault/Programming/segfault/storthc/main.st:7:7: error: expected a top-level declaration (fn, struct, enum, tag_union, const, extern), got 'else'
+   5 |     } else if  {
+   6 |         printf("Urmom is a horse\n");
+   7 |     } else {
+     |       ^
+```
+
+This is a decriptic error message from this unfinished condition the semantic analyzer should tell as before hand of unfinished branch. No need to even try to lower the condition.
