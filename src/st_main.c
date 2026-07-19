@@ -36,7 +36,7 @@ int main(int argc, char **argv)
                  &build_exe);
     ST_flag_bool(fp, "run", "Generate the executable and run the "
                  "generated executable.", &run_exe);
-    ST_flag_bool(fp, "emit-obj", "Emit the object files"
+    ST_flag_bool(fp, "emit-obj", "Emit the object files "
                  "generated from the assembly", &emit_obj);
 
     ST_flag_alias(fp, "emit-asm", 's');

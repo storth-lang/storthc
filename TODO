@@ -64,3 +64,12 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Strings have to be utf8 so the size of the strings should be validated with in the compiler.
 - [ ] Since strings are views old views that were never constructed should be deleted(TBD)?
 - [ ] Semantically the best way to slice a string is have a slice function on the level of module.
+
+
+09:00:30 Idea masturbation
+
+- [ ] No macro system. We will have some meta staging from the meta
+      language.[terra](https://dl.acm.org/doi/pdf/10.1145/258993.259019)
+- [ ] User defined compile time directives as attributes
+- [ ] Exposure of compiler plugin meaning the user can create event pull
+      based compiler plugins instead of jai's message push style one.
