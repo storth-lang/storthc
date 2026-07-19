@@ -68,7 +68,7 @@ typedef double f64;
         abort();                                \
 } while(0)
 
-#define ST_MIN(a, b) ((a) < (b)) ? (a) : (b)
-#define ST_MAX(a, b) ((a) > (b)) ? (a) : (b)
+#define ST_MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define ST_MAX(a, b) (((a) > (b)) ? (a) : (b))
 
 #endif

@@ -28,8 +28,6 @@ void *ST_arena_push(ST_arena_t *arena, u64 size);
 void *ST_arena_push_zeroed(ST_arena_t *arena, u64 size);
 void ST_arena_pop(ST_arena_t *arena, u64 pos);
 
-// da_append for lists that live inside arena-owned structures (AST nodes).
-// Grows into the arena; abandoned blocks are reclaimed by ST_arena_free.
 #define ST_da_append_arena(a, arr, item)                                \
     do {                                                                \
         if ((arr)->count >= (arr)->capacity)                            \

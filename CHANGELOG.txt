@@ -51,3 +51,6 @@
 - Added a flag parser api that is OS agnositc in the level of the api this will still obviously require
   more work with very nice error handeling and also using the color system but for at the very least
   having some sort of an api it is nice.
+
+- Finally after so long added strings granted that the user can not access the field data and len
+  yet this is still a nicer starting point.
