@@ -64,7 +64,8 @@ typedef double f64;
 
 #define ST_todo(msg)                            \
     do {                                        \
-        fprintf(stderr, "TODO: %s\n", msg);     \
+        fprintf(stderr, "%s:%d:1 TODO: %s\n",   \
+                __FILE__, __LINE__, msg);       \
         abort();                                \
 } while(0)
 
