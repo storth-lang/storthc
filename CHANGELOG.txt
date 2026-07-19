@@ -54,3 +54,10 @@
 
 - Finally after so long added strings granted that the user can not access the field data and len
   yet this is still a nicer starting point.
+
+2026:07:18
+
+- Added support for if else in the level of the IR. Yes still while and for loop are missing but at least
+  with this in place I can implement rule 110. Obviously once I add support in the assembly.
+
+- Added some test cases just to see how well the compiler does from what we have now.

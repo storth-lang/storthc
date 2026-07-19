@@ -726,6 +726,11 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
     }
 }
 
+static void ST_lower_body(ST_lower_ctx_t *c, ST_stmts_t *body)
+{
+    ST_forrange(0, body->count) ST_lower_stmt(c, body->items[i]);
+}
+
 static void ST_lower_store_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
                                   ST_ir_inst_t *addr)
 {
@@ -933,13 +938,43 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         break;
     }
 
+    case ST_ST_IF: {
+        ST_ir_inst_t *cond = ST_lower_expr(c, s->if_.cond);
+        if (!cond) break;
+
+        ST_ir_block_t *then_b = ST_ir_block_new(c->fn, "if_then");
+        ST_ir_block_t *else_b = s->if_.else_stmt ?
+            ST_ir_block_new(c->fn, "if_else") : NULL;
+
+        ST_ir_block_t *join = ST_ir_block_new(c->fn, "if_end");
+        ST_ir_term_condbr(c->cur, cond, then_b, else_b ? else_b : join, s->line, s->col);
+
+        ST_ir_block_seal(then_b);
+        c->cur = then_b;
+        ST_lower_body(c, &s->if_.then_body);
+        if (!ST_ir_block_is_terminated(c->cur))
+            ST_ir_term_br(c->cur, join, s->line, s->col);
+
+        if (else_b)
+        {
+            ST_ir_block_seal(else_b);
+            c->cur = else_b;
+            ST_lower_stmt(c, s->if_.else_stmt);
+            if (!ST_ir_block_is_terminated(c->cur))
+                ST_ir_term_br(c->cur, join, s->line, s->col);
+        }
+        ST_ir_block_seal(join);
+        c->cur = join;
+        if (join->preds.count == 0) ST_ir_term_unreachable(join, s->line, s->col);
+    } break;
+
     case ST_ST_BLOCK:
         ST_forrange(0, s->block.count) ST_lower_stmt(c, s->block.items[i]);
         break;
 
     default:
         ST_diag_error(&c->diag, s->line, s->col,
-                      "internal: control flow (if/while/for/switch/goto/defer) isn't lowered yet");
+                      "internal: control flow (while/for/switch/goto/defer) isn't lowered yet");
         break;
     }
 }
