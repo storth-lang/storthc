@@ -968,13 +968,42 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         if (join->preds.count == 0) ST_ir_term_unreachable(join, s->line, s->col);
     } break;
 
+    case ST_ST_WHILE: {
+        ST_ir_block_t *while_begin = ST_ir_block_new(c->fn, "while_begin");
+        ST_ir_block_t *while_body  = ST_ir_block_new(c->fn, "while_body");
+        ST_ir_block_t *while_end   = ST_ir_block_new(c->fn, "while_end");
+
+        ST_ir_term_br(c->cur, while_begin, s->line, s->col);
+        c->cur = while_begin;
+
+        ST_ir_inst_t *cond = ST_lower_expr(c, s->while_.cond);
+        if (!cond)
+        {
+            ST_ir_block_seal(while_begin);
+            ST_ir_block_seal(while_end);
+            c->cur = while_end;
+            break;
+        }
+        ST_ir_term_condbr(c->cur, cond, while_body, while_end, s->line, s->col);
+        ST_ir_block_seal(while_body);
+        c->cur = while_body;
+        ST_lower_body(c, &s->while_.body);
+
+        if (!ST_ir_block_is_terminated(c->cur))
+            ST_ir_term_br(c->cur, while_begin, s->line, s->col);
+
+        ST_ir_block_seal(while_body);
+        ST_ir_block_seal(while_end);
+        c->cur = while_end;
+    } break;
+
     case ST_ST_BLOCK:
         ST_forrange(0, s->block.count) ST_lower_stmt(c, s->block.items[i]);
         break;
 
     default:
         ST_diag_error(&c->diag, s->line, s->col,
-                      "internal: control flow (while/for/switch/goto/defer) isn't lowered yet");
+                      "internal: control flow (for/switch/goto/defer) isn't lowered yet");
         break;
     }
 }
