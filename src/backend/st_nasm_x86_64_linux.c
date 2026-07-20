@@ -145,13 +145,13 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
         fprintf(out, "    call " ST_sv_fmt "\n", ST_sv_args(in->call.callee_name));
     }break;
     case ST_IR_CALL_INDIRECT: ST_todo("ST_IR_CALL_INDIRECT"); break;
-    case ST_IR_PHI: ST_todo("ST_IR_PHI"); break;
+    case ST_IR_PHI: return;
     case ST_IR_COUNT: ST_todo("ST_IR_COUNT"); break;
     case ST_IR_ALLOCA: {
         fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off); 
     } break;
     case ST_IR_LOAD: {
-        ST_load(out, "rcx", in->store.addr);
+        ST_load(out, "rcx", in->load.addr);
         ST_mem_load(out, in->ty);
     } break;
     case ST_IR_STORE: {
@@ -187,6 +187,43 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     }
 }
 
+static ST_ir_inst_t *ST_phi_incoming(ST_ir_inst_t *in, ST_ir_block_t *from)
+{
+    ST_forrange(0, in->phi.preds.count)
+    {
+        if (in->phi.preds.items[i] == from) return in->phi.values.items[i];
+    }
+    return NULL;
+}
+
+static void ST_generate_phi_copies(FILE *out, ST_ir_block_t *from, ST_ir_block_t *to)
+{
+    for (ST_ir_inst_t *inst = to->first; inst; inst = inst->next)
+    {
+        if (inst->removed || inst->kind != ST_IR_PHI) continue;
+
+        ST_ir_inst_t *v = ST_phi_incoming(inst, from);
+        if (!v) continue;
+        ST_load(out, "rax", v);
+        fprintf(out, "push rax\n");
+    }
+
+    for (ST_ir_inst_t *inst = to->last; inst; inst = inst->prev)
+    {
+        if (inst->removed || inst->kind != ST_IR_PHI) continue;
+        if (!ST_phi_incoming(inst, from)) continue;
+        fprintf(out, "pop rax\n");
+        fprintf(out, "mov [rbp%+d], rax\n", ST_slot(inst));
+    }
+}
+
+static b8 ST_edge_has_phi(ST_ir_block_t *to)
+{
+    for (ST_ir_inst_t *inst = to->first; inst; inst = inst->next)
+        if (!inst->removed && inst->kind == ST_IR_PHI) return 1;
+    return 0;
+}
+
 static void ST_generate_term(FILE *out, ST_ir_block_t *b)
 {
     ST_ir_term_t *t = &b->term;
@@ -198,16 +235,33 @@ static void ST_generate_term(FILE *out, ST_ir_block_t *b)
         fprintf(out, "    ret\n");
     } break;
     case ST_IR_TERM_BR: {
+        ST_generate_phi_copies(out, b, t->t_block);
         fprintf(out, "    jmp .bb%u\n", t->t_block->id);
     } break;
     case ST_IR_TERM_NONE: ST_todo("ST_IR_TERM_RET"); break;
     case ST_IR_TERM_COND_BR: {
         ST_load(out, "rax", t->cond);
         fprintf(out, "    test rax, rax\n");
-        fprintf(out, "    jnz .bb%u\n", t->t_block->id);
-        fprintf(out, "    jmp .bb%u\n", t->f_block->id);
+        if (ST_edge_has_phi(t->f_block))
+        {
+            fprintf(out, "    jz .bb%u_edge_f\n", b->id);
+            ST_generate_phi_copies(out, b, t->t_block);
+            fprintf(out, "    jmp .bb%u\n", t->t_block->id);
+            fprintf(out, "    .bb%u_edge_f:\n", b->id);
+            ST_generate_phi_copies(out, b, t->f_block);
+            fprintf(out, "    jmp .bb%u\n", t->f_block->id);
+            
+        }
+        else
+        {
+            fprintf(out, "    jz .bb%u\n", t->f_block->id);
+            ST_generate_phi_copies(out, b, t->t_block);
+            fprintf(out, "    jmp .bb%u\n", t->t_block->id);
+        }
     } break;
-    case ST_IR_TERM_UNREACHABLE: ST_todo("ST_IR_TERM_UNREACHABLE"); break;
+    case ST_IR_TERM_UNREACHABLE: {
+        fprintf(out, "    ud2\n");
+    } break;
     }
 }
 
