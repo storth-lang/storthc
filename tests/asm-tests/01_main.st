@@ -3,4 +3,4 @@ fn main() -> i64 {
     return 0;
 }
 
-extern fn printf(fmt : *u8) -> i64;
+extern fn printf(fmt: *char, ...) -> i64;

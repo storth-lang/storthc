@@ -15,3 +15,27 @@
 ```
 
 This is a decriptic error message from this unfinished condition the semantic analyzer should tell as before hand of unfinished branch. No need to even try to lower the condition.
+
+```
+struct Foo {
+    x: u32;
+    y: i32;
+}
+
+fn foo_init(f: *Foo) -> void {
+    f.x = 20;
+    f.y = 30;
+}
+
+fn main() -> i64 {
+    f : Foo;
+    foo_init(&f);
+    printf("%d\n", f.x);
+    printf("%d\n", f.y);
+    return 0;
+}
+
+extern fn printf(fmt: *char, ...) -> i64;
+```
+
+dunno the reason but I have a suspcion.
