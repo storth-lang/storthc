@@ -373,8 +373,6 @@ static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
     }
 }
 
-
-
 static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
                                      ST_ty_t *st, ST_expr_t *lit)
 {
@@ -745,6 +743,41 @@ static void ST_lower_store_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
     ST_ir_store(c->cur, ty, addr, rhs, s->line, s->col);
 }
 
+static void ST_lower_multi_bind_one(ST_lower_ctx_t *c, ST_stmt_t *s, u32 i,
+                                    ST_ir_inst_t *v, ST_ty_t *ty)
+{
+    if (!v || !ty) return;
+    if (s->multi.declare)
+    {
+        if (!ST_lower_is_addr_taken(c, s->multi.names[i]))
+        {
+            ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys,
+                                              ty, s->line, s->col);
+            ST_ir_store(c->cur, ty, slot, v, s->line, s->col);
+            ST_lower_bind_addr(c, s->multi.names[i], slot, ty);
+        }
+        else
+        {
+            void *key = (void *)&s->multi.names[i];
+            ST_ir_write_var(c->cur, key, v);
+            ST_lower_bind_ssa(c, s->multi.names[i], key, ty);
+        }
+        return;
+    }
+    ST_lower_bind_t *bind = ST_lower_scope_find(c, s->multi.names[i]);
+    if (!bind)
+    {
+        ST_diag_error(&c->diag, s->line, s->col,
+                      "internal: Unkown assignment target "
+                      ST_sv_fmt" is not a known local", ST_sv_args(s->multi.names[i]));
+        return;
+    }
+
+    if (bind->kind == ST_BIND_ADDR) ST_ir_store(c->cur, ty, bind->slot, v,
+                                                s->line, s->col);
+    else ST_ir_write_var(c->cur, bind->key, v);
+}
+
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
 {
     switch (s->kind)
@@ -1000,6 +1033,78 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
 
     case ST_ST_BLOCK:
         ST_forrange(0, s->block.count) ST_lower_stmt(c, s->block.items[i]);
+        break;
+
+    case ST_ST_MULTI_BIND:
+        b8 call_from = (s->multi.n_names > 1 && s->multi.values.count == 1 &&
+                        s->multi.values.items[0]->kind == ST_EX_CALL);
+        if (call_from)
+        {
+            ST_expr_t *callee = s->multi.values.items[0];
+            ST_ir_inst_t *call_val = ST_lower_expr(c, callee);
+            ST_tys_t *ret_tys = NULL;
+            if (callee->call.callee->kind == ST_EX_IDENT)
+            {
+                ST_ir_fn_t *target = ST_ir_module_find_fn(c->module,
+                                                          callee->call.callee->name);
+                if (target) ret_tys = &target->ty->rets;
+            }
+            else
+            {
+                ST_diag_error(&c->diag, s->line, s->col,
+                              "internal: multi return func not implemented");
+                break;
+            }
+            if (!ret_tys || ret_tys->count != s->multi.n_names) break;
+            ST_forrange(0, s->multi.n_names)
+            {
+                ST_ty_t *rt = ret_tys->items[i];
+                if (!ST_lower_ty_is_scalar(rt))
+                {
+                    ST_diag_error(&c->diag, s->line, s->col,
+                                  "internal: Only scalar value are supported right now");
+                    continue;
+                }
+                ST_ir_inst_t *val = i == 0 ? call_val :
+                    ST_ir_extract(c->cur, rt, call_val, i, s->line, s->col);
+
+                ST_lower_multi_bind_one(c, s, i, val, rt);
+            }
+        }
+
+        if (s->multi.values.count != s->multi.n_names) break;
+        #define ST_IR_TEMP_SIZE 256
+        ST_ir_inst_t *vals[ST_IR_TEMP_SIZE] = {0};
+        ST_ty_t *tys[ST_IR_TEMP_SIZE] = {0};
+        u32 n = s->multi.n_names;
+        if (n > ST_array_len(vals))
+        {
+            ST_diag_error(&c->diag, s->line, s->col,
+                          "internal: more than %u in a multi bind is not lowered yet",
+                          ST_array_len(vals));
+            break;
+        }
+
+        ST_forrange(0, n)
+        {
+            ST_expr_t *v = s->multi.values.items[i];
+            tys[i] = v->ty;
+            if (!ST_lower_ty_is_scalar(tys[i]))
+            {
+                ST_diag_error(&c->diag, s->line, s->col,
+                              "internal: Only scalar value are supported right now");
+                tys[i] = NULL;
+                continue;
+            }
+
+            vals[i] = ST_lower_expr(c, v);
+        }
+
+        ST_forrange(0, n)
+        {
+            ST_lower_multi_bind_one(c, s, i, vals[i], tys[i]);
+        }
+
         break;
 
     default:

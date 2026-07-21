@@ -21,7 +21,7 @@ typedef struct
     ST_arena_chunk_t *cur;
 } ST_arena_t;
 
-ST_arena_t *ST_arena_alloc();
+ST_arena_t *ST_arena_alloc(void);
 void ST_arena_free(ST_arena_t *arena);
 
 void *ST_arena_push(ST_arena_t *arena, u64 size);

@@ -22,7 +22,7 @@ static ST_arena_chunk_t *ST_arena_chunk_alloc(u64 capacity)
     return chunk;
 }
 
-ST_arena_t *ST_arena_alloc()
+ST_arena_t *ST_arena_alloc(void)
 {
     ST_arena_t *arena = malloc(sizeof(*arena));
     arena->head = ST_arena_chunk_alloc(ST_DEFAULT_CHUNK_SIZE);

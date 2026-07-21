@@ -74,7 +74,7 @@ static void ST_icmp(FILE *out, ST_ir_inst_t *in, const char *setcc)
 
 static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
 {
-    _Static_assert(ST_IR_COUNT == 49, "IR count exceeded");
+    _Static_assert(ST_IR_COUNT == 50, "IR count exceeded");
     if (in->removed) return;
     switch(in->kind)
     {
@@ -101,6 +101,7 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
         fprintf(out, "    imul rax, rcx\n");
     } break;
     case ST_IR_SDIV: ST_todo("ST_IR_SDIV"); break;
+    case ST_IR_EXTRACT_OP: ST_todo("ST_IR_EXTRACT_OP"); break;
     case ST_IR_UDIV: ST_todo("ST_IR_UDIV"); break;
     case ST_IR_SREM: ST_todo("ST_IR_SREM"); break;
     case ST_IR_UREM: ST_todo("ST_IR_UREM"); break;
