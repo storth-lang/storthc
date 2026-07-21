@@ -101,7 +101,11 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
         fprintf(out, "    imul rax, rcx\n");
     } break;
     case ST_IR_SDIV: ST_todo("ST_IR_SDIV"); break;
-    case ST_IR_EXTRACT_OP: ST_todo("ST_IR_EXTRACT_OP"); break;
+    case ST_IR_EXTRACT_OP: {
+        if (in->extract.index == 0) ST_load(out, "rax", in->extract.agg);
+        else if (in->extract.index == 1) fprintf(out, "    mov rax, rdx\n");
+        else ST_todo("Multiple call return not implemented");
+    } break;
     case ST_IR_UDIV: ST_todo("ST_IR_UDIV"); break;
     case ST_IR_SREM: ST_todo("ST_IR_SREM"); break;
     case ST_IR_UREM: ST_todo("ST_IR_UREM"); break;
@@ -231,7 +235,9 @@ static void ST_generate_term(FILE *out, ST_ir_block_t *b)
     switch (t->kind)
     {
     case ST_IR_TERM_RET: {
-        if (t->rets.count) ST_load(out, "rax", t->rets.items[0]);
+        if (t->rets.count >= 1) ST_load(out, "rax", t->rets.items[0]);
+        if (t->rets.count >= 2) ST_load(out, "rdx", t->rets.items[1]);
+        if (t->rets.count > 2) ST_todo("Not implemented");
         fprintf(out, "    leave\n");
         fprintf(out, "    ret\n");
     } break;
