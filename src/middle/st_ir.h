@@ -47,6 +47,7 @@ typedef enum
     ST_IR_CAST,
     ST_IR_PARAM,
     ST_IR_CALL,
+    ST_IR_EXTRACT_OP,
     ST_IR_CALL_INDIRECT,
     ST_IR_PHI,
     
@@ -109,6 +110,10 @@ struct ST_ir_inst_t
             ST_ir_insts_t values;
             ST_ir_blocks_t preds;
         } phi;
+        struct {
+            ST_ir_inst_t *agg;
+            u32 index;
+        } extract;
         struct {
             u32 size, align;
             u32 frame_off;
@@ -202,8 +207,10 @@ ST_ir_inst_t *ST_ir_cast(ST_ir_block_t *b, ST_ty_t *to_ty, ST_ir_inst_t *v, u32 
 ST_ir_inst_t *ST_ir_param(ST_ir_block_t *b, ST_ty_t *ty, u32 index, ST_string_t name);
 ST_ir_inst_t *ST_ir_call(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_string_t callee_name,
                           ST_ir_fn_t *callee, ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
+ST_ir_inst_t *ST_ir_extract(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *agg, u32 index,
+                            u32 line, u32 col);
 ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *callee_ptr,
-                                   ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
+                                  ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
 ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p,
                            u32 line, u32 col);
 ST_ir_inst_t *ST_ir_load(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr,
