@@ -54,9 +54,7 @@ int main(int argc, char **argv)
     ST_string_t exe_path_s = ST_abs_path(arena, exe_path);
     exe_path = (const char *)exe_path_s.data;
 
-    if (build_exe || run_exe) asm_path = "/tmp/test.asm";
-    if (build_exe || run_exe) obj_path = "/tmp/test.o";
-    FILE *f = fopen(asm_path, "wb");
+
 
     if (!ST_flag_parse(fp, argc, argv))
     {
@@ -64,6 +62,12 @@ int main(int argc, char **argv)
         goto done;
     }
 
+    if (build_exe || run_exe) {
+        asm_path = "/tmp/test.asm";
+        obj_path = "/tmp/test.o";
+    }
+
+    FILE *f = fopen(asm_path, "wb");
     ST_string_t file = ST_abs_path(arena, path);
     ST_string_t src = {0};
     if (!ST_read_entire_file(arena, &src, path))
