@@ -78,7 +78,7 @@ static void ST_generate_strs(FILE *out, ST_ir_module_t *m)
         fprintf(out, "align 8\n");
         fprintf(out, "str_%u:\n", (u32)i);
         fprintf(out, "    dq str_%u_data\n", (u32)i);
-        fprintf(out, "    dq %u\n", (u32)i);
+        fprintf(out, "    dq %u\n", (u32)s.len);
     }
 }
 
@@ -196,7 +196,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in)
     case ST_IR_PHI: return;
     case ST_IR_COUNT: ST_todo("ST_IR_COUNT"); break;
     case ST_IR_ALLOCA: {
-        fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off); 
+        fprintf(out, "    lea rax, [rbp-%u]\n", in->alloca_.frame_off);
     } break;
     case ST_IR_LOAD: {
         ST_load(out, "rcx", in->load.addr);
@@ -220,14 +220,14 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in)
                 fprintf(out, "    imul rcx, %u\n", _scale);
                 fprintf(out, "    add rax, rcx\n");
             }
-            if (in->addr.offset) fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
         }
+        if (in->addr.offset) fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
     } break;
     case ST_IR_GLOBAL_ADDR: ST_todo("ST_IR_GLOBAL_ADDR"); break;
 
     default: break;
     }
-    if (in->ty && in->ty->kind != ST_TY_VOID) 
+    if (in->ty && in->ty->kind != ST_TY_VOID)
     {
         fprintf(out, "    mov [rbp%+d], rax\n", ST_slot(in));
     }
@@ -310,7 +310,7 @@ static void ST_generate_term(FILE *out, ST_gen_ctx_t *ctx, ST_ir_block_t *b)
             fprintf(out, "    .bb%u_edge_f:\n", b->id);
             ST_generate_phi_copies(out, b, t->f_block);
             fprintf(out, "    jmp .bb%u\n", t->f_block->id);
-            
+
         }
         else
         {
