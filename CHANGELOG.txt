@@ -1,4 +1,4 @@
-# Storth Programming Language
+ # Storth Programming Language
 
 2026:07:15
 - Added support for structs.
@@ -64,8 +64,15 @@
 
 - Added ==, >=, <=, !=, >, < with variable working in the backend of nasm.
 
-- Added while loops in my ir so now I can have set and jump in my assembly based on condition so I can have loops and test either game of life or rule 110.
+- Added while loops in my ir so now I can have set and jump in my assembly based on condition so I can have
+  loops and test either game of life or rule 110.
 
 2026:07:20
 
-- Added support for multiple call binding for both declaration and return. Multi call assignment in the level of ir works however the backend does not support it yet.
+- Added support for multiple call binding for both declaration and return. Multi call assignment in the level
+  of ir works however the backend does not support it yet.
+
+2026:07:21
+
+- Finally we have multiple bind declaration supported for scalar type though it does not work with other types.
+  Meaning a function returning multiple value can be mapped correctly.
