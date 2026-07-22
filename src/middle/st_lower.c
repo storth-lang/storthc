@@ -32,6 +32,8 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_short_and(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e);
 
 static void ST_lower_scope_bind(ST_lower_ctx_t *c, ST_string_t name, ST_lower_bind_t *bind)
 {
@@ -445,6 +447,64 @@ static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 
     }
 }
 
+static ST_ir_inst_t *ST_lower_short_and(ST_lower_ctx_t *c, ST_expr_t *e)
+{
+    ST_ir_inst_t *l = ST_lower_expr(c, e->bin.l);
+    if (!l) return NULL;
+    void *key = (void *)e;
+    ST_ir_write_var(c->cur, key, ST_ir_const_int(c->cur, e->ty, 0));
+    ST_ir_block_t *rhs_b  = ST_ir_block_new(c->fn, "and_rhs");
+    ST_ir_block_t *join_b = ST_ir_block_new(c->fn, "and_end");
+
+    ST_ir_term_condbr(c->cur, l, rhs_b, join_b, e->line, e->col);
+    ST_ir_block_seal(rhs_b);
+
+    c->cur = rhs_b;
+    ST_ir_inst_t *r = ST_lower_expr(c, e->bin.r);
+    if (!r) r = ST_ir_const_int(c->cur, e->ty, 0);
+    ST_ir_write_var(c->cur, key, r);
+    if (!ST_ir_block_is_terminated(c->cur))
+        ST_ir_term_br(c->cur, join_b, e->line, e->col);
+
+    ST_ir_block_seal(join_b);
+    c->cur = join_b;
+    if (join_b->preds.count == 0)
+    {
+        ST_ir_term_unreachable(join_b, e->line, e->col);
+        return ST_ir_const_int(c->cur, e->ty, 0);
+    }
+    return ST_ir_read_var(c->cur, key, e->ty);
+}
+
+static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e)
+{
+    ST_ir_inst_t *l = ST_lower_expr(c, e->bin.l);
+    if (!l) return NULL;
+    void *key = (void *)e;
+    ST_ir_write_var(c->cur, key, ST_ir_const_int(c->cur, e->ty, 1));
+    ST_ir_block_t *rhs_b  = ST_ir_block_new(c->fn, "or_rhs");
+    ST_ir_block_t *join_b = ST_ir_block_new(c->fn, "or_end");
+
+    ST_ir_term_condbr(c->cur, l, join_b, rhs_b, e->line, e->col);
+    ST_ir_block_seal(rhs_b);
+
+    c->cur = rhs_b;
+    ST_ir_inst_t *r = ST_lower_expr(c, e->bin.r);
+    if (!r) r = ST_ir_const_int(c->cur, e->ty, 0);
+    ST_ir_write_var(c->cur, key, r);
+    if (!ST_ir_block_is_terminated(c->cur))
+        ST_ir_term_br(c->cur, join_b, e->line, e->col);
+
+    ST_ir_block_seal(join_b);
+    c->cur = join_b;
+    if (join_b->preds.count == 0)
+    {
+        ST_ir_term_unreachable(join_b, e->line, e->col);
+        return ST_ir_const_int(c->cur, e->ty, 0);
+    }
+    return ST_ir_read_var(c->cur, key, e->ty);
+}
+
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e)
 {
     switch (e->kind)
@@ -544,8 +604,6 @@ static ST_ir_op_t ST_lower_binop(ST_diag_t *diag, ST_expr_t *e, b8 is_f, b8 uns)
     if (ST_string_eq_cstr(op, "<=")) return is_f ? ST_IR_FCMP_LE : (uns ? ST_IR_ICMP_ULE : ST_IR_ICMP_SLE);
     if (ST_string_eq_cstr(op, ">"))  return is_f ? ST_IR_FCMP_GT : (uns ? ST_IR_ICMP_UGT : ST_IR_ICMP_SGT);
     if (ST_string_eq_cstr(op, ">=")) return is_f ? ST_IR_FCMP_GE : (uns ? ST_IR_ICMP_UGE : ST_IR_ICMP_SGE);
-    if (ST_string_eq_cstr(op, "and")) return ST_IR_AND;
-    if (ST_string_eq_cstr(op, "or"))  return ST_IR_OR;
     ST_diag_error(diag, e->line, e->col, "internal: unsupported binary operator '" ST_sv_fmt "'", ST_sv_args(op));
     return ST_IR_ADD;
 }
@@ -692,6 +750,9 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
     }
 
     case ST_EX_BINARY: {
+        if (ST_string_eq_cstr(e->bin.op, "&&")) return ST_lower_short_and(c, e);
+        if (ST_string_eq_cstr(e->bin.op, "||")) return ST_lower_short_or(c, e);
+
         if (e->bin.l->ty && e->bin.l->ty->kind == ST_TY_STRING)
         {
             ST_ir_inst_t *args[2];
@@ -707,9 +768,9 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
 
         }
 
-
         ST_ir_inst_t *l = ST_lower_expr(c, e->bin.l);
         ST_ir_inst_t *r = ST_lower_expr(c, e->bin.r);
+
         b8 is_f = ST_ty_is_float(e->bin.l->ty) || ST_ty_is_float(e->bin.r->ty);
         b8 uns  = e->bin.l->ty && !e->bin.l->ty->is_signed;
         ST_ir_op_t op = ST_lower_binop(&c->diag, e, is_f, uns);
