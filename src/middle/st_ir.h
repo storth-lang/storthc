@@ -101,6 +101,7 @@ struct ST_ir_inst_t
             ST_string_t callee_name;
             ST_ir_fn_t *callee;
             ST_ir_insts_t args;
+            u32 ret_buf_offset;
         } call;
         struct {
             ST_ir_inst_t *callee_ptr;

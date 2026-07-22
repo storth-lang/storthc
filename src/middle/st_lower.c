@@ -1035,7 +1035,7 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         ST_forrange(0, s->block.count) ST_lower_stmt(c, s->block.items[i]);
         break;
 
-    case ST_ST_MULTI_BIND:
+    case ST_ST_MULTI_BIND: {
         b8 call_from = (s->multi.n_names > 1 && s->multi.values.count == 1 &&
                         s->multi.values.items[0]->kind == ST_EX_CALL);
         if (call_from)
@@ -1104,8 +1104,7 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         {
             ST_lower_multi_bind_one(c, s, i, vals[i], tys[i]);
         }
-
-        break;
+    } break;
 
     default:
         ST_diag_error(&c->diag, s->line, s->col,
