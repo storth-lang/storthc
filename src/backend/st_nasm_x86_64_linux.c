@@ -2,6 +2,13 @@
 #include <stdio.h>
 
 static const char *arg_regs[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+#define ST_N_ARG_REGS ((u32)ST_array_len(arg_regs))
+
+typedef struct
+{
+    ST_ir_fn_t *fn;
+    u32 hidden_ret_off;
+} ST_gen_ctx_t;
 
 static i32 ST_slot(ST_ir_inst_t *v)
 {
@@ -12,6 +19,18 @@ static i32 ST_slot(ST_ir_inst_t *v)
 static void ST_load(FILE *out, const char *reg, ST_ir_inst_t *v)
 {
     fprintf(out, "    mov %s, [rbp%+d]\n", reg, ST_slot(v));
+}
+
+static u32 ST_call_ret_count(ST_ir_inst_t *call_inst)
+{
+    if (call_inst->call.callee && call_inst->call.callee->ty)
+        return call_inst->call.callee->ty->rets.count;
+    return 1;
+}
+
+static i32 ST_ret_buf_off(ST_ir_inst_t *call_inst, u32 index)
+{
+    return (i32)(8 * index) - (i32)call_inst->call.ret_buf_offset;
 }
 
 static void ST_mem_load(FILE *out, ST_ty_t *ty)
@@ -72,7 +91,7 @@ static void ST_icmp(FILE *out, ST_ir_inst_t *in, const char *setcc)
     fprintf(out, "    movzx rax, al\n");
 }
 
-static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
+static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in)
 {
     _Static_assert(ST_IR_COUNT == 50, "IR count exceeded");
     if (in->removed) return;
@@ -102,9 +121,12 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     } break;
     case ST_IR_SDIV: ST_todo("ST_IR_SDIV"); break;
     case ST_IR_EXTRACT_OP: {
-        if (in->extract.index == 0) ST_load(out, "rax", in->extract.agg);
-        else if (in->extract.index == 1) fprintf(out, "    mov rax, rdx\n");
-        else ST_todo("Multiple call return not implemented");
+        ST_ir_inst_t *agg = in->extract.agg;
+        u32 rc = (agg->kind == ST_IR_CALL) ? ST_call_ret_count(agg) : 0;
+        if (rc >= 2) fprintf(out, "    mov rax, [rbp%+d]\n",
+                             ST_ret_buf_off(agg, in->extract.index));
+        else if (in->extract.index == 0) ST_load(out, "rax", agg);
+        else ST_todo("extract index >0 from a non multi-return value");
     } break;
     case ST_IR_UDIV: ST_todo("ST_IR_UDIV"); break;
     case ST_IR_SREM: ST_todo("ST_IR_SREM"); break;
@@ -140,14 +162,35 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
     case ST_IR_FCMP_GE: ST_todo("ST_IR_FCMP_GE"); break;
     case ST_IR_CAST: ST_todo("ST_IR_CAST"); break;
     case ST_IR_PARAM: {
-        fprintf(out, "    mov rax, %s\n", arg_regs[in->params.index]);
+        u32 shift = ctx->hidden_ret_off ? 1 : 0;
+        u32 idx = in->params.index + shift;
+        if (idx >= ST_N_ARG_REGS) ST_todo("too many parameters");
+        fprintf(out, "    mov rax, %s\n", arg_regs[idx]);
     } break;
     case ST_IR_CALL: {
-        ST_forrange(0, in->call.args.count)
-            ST_load(out, arg_regs[i], in->call.args.items[i]);
+        u32 rc = ST_call_ret_count(in);
+        if (rc > 2)
+        {
+            u32 n = in->call.args.count;
+            if (n + 1 > ST_N_ARG_REGS) ST_todo("too many arguments alongside hidden return pointer");
+            fprintf(out, "    lea rdi, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+            ST_forrange(0, n) ST_load(out, arg_regs[i + 1], in->call.args.items[i]);
+        }
+        else
+        {
+            ST_forrange(0, in->call.args.count) ST_load(out, arg_regs[i], in->call.args.items[i]);
+        }
 
         fprintf(out, "    xor eax, eax\n");
         fprintf(out, "    call " ST_sv_fmt "\n", ST_sv_args(in->call.callee_name));
+
+        if (rc == 2)
+        {
+            fprintf(out, "    mov [rbp%+d], rax\n", ST_ret_buf_off(in, 0));
+            fprintf(out, "    mov [rbp%+d], rdx\n", ST_ret_buf_off(in, 1));
+            fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+        }
+        else if (rc > 2) fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
     }break;
     case ST_IR_CALL_INDIRECT: ST_todo("ST_IR_CALL_INDIRECT"); break;
     case ST_IR_PHI: return;
@@ -177,9 +220,7 @@ static void ST_generate_inst(FILE *out, ST_ir_inst_t *in)
                 fprintf(out, "    imul rcx, %u\n", _scale);
                 fprintf(out, "    add rax, rcx\n");
             }
-            if (in->addr.offset) {
-                fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
-            }
+            if (in->addr.offset) fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
         }
     } break;
     case ST_IR_GLOBAL_ADDR: ST_todo("ST_IR_GLOBAL_ADDR"); break;
@@ -229,15 +270,27 @@ static b8 ST_edge_has_phi(ST_ir_block_t *to)
     return 0;
 }
 
-static void ST_generate_term(FILE *out, ST_ir_block_t *b)
+static void ST_generate_term(FILE *out, ST_gen_ctx_t *ctx, ST_ir_block_t *b)
 {
     ST_ir_term_t *t = &b->term;
     switch (t->kind)
     {
     case ST_IR_TERM_RET: {
-        if (t->rets.count >= 1) ST_load(out, "rax", t->rets.items[0]);
-        if (t->rets.count >= 2) ST_load(out, "rdx", t->rets.items[1]);
-        if (t->rets.count > 2) ST_todo("Not implemented");
+        if (t->rets.count > 2)
+        {
+            fprintf(out, "    mov r10, [rbp%+d]\n", -(i32)ctx->hidden_ret_off);
+            ST_forrange(0, t->rets.count)
+            {
+                ST_load(out, "rax", t->rets.items[i]);
+                fprintf(out, "    mov [r10+%u], rax\n", 8u * i);
+            }
+            fprintf(out, "    mov rax, r10\n");
+        }
+        else
+        {
+            if (t->rets.count >= 1) ST_load(out, "rax", t->rets.items[0]);
+            if (t->rets.count >= 2) ST_load(out, "rdx", t->rets.items[1]);
+        }
         fprintf(out, "    leave\n");
         fprintf(out, "    ret\n");
     } break;
@@ -272,22 +325,67 @@ static void ST_generate_term(FILE *out, ST_ir_block_t *b)
     }
 }
 
+static u32 ST_layout_fn(ST_ir_fn_t *fn, ST_gen_ctx_t *ctx)
+{
+    u32 cur = fn->next_value_id * 8u;
+
+    ctx->fn = fn;
+    ctx->hidden_ret_off = 0;
+    if (fn->ty && fn->ty->rets.count > 2)
+    {
+        cur += 8;
+        ctx->hidden_ret_off = cur;
+    }
+
+    ST_forrange(0, fn->blocks.count)
+    {
+        ST_ir_block_t *b = fn->blocks.items[i];
+        for (ST_ir_inst_t *in = b->first; in; in = in->next)
+        {
+            if (in->removed) continue;
+            if (in->kind == ST_IR_ALLOCA)
+            {
+                u32 align = in->alloca_.align ? in->alloca_.align : 8;
+                u32 size  = in->alloca_.size  ? in->alloca_.size  : 8;
+                cur = (cur + align - 1) & ~(align - 1);
+                cur += size;
+                in->alloca_.frame_off = cur;
+            }
+            else if (in->kind == ST_IR_CALL)
+            {
+                u32 rc = ST_call_ret_count(in);
+                if (rc >= 2)
+                {
+                    cur = (cur + 7u) & ~7u;
+                    cur += rc * 8u;
+                    in->call.ret_buf_offset = cur;
+                }
+            }
+        }
+    }
+    return cur;
+}
+
 static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn)
 {
-    u32 frame = (fn->next_value_id * 8 + 15) & ~15u;
+    ST_gen_ctx_t ctx;
+    u32 extra = ST_layout_fn(fn, &ctx);
+    u32 frame = (extra + 15) & ~15u;
     fprintf(out, "\n" ST_sv_fmt":\n", ST_sv_args(fn->name));
     fprintf(out, "    push rbp\n");
     fprintf(out, "    mov rbp, rsp\n");
     fprintf(out, "    sub rsp, %u\n", frame);
+    if (ctx.hidden_ret_off) fprintf(out, "    mov [rbp%+d], rdi\n",
+                                    -(i32)ctx.hidden_ret_off);
     ST_forrange(0, fn->blocks.count)
     {
         ST_ir_block_t *b = fn->blocks.items[i];
         fprintf(out, "    .bb%u:\n", b->id);
         for (ST_ir_inst_t *in = b->first; in; in = in->next)
         {
-            ST_generate_inst(out, in);
+            ST_generate_inst(out, &ctx, in);
         }
-        ST_generate_term(out, b);
+        ST_generate_term(out, &ctx, b);
     }
 }
 
