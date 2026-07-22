@@ -326,6 +326,17 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
         {
             ST_lower_struct_zero(c, base, foff, f->ty, line, col);
         }
+        else if (f->ty->kind == ST_TY_STRING)
+        {
+            ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
+            ST_ty_t *lty = c->sema->tys.prim[ST_ti64];
+
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, foff, dty, line, col);
+            ST_ir_store(c->cur, dty, fp, ST_ir_const_int(c->cur, dty, 0), line, col);
+
+            fp = ST_lower_field_ptr(c, base, foff + 8, lty, line, col);
+            ST_ir_store(c->cur, lty, fp, ST_ir_const_int(c->cur, lty, 0), line, col);
+        }
         else if (ST_lower_ty_is_scalar(f->ty))
         {
             ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, foff, f->ty, line, col);
@@ -334,11 +345,12 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
                 : ST_ir_const_int(c->cur, f->ty, 0);
             ST_ir_store(c->cur, f->ty, fp, z, line, col);
         }
+
         else
         {
             ST_diag_error(&c->diag, line, col,
                           "internal: field '" ST_sv_fmt "' has a type that isn't "
-                          "lowered yet (arrays/strings in structs come later)",
+                          "lowered yet (arrays in structs come later)",
                           ST_sv_args(f->name));
         }
     }
@@ -356,6 +368,12 @@ static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
             ST_lower_struct_copy(c, dst, doff + (i32)f->offset,
                                  src, soff + (i32)f->offset, f->ty, line, col);
         }
+        else if (f->ty->kind == ST_TY_STRING)
+        {
+            ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)f->offset, f->ty, line, col);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)f->offset, f->ty, line, col);
+            ST_lower_string_copy(c, dp, sp, line, col);
+        }
         else if (ST_lower_ty_is_scalar(f->ty))
         {
             ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)f->offset, f->ty, line, col);
@@ -363,11 +381,10 @@ static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
             ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)f->offset, f->ty, line, col);
             ST_ir_store(c->cur, f->ty, dp, v, line, col);
         }
-        else
         {
             ST_diag_error(&c->diag, line, col,
                           "internal: field '" ST_sv_fmt "' has a type that isn't "
-                          "lowered yet (arrays/strings in structs come later)",
+                          "lowered yet (arrays in structs come later)",
                           ST_sv_args(f->name));
         }
     }
@@ -405,6 +422,14 @@ static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 
                                          fi->value->line, fi->value->col);
             }
         }
+        else if (fty->kind == ST_TY_STRING)
+        {
+            ST_ir_inst_t *src = ST_lower_string_addr(c, fi->value);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, off + (i32)foff, fty,
+                                                  fi->value->line, fi->value->col);
+            ST_lower_string_copy(c, dp, src, fi->value->line, fi->value->col);
+        }
+
         else if (ST_lower_ty_is_scalar(fty))
         {
             ST_ir_inst_t *v = ST_lower_expr(c, fi->value);
@@ -672,14 +697,14 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
             ST_ir_inst_t *args[2];
             args[0] = ST_lower_string_addr(c, e->bin.l);
             args[1] = ST_lower_string_addr(c, e->bin.r);
-            
+
             ST_ir_inst_t *eq = ST_ir_call(c->cur, e->ty, ST_cstr_to_str("st_string_eq"),
                                           NULL, args, 2, e->line, e->col);
             if (ST_string_eq_cstr(e->bin.op, "==")) return eq;
             return ST_ir_binop(c->cur, ST_IR_ICMP_EQ, e->ty, eq,
                                ST_ir_const_int(c->cur, e->ty, 0),
                                e->line, e->col);
-            
+
         }
 
 
@@ -704,6 +729,9 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
         return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
     }
 
+    case ST_EX_STR:
+        return ST_lower_string_lit_addr(c, e);
+
     case ST_EX_CALL:
         return ST_lower_call(c, e);
 
@@ -716,7 +744,7 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
         ST_ir_inst_t *p = ST_lower_field_ptr(c, a, 0, e->ty, e->line, e->col);
         return ST_ir_load(c->cur, e->ty, p, e->line, e->col);
     } break;
-        
+
     default:
         ST_diag_error(&c->diag, e->line, e->col,
                       "internal: this expression form isn't lowered yet");
@@ -903,8 +931,9 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
                 break;
             }
             ST_ir_inst_t *dst = ST_lower_lvalue_addr(c, lhs);
-            ST_ir_inst_t *src = dst ? ST_lower_lvalue_addr(c, s->assign.rhs) : NULL;
+            ST_ir_inst_t *src = dst ? ST_lower_string_addr(c, s->assign.rhs) : NULL;
             if (dst && src) ST_lower_string_copy(c, dst, src, s->line, s->col);
+            break;
         }
 
         if (lhs->kind == ST_EX_FIELD)

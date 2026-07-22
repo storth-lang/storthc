@@ -4,7 +4,7 @@ SRCROOT := src
 OBJROOT := obj
 BINDIR := bin
 
-CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wpedantic -fsanitize=address -Warray-bounds=2 -Wno-missing-field-initializers -Wno-missing-braces -g
+CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wpedantic -fsanitize=address -Warray-bounds=2 -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g
 LDLIBS := -lm
 TARGET := $(BINDIR)/storthc
 
