@@ -85,3 +85,10 @@
 
 - Just fixed indexing of arrays though we still do not compile time check index's we will still have indexing none
   the less we can still index arrays though matrix arrays do not work yet this is a far greater support.
+
+2026:07:22
+
+- We now support &&, || and ! operators correctly. The idea is about branching we fixed the IR to have the correct
+  branching for all of these operation meaning the short circuit is now valid.
+
+- Also added support for them in the backend as well.
