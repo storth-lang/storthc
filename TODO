@@ -90,3 +90,29 @@ Test framework: Refer the NOTES in the 'tests/' directory
   stuff and changing how they are loaded into register.
 
 - [x] Use blocks for SSA ir.
+
+## Arrays
+
+- [ ] Fix type indexer to not allow indexing of invalid size at compile time.
+  ```
+  xs : []i32 = { 33, 44, 77 }; // Such code should be valid.
+  f := xs[222]; // This should automatically be an error as the count of xs is 3.
+  ```
+
+- [ ] Array should have pointer .len to get the count of the array aka the element count.
+- [ ] Slicing into arrays like xs[2..] or xs[..3] should they be allowed(TBD)??
+- [ ] For looping over arr to do the element should be possible.
+  ```
+  array : []u32 = { 22, 33, 44 };
+  for arr: array {
+      printf("%d\n", arr);
+  }
+  ```
+  If at any given moment we want to index over it.
+  ```
+  for it: 0..array.len {
+      printf("%d %d\n", it, arr[it]);
+  }
+  ```
+
+- Array in strcuture or other declaration is not supported they should be supported.
