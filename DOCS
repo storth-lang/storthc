@@ -42,7 +42,7 @@ To create an instance of that strcture you would do:
 `src_code
 f := Foo{}; // This will initalize all the members to be 0.
 f := Foo{"Urmom", 20}; // This is deseganted initalizer from C.
-f := Foo{age = 20, name = "Aboba"}; // This is named initialization 
+f := Foo{age = 20, name = "Aboba"}; // This is named initialization
 `
 Type declaration will also memset the members to 0 meaning puttin `{}` is optional;
 
@@ -61,7 +61,7 @@ tag_union Foo {
 }
 `
 
-In tag unions the concept comes from rust where we have an intrinsic tag(refer to intrinsics) 
+In tag unions the concept comes from rust where we have an intrinsic tag(refer to intrinsics)
 that will store the id of the active member to make it so that inactive member is inaccessible.
 
 `src_code
@@ -178,7 +178,6 @@ Operator - : is used for subtraction.
 Operator / : is used for division.
 Operator * : is used for multiplication. If called from type specifier then it will become a pointer to that memory.
 Operator & : is used for reference. So that we can do x := 20 then have p := &x.
-
 
 ### Double sign operations
 

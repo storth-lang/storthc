@@ -1,4 +1,4 @@
- # Storth Programming Language
+# Storth Programming Language
 
 2026:07:15
 - Added support for structs.

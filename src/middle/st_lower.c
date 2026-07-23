@@ -1,5 +1,13 @@
 #include "st_lower.h"
 
+typedef struct ST_lower_loop_t ST_lower_loop_t;
+struct ST_lower_loop_t
+{
+    ST_ir_block_t *br_target;
+    ST_ir_block_t *con_target;
+    ST_lower_loop_t *parent;
+};
+
 typedef struct
 {
     ST_arena_t *arena;
@@ -12,6 +20,7 @@ typedef struct
     ST_ir_block_t *cur;
     ST_ht_t scope;
     ST_ht_t addr_taken;
+    ST_lower_loop_t *loop;
 } ST_lower_ctx_t;
 
 typedef enum
@@ -1203,7 +1212,14 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         ST_ir_term_condbr(c->cur, cond, while_body, while_end, s->line, s->col);
         ST_ir_block_seal(while_body);
         c->cur = while_body;
+
+        ST_lower_loop_t loop = {
+            while_end, while_begin, c->loop
+        };
+
+        c->loop = &loop;
         ST_lower_body(c, &s->while_.body);
+        c->loop = loop.parent;
 
         if (!ST_ir_block_is_terminated(c->cur))
             ST_ir_term_br(c->cur, while_begin, s->line, s->col);
@@ -1212,6 +1228,26 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
         ST_ir_block_seal(while_begin);
         ST_ir_block_seal(while_end);
         c->cur = while_end;
+    } break;
+
+    case ST_ST_BREAK: {
+        if (!c->loop)
+        {
+            ST_diag_error(&c->diag, s->line, s->col,
+                          "'break': used outside of a loop");
+            break;
+        }
+        ST_ir_term_br(c->cur, c->loop->br_target, s->line, s->col);
+    } break;
+
+    case ST_ST_CONTINUE: {
+        if (!c->loop)
+        {
+            ST_diag_error(&c->diag, s->line, s->col,
+                          "'continue': used outside of a loop");
+            break;
+        }
+        ST_ir_term_br(c->cur, c->loop->con_target, s->line, s->col);
     } break;
 
     case ST_ST_BLOCK:

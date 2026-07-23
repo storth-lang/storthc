@@ -36,7 +36,7 @@ Temporarily I still did not implement any backend for my language or added flag 
 
 - Use raw mmap syscalls for the dynamic array.
 
-# Strings 
+# Strings
 They are going to be utf8-strings that will be stored in the following layout.
 
 ```
