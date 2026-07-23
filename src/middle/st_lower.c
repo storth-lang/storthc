@@ -34,6 +34,8 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_short_and(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e);
+static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                 ST_ty_t *st, u32 line, u32 col);
 
 static void ST_lower_scope_bind(ST_lower_ctx_t *c, ST_string_t name, ST_lower_bind_t *bind)
 {
@@ -317,6 +319,41 @@ static void ST_lower_string_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dest,
     ST_ir_store(c->cur, lty, p, v, line, col);
 }
 
+static void ST_lower_array_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                 ST_ty_t *aty, u32 line, u32 col)
+{
+    ST_ty_t *ety = aty->inner;
+    u32 esz = ety->size;
+    ST_forrange(0, aty->count)
+    {
+        i32 eoff = off + (i32)(i * esz);
+        if (ety->kind == ST_TY_STRUCT) ST_lower_struct_zero(c, base, eoff, ety, line, col);
+        else if (ety->kind == ST_TY_STRING)
+        {
+            ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
+            ST_ty_t *lty = c->sema->tys.prim[ST_ti64];
+
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, eoff, dty, line, col);
+            ST_ir_store(c->cur, dty, fp, ST_ir_const_int(c->cur, dty, 0), line, col);
+            fp = ST_lower_field_ptr(c, base, eoff + 8, lty, line, col);
+            ST_ir_store(c->cur, lty, fp, ST_ir_const_int(c->cur, lty, 0), line, col);
+        }
+        else if (ety->kind == ST_TY_ARRAY) ST_lower_array_zero(c, base, eoff, ety, line, col);
+        else if (ST_lower_ty_is_scalar(ety))
+        {
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, eoff, ety, line, col);
+            ST_ir_inst_t *z = ST_ty_is_float(ety) ?
+                ST_ir_const_float(c->cur, ety, 0.0)
+                : ST_ir_const_int(c->cur, ety, 0);
+            ST_ir_store(c->cur, ety, fp, z, line, col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, line, col, "internal: array element now lowered yet");
+        }
+    }
+}
+
 static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
                                  ST_ty_t *st, u32 line, u32 col)
 {
@@ -576,6 +613,36 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e)
         }
         return ST_lower_field_ptr(c, base, (i32)foff, fty, e->line, e->col);
     }
+    case ST_EX_INDEX: {
+        ST_expr_t *b = e->index.base;
+        ST_ty_t *bt = b->ty;
+        ST_ir_inst_t *base;
+        ST_ty_t *ety;
+        if (bt && bt->kind == ST_TY_PTR)
+        {
+            base = ST_lower_expr(c, b);
+            ety = bt->inner;
+        }
+        else if (bt && bt->kind == ST_TY_ARRAY)
+        {
+            base = ST_lower_lvalue_addr(c, b);
+            ety = bt->inner;
+        }
+        else
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: cannot take the address or non scalar type");
+            return NULL;
+        }
+
+        if (!base) return NULL;
+        ST_ir_inst_t *idx = ST_lower_expr(c, e->index.index);
+        if (!idx) return NULL;
+
+        ST_ty_t *pty = ST_ty_ptr(&c->sema->tys, ety);
+        u32 scale = ety->size ? ety->size : 1;
+        return ST_ir_addr(c->cur, pty, base, idx, scale, 0, e->line, e->col);
+    } break;
     default:
         break;
     }
@@ -790,6 +857,19 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
         return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
     }
 
+    case ST_EX_INDEX: {
+        ST_ir_inst_t *a = ST_lower_lvalue_addr(c, e);
+        if (!a) return ST_ir_const_int(c->cur, e->ty, 0);
+        if (!ST_lower_ty_is_scalar(e->ty))
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: using a whole struct field as a value is only "
+                          "lowered in declarations and assignments so far");
+            return ST_ir_const_int(c->cur, e->ty, 0);
+        }
+        return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
+    }
+
     case ST_EX_STR:
         return ST_lower_string_lit_addr(c, e);
 
@@ -926,12 +1006,25 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
             ST_lower_bind_addr(c, s->decl.name, slots, ty);
             break;
         }
+        if (ty->kind == ST_TY_ARRAY)
+        {
+            ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->line, s->col);
+            ST_lower_array_zero(c, slot, 0, ty, s->line, s->col);
+
+            if (s->decl.init)
+            {
+                ST_diag_error(&c->diag, s->line, s->col, "Urmom");
+                break;
+            }
+            ST_lower_bind_addr(c, s->decl.name, slot, ty);
+            break;
+        }
 
         if (!ST_lower_ty_is_scalar(ty))
         {
             ST_diag_error(&c->diag, s->line, s->col,
                           "internal: this declaration type isn't lowered yet "
-                          "(arrays/strings come later)");
+                          "(arrays come later)");
             break;
         }
 
@@ -997,7 +1090,7 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
             break;
         }
 
-        if (lhs->kind == ST_EX_FIELD)
+        if (lhs->kind == ST_EX_FIELD || lhs->kind == ST_EX_INDEX)
         {
             ST_ir_inst_t *addr = ST_lower_lvalue_addr(c, lhs);
             if (addr) ST_lower_store_assign(c, s, lhs->ty, addr);

@@ -17,7 +17,7 @@
       type info the fn is generic it should not fail.
 - [ ] Make a menu config like linux kernel to customize the following.
     - [ ] Platforms to support.(default current-only). Adds support for -t flag.
-    - [ ] Bake the assembler and the linker into the executable. 
+    - [ ] Bake the assembler and the linker into the executable.
     - [ ] Swap out the assembler(thinking to use fasm).
     - [ ] Debug or Release build.
     - [ ] Option to show or not show the time to do each phase.
@@ -47,8 +47,8 @@ Test framework: Refer the NOTES in the 'tests/' directory
 # Frontend
 
 - [ ] Assemly block.
-- [ ] Module support. 
-- [ ] Much more better error reporting. 
+- [ ] Module support.
+- [ ] Much more better error reporting.
 - [ ] Declaration of templates should not required #template
 
 # Backend
@@ -67,14 +67,52 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Semantically the best way to slice a string is have a slice function on the level of module.
 - [ ] String interning should be a thing.
 
-09:00:30 Idea masturbation
+2026:07:22 Idea masturbation
 
 - [ ] No macro system. We will have some meta staging from the meta
       language. Paper: https://dl.acm.org/doi/pdf/10.1145/258993.259019
-- [ ] User defined compile time directives as attributes
+- [ ] User defined compile time directives as attributes.
 - [ ] Exposure of compiler plugin meaning the user can create event pull
       based compiler plugins instead of jai's message push style one.
 
-- [ ] Alloca does not take into account for function frame so if a function returns multiple returns
+- [x] Alloca does not take into account for function frame so if a function returns multiple returns
       Fix stack allocation to allocate new memory depeding of the stack frame slot provided by the function.
-- [ ] Not emit obj and asm crap in the same dir put it in its own separate userspace directory.
+- [x] Not emit obj and asm crap in the same dir put it in its own separate userspace directory.
+
+2026:07:23 Idea masturbation
+- [ ] Array declaration as literal should work since type inference knows the types at compile type.
+  ```
+  xs : []i32 = { 33, 44, 77 }; // Such code should be valid.
+  ```
+
+- [ ] Implement type system of standard-ml(moscow ml: https://mosml.org/). Meaning as if var declaration can not
+  just take offset with implicit conversion of the same family class. This is for type saftey instead of always casting
+  stuff and changing how they are loaded into register.
+
+- [x] Use blocks for SSA ir.
+
+## Arrays
+
+- [ ] Fix type indexer to not allow indexing of invalid size at compile time.
+  ```
+  xs : []i32 = { 33, 44, 77 }; // Such code should be valid.
+  f := xs[222]; // This should automatically be an error as the count of xs is 3.
+  ```
+
+- [ ] Array should have pointer .len to get the count of the array aka the element count.
+- [ ] Slicing into arrays like xs[2..] or xs[..3] should they be allowed(TBD)??
+- [ ] For looping over arr to do the element should be possible.
+  ```
+  array : []u32 = { 22, 33, 44 };
+  for arr: array {
+      printf("%d\n", arr);
+  }
+  ```
+  If at any given moment we want to index over it.
+  ```
+  for it: 0..array.len {
+      printf("%d %d\n", it, arr[it]);
+  }
+  ```
+
+- Array in strcuture or other declaration is not supported they should be supported.
