@@ -857,6 +857,19 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
         return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
     }
 
+    case ST_EX_INDEX: {
+        ST_ir_inst_t *a = ST_lower_lvalue_addr(c, e);
+        if (!a) return ST_ir_const_int(c->cur, e->ty, 0);
+        if (!ST_lower_ty_is_scalar(e->ty))
+        {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: using a whole struct field as a value is only "
+                          "lowered in declarations and assignments so far");
+            return ST_ir_const_int(c->cur, e->ty, 0);
+        }
+        return ST_ir_load(c->cur, e->ty, a, e->line, e->col);
+    }
+
     case ST_EX_STR:
         return ST_lower_string_lit_addr(c, e);
 
