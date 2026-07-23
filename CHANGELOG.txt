@@ -76,3 +76,10 @@
 
 - Finally we have multiple bind declaration supported for scalar type though it does not work with other types.
   Meaning a function returning multiple value can be mapped correctly.
+
+2026:07:22
+
+- We now support &&, || and ! operators correctly. The idea is about branching we fixed the IR to have the correct
+  branching for all of these operation meaning the short circuit is now valid.
+
+- Also added support for them in the backend as well.
