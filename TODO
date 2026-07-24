@@ -77,6 +77,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 
 - [x] Alloca does not take into account for function frame so if a function returns multiple returns
       Fix stack allocation to allocate new memory depeding of the stack frame slot provided by the function.
+
 - [x] Not emit obj and asm crap in the same dir put it in its own separate userspace directory.
 
 2026:07:23 Idea masturbation
@@ -115,4 +116,4 @@ Test framework: Refer the NOTES in the 'tests/' directory
   }
   ```
 
-- Array in strcuture or other declaration is not supported they should be supported.
+- [ ] Array in strcuture or other declaration is not supported they should be supported.
