@@ -956,6 +956,93 @@ static void ST_lower_multi_bind_one(ST_lower_ctx_t *c, ST_stmt_t *s, u32 i,
     else ST_ir_write_var(c->cur, bind->key, v);
 }
 
+static void ST_lower_array_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
+                                ST_ir_inst_t *src, i32 soff, ST_ty_t *sty,
+                                u32 line, u32 col)
+{
+    ST_ty_t *ety = sty->inner;
+    u32 esz = ety->size;
+    ST_forrange(0, sty->count)
+    {
+        i32 eoff = (i32)(i * esz);
+        if (ety->kind == ST_TY_STRUCT)
+            ST_lower_struct_copy(c, dst, doff + eoff, src, soff + eoff, ety, line, col);
+        else if (ety->kind == ST_TY_STRING)
+        {
+            ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + eoff, ety, line, col);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + eoff, ety, line, col);
+            ST_lower_string_copy(c, dp, sp, line, col);
+        }
+        else if (ety->kind == ST_TY_ARRAY)
+        {
+            ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + eoff, ety, line, col);
+            ST_ir_inst_t *v = ST_ir_load(c->cur, ety, sp, line, col);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + eoff, ety, line, col);
+            ST_ir_store(c->cur, ety, dp, v, line, col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, line, col,
+                          "internal: array element type is not lowered yet.");
+        }
+    }
+}
+
+static void ST_lower_array_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                    ST_ty_t *sty, ST_expr_t *lit)
+{
+    ST_ty_t *ety = sty->inner;
+    u32 esz = ety->size;
+    ST_forrange(0, lit->struct_lit.inits.count)
+    {
+        if (i >= sty->count) break;
+        ST_field_init_t *fi = &lit->struct_lit.inits.items[i];
+        i32 eoff = off + (i32)(i * esz);
+        if (ety->kind == ST_TY_STRUCT)
+        {
+            if (fi->value->kind == ST_EX_STRUCT_LIT)
+                ST_lower_struct_lit_into(c, base, off, ety, fi->value);
+            else
+            {
+                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, fi->value);
+                if (src) ST_lower_struct_copy(c, base, eoff, src, 0, ety,
+                                              fi->value->line, fi->value->col);
+            }
+        }
+        else if (ety->kind == ST_TY_STRING)
+        {
+            ST_ir_inst_t *src = ST_lower_string_addr(c, fi->value);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, off, ety,
+                                                  fi->value->line, fi->value->col);
+            ST_lower_string_copy(c, dp, src, fi->value->line, fi->value->col);
+        }
+        else if (ety->kind == ST_TY_ARRAY)
+        {
+            if (fi->value->kind == ST_EX_STRUCT_LIT)
+                ST_lower_array_lit_into(c, base, off, ety, fi->value);
+            else
+            {
+                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, fi->value);
+                if (src)
+                    ST_lower_array_copy(c, base, off, src, 0, ety,
+                                         fi->value->line, fi->value->col);
+            }
+        }
+        else if (ST_lower_ty_is_scalar(ety))
+        {
+            ST_ir_inst_t *v = ST_lower_expr(c, fi->value);
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, off, ety,
+                                                  fi->value->line, fi->value->col);
+            ST_ir_store(c->cur, ety, fp, v, fi->value->line, fi->value->col);
+        }
+        else
+        {
+            ST_diag_error(&c->diag, fi->value->line, fi->value->col,
+                          "internal: this array element type is not lowered yet.");
+        }
+    }
+}
+
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
 {
     switch (s->kind)
@@ -1022,8 +1109,13 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s)
 
             if (s->decl.init)
             {
-                ST_diag_error(&c->diag, s->line, s->col, "Urmom");
-                break;
+                if (s->decl.init->kind == ST_EX_STRUCT_LIT)
+                    ST_lower_array_lit_into(c, slot, 0, ty, s->decl.init);
+                else
+                {
+                    ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->decl.init);
+                    if (src) ST_lower_array_copy(c, slot, 0, src, 0, ty, s->line, s->col);
+                }
             }
             ST_lower_bind_addr(c, s->decl.name, slot, ty);
             break;

@@ -31,6 +31,7 @@ struct ST_tyexpr_t
     ST_string_t name;
     ST_tyexpr_t *inner;
     ST_expr_t *count_expr;
+    b8 is_dynamic;
 };
 
 typedef enum

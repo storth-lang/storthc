@@ -227,8 +227,11 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p)
         p->pos++;
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_ARRAY, t->line, t->col);
         if (ST_at_symbol(p, ".."))
+        {
             p->pos++;
-        else
+            te->is_dynamic = 1;
+        }
+        else if (!ST_at_symbol(p, "]"))
         {
             te->count_expr = ST_parse_expr(p);
             if (!te->count_expr) return NULL;

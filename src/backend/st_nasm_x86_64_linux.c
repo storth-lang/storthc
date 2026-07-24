@@ -135,7 +135,10 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in)
     case ST_IR_FSUB: ST_todo("ST_IR_FSUB"); break;
     case ST_IR_FMUL: ST_todo("ST_IR_FMUL"); break;
     case ST_IR_FDIV: ST_todo("ST_IR_FDIV"); break;
-    case ST_IR_NEG: ST_todo("ST_IR_NEG"); break;
+    case ST_IR_NEG: {
+        ST_load(out, "rax", in->unary.v);
+        fprintf(out, "    neg rax\n");
+    } break;
     case ST_IR_FNEG: ST_todo("ST_IR_FNEG"); break;
     case ST_IR_AND: {
         ST_load(out, "rax", in->bin.l);

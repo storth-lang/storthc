@@ -1,3 +1,4 @@
+
 #include "st_semantic.h"
 #include "st_lexer.h"
 
@@ -276,8 +277,15 @@ static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te)
     case ST_TE_ARRAY: {
         ST_ty_t *inner = ST_resolve_tyexpr(se, te->inner);
         if (!inner) return NULL;
-        if (!te->count_expr) return ST_ty_dyn_array(&se->tys, inner);
-        // fixed array: the element size must be known now
+        if (te->is_dynamic) return ST_ty_dyn_array(&se->tys, inner);
+        if (!te->count_expr)
+        {
+            ST_diag_error(&se->diag, te->line, te->col,
+                          "array size can only be inferred on a declaration with "
+                          "an array-literal initalizer ('x : []T = { ... }); "
+                          "give an explicit size '[N]T' here");
+            return NULL;
+        }
         ST_complete_ty(se, inner);
         i64 n = 0;
         if (!ST_const_eval(se, te->count_expr, &n))
@@ -730,7 +738,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e)
         if (i >= max_p) break;
         ST_arg_t *arg = &e->call.args.items[i];
         ST_ty_t *pt = fnty->params.items[i];
-        ST_arg_extern_decay(se, sym, pt, arg); 
+        ST_arg_extern_decay(se, sym, pt, arg);
         ST_ty_t *at = arg->value->ty;
         if (pt && at && !ST_ty_coerces(se, at, pt))
         {
@@ -755,7 +763,7 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e)
 {
     ST_expr_t *base = e->field.base;
 
-    // TODO(segfault): tag_union construction 
+    // TODO(segfault): tag_union construction
     // Type.Member: enum variants
     if (base && base->kind == ST_EX_IDENT)
     {
@@ -883,7 +891,7 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         else
             t = ST_ty_for_decls(&se->tys, sym->decl);
     }
-    else if (expect && expect->kind == ST_TY_STRUCT)
+    else if (expect && (expect->kind == ST_TY_STRUCT || expect->kind == ST_TY_ARRAY))
         t = expect;
     else
         ST_diag_error(&se->diag, e->line, e->col,
@@ -891,6 +899,36 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                       "name it: 'Type{ .. }'");
 
     if (t) ST_complete_ty(se, t);
+    if (t && t->kind == ST_TY_ARRAY)
+    {
+        ST_ty_t *ety = t->inner;
+        if (e->struct_lit.inits.count > t->count)
+        {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "too many initalizers for an array of %llu elements%s",
+                          (unsigned long long)t->count, t->count == 1 ? "" : "s");
+        }
+        ST_forrange(0, e->struct_lit.inits.count)
+        {
+            ST_field_init_t *fi = &e->struct_lit.inits.items[i];
+            if (fi->name.len)
+            {
+                ST_diag_error(&se->diag, e->line, e->col,
+                              "array literal do not take named initalizers.",
+                              "'("ST_sv_fmt"')", ST_sv_args(fi->name));
+                continue;
+            }
+            ST_ty_t *vt = ST_type_expr(se, fi->value);
+            if(i >= t->fields.count || !vt) continue;
+            if (!ST_ty_coerces(se, vt, ety))
+            {
+                ST_diag_error(&se->diag, e->line, e->col,
+                              "array element expects '%s', got '%s'.",
+                              ST_tstr(se, ety), ST_tstr(se, vt));
+            }
+        }
+        return t;
+    }
 
     ST_forrange(0, e->struct_lit.inits.count)
     {
@@ -1034,8 +1072,27 @@ static void ST_check_cond(ST_sema_t *se, ST_expr_t *cond, const char *what)
 
 static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s)
 {
-    ST_ty_t *dt = s->decl.te ? ST_resolve_tyexpr(se, s->decl.te) : NULL;
+    b8 infer_count = s->decl.te && s->decl.te->kind == ST_TE_ARRAY
+        && !s->decl.te->is_dynamic && !s->decl.te->count_expr;
+    ST_ty_t *dt = NULL;
+    if (s->decl.te && !infer_count) dt = ST_resolve_tyexpr(se, s->decl.te);
     if (dt) ST_complete_ty(se, dt);
+    if (infer_count)
+    {
+        ST_ty_t *ety = ST_resolve_tyexpr(se, s->decl.te->inner);
+        b8 has_lit = s->decl.init && s->decl.init->kind == ST_EX_STRUCT_LIT
+            && !s->decl.init->struct_lit.type_name.len;
+        if (ety && has_lit)
+        {
+            ST_complete_ty(se, ety);
+            dt = ST_ty_array(&se->tys, ety, s->decl.init->struct_lit.inits.count);
+        }
+        else if (ety)
+            ST_diag_error(&se->diag, s->line, s->col,
+                          "cannot infer the size of '" ST_sv_fmt "' give it an"
+                          "explicit count '[N]T' or initalize it with an array"
+                          "iteral '{....}'.", ST_sv_args(s->decl.name));
+    }
 
     ST_ty_t *it = NULL;
     if (s->decl.init)
@@ -1633,4 +1690,3 @@ static void ST_sema_check(ST_sema_t *se, ST_program_t *prog)
    ST_sema_check(se, prog);
    return se->diag.n_errors == 0;
 }
- 
