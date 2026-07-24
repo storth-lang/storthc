@@ -58,12 +58,12 @@ void ST_dump_tyexpr(FILE *out, ST_tyexpr_t *te)
         ST_dump_tyexpr(out, te->inner);
         break;
     case ST_TE_ARRAY:
-        if (te->count_expr && te->count_expr->kind == ST_EX_INT)
+        if (te->is_dynamic) fprintf(out, "[..]");
+        else if (te->count_expr && te->count_expr->kind == ST_EX_INT)
             fprintf(out, "[%ld]", te->count_expr->ival);
         else if (te->count_expr)
             fprintf(out, "[expr]");
-        else
-            fprintf(out, "[..]");
+        else fprintf(out, "[?]");
         ST_dump_tyexpr(out, te->inner);
         break;
     }
