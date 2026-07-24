@@ -1048,7 +1048,7 @@ static void ST_lower_array_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 o
         else if (ST_lower_ty_is_scalar(ety))
         {
             ST_ir_inst_t *v = ST_lower_expr(c, fi->value);
-            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, off, ety,
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, eoff, ety,
                                                   fi->value->line, fi->value->col);
             ST_ir_store(c->cur, ety, fp, v, fi->value->line, fi->value->col);
         }
