@@ -142,40 +142,37 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in)
     case ST_IR_FNEG: ST_todo("ST_IR_FNEG"); break;
     case ST_IR_AND: {
         ST_load(out, "rax", in->bin.l);
-        ST_load(out, "rbx", in->bin.r);
-        fprintf(out, "    test rax, rax\n");
-        fprintf(out, "    setne al\n");
-        fprintf(out, "    movzx eax, al\n");
-
-        fprintf(out, "    test rbx, rbx\n");
-        fprintf(out, "    setne cl\n");
-        fprintf(out, "    movzx ecx, cl\n");
-
-        fprintf(out, "    and eax, ecx\n");
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    and rax, rcx\n");
     } break;
     case ST_IR_OR: {
         ST_load(out, "rax", in->bin.l);
-        ST_load(out, "rbx", in->bin.r);
-
-        fprintf(out, "    test rax, rax\n");
-        fprintf(out, "    setne al\n");
-        fprintf(out, "    movzx eax, al\n");
-
-        fprintf(out, "    test rbx, rbx\n");
-        fprintf(out, "    setne cl\n");
-        fprintf(out, "    movzx ecx, cl\n");
-
-        fprintf(out, "    or eax, ecx\n");
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    or rax, rcx\n");
     } break;
-    case ST_IR_XOR: ST_todo("ST_IR_XOR"); break;
-    case ST_IR_SHL: ST_todo("ST_IR_SHL"); break;
-    case ST_IR_LSHR: ST_todo("ST_IR_LSHR"); break;
-    case ST_IR_ASHR: ST_todo("ST_IR_ASHR"); break;
+    case ST_IR_XOR: {
+        ST_load(out, "rax", in->bin.l);
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    xor rax, rcx\n");
+    } break;
+    case ST_IR_SHL: {
+        ST_load(out, "rax", in->bin.l);
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    shl rax, cl\n");
+    } break;
+    case ST_IR_LSHR: {
+        ST_load(out, "rax", in->bin.l);
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    shr rax, cl\n");
+    } break;
+    case ST_IR_ASHR: {
+        ST_load(out, "rax", in->bin.l);
+        ST_load(out, "rcx", in->bin.r);
+        fprintf(out, "    sar rax, cl\n");
+    } break;
     case ST_IR_NOT: {
         ST_load(out, "rax", in->unary.v);
-        fprintf(out, "    test rax, rax\n");
-        fprintf(out, "    sete al\n");
-        fprintf(out, "    movzx eax, al\n");
+        fprintf(out, "    not rax\n");
     } break;
     case ST_IR_ICMP_EQ: ST_icmp(out, in, "sete"); break;
     case ST_IR_ICMP_NE: ST_icmp(out, in, "setne"); break;
