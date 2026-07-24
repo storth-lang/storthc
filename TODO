@@ -67,15 +67,15 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Semantically the best way to slice a string is have a slice function on the level of module.
 - [ ] String interning should be a thing.
 
-09:00:30 Idea masturbation
+2026:07:22 Idea masturbation
 
 - [ ] No macro system. We will have some meta staging from the meta
       language. Paper: https://dl.acm.org/doi/pdf/10.1145/258993.259019
-- [ ] User defined compile time directives as attributes
+- [ ] User defined compile time directives as attributes.
 - [ ] Exposure of compiler plugin meaning the user can create event pull
       based compiler plugins instead of jai's message push style one.
 
-- [ ] Alloca does not take into account for function frame so if a function returns multiple returns
+- [x] Alloca does not take into account for function frame so if a function returns multiple returns
       Fix stack allocation to allocate new memory depeding of the stack frame slot provided by the function.
 
 - [x] Not emit obj and asm crap in the same dir put it in its own separate userspace directory.

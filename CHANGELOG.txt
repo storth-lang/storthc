@@ -76,3 +76,19 @@
 
 - Finally we have multiple bind declaration supported for scalar type though it does not work with other types.
   Meaning a function returning multiple value can be mapped correctly.
+
+2026:07:23
+
+- Array is now supported to a degree. We can lower arrays in declaration obviously not in structs or other stuff.
+  Also they are still buggy in the sense we do not take into account for the size of the array and provide a nice
+  fields like length and pointer to do the offset with the array.
+
+- Just fixed indexing of arrays though we still do not compile time check index's we will still have indexing none
+  the less we can still index arrays though matrix arrays do not work yet this is a far greater support.
+
+2026:07:22
+
+- We now support &&, || and ! operators correctly. The idea is about branching we fixed the IR to have the correct
+  branching for all of these operation meaning the short circuit is now valid.
+
+- Also added support for them in the backend as well.

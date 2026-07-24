@@ -54,8 +54,6 @@ int main(int argc, char **argv)
     ST_string_t exe_path_s = ST_abs_path(arena, exe_path);
     exe_path = (const char *)exe_path_s.data;
 
-
-
     if (!ST_flag_parse(fp, argc, argv))
     {
         ST_flag_usage(fp);
