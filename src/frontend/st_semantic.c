@@ -818,9 +818,9 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e)
     if (t->kind == ST_TY_ARRAY || t->kind == ST_TY_DYN_ARRAY
         || t->kind == ST_TY_STRING)
     {
-        if (ST_string_eq_cstr(e->field.name, "count"))
+        if (ST_string_eq_cstr(e->field.name, "len"))
             return se->tys.prim[ST_ti64];
-        if (ST_string_eq_cstr(e->field.name, "data"))
+        if (ST_string_eq_cstr(e->field.name, "ptr"))
             return ST_ty_ptr(&se->tys, t->kind == ST_TY_STRING
                              ? se->tys.prim[ST_tchar] : t->inner);
     }

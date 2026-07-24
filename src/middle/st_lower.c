@@ -592,24 +592,26 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e)
         else
             base = ST_lower_lvalue_addr(c, b);
 
-        if (!base) return NULL;
-        if (!bt || bt->kind != ST_TY_STRUCT)
+        if (!base || !bt) return NULL;
+        if (bt->kind == ST_TY_STRING || bt->kind == ST_TY_DYN_ARRAY)
         {
-            ST_diag_error(&c->diag, e->line, e->col,
-                          "internal: field access on this type isn't lowered yet "
-                          "(array/string members come later)");
-            return NULL;
+            if (ST_string_eq_cstr(e->field.name, "ptr"))
+            {
+                ST_ty_t *elem = bt->kind == ST_TY_STRING
+                    ? c->sema->tys.prim[ST_tchar] : bt->inner;
+                return ST_lower_field_ptr(c, base, 0,
+                                          ST_ty_ptr(&c->sema->tys, elem), e->line, e->col);
+            }
+            if (ST_string_eq_cstr(e->field.name, "len"))
+                return ST_lower_field_ptr(c, base, 8,
+                                          c->sema->tys.prim[ST_ti64], e->line, e->col);
         }
 
-        if (bt || bt->kind == ST_TY_STRING)
+        if (bt->kind != ST_TY_STRUCT)
         {
-            if (ST_string_eq_cstr(e->field.name, "data")) {
-                return ST_lower_field_ptr(c, base, 0, ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]), e->line, e->col);
-            }
-            if (ST_string_eq_cstr(e->field.name, "len")) {
-                return ST_lower_field_ptr(c, base, 8, ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_ti64]), e->line, e->col);
-            }
-
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: field access on this type isn't lowered yet ");
+            return NULL;
         }
         ST_ty_t *fty = NULL;
         u32 foff = 0;
@@ -854,6 +856,21 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e)
     }
 
     case ST_EX_FIELD: {
+        ST_expr_t *fb = e->field.base;
+        ST_ty_t *ftb = fb->ty;
+        if (ftb && ftb->kind == ST_TY_PTR) ftb = ftb->inner;
+        if (ftb && ftb->kind == ST_TY_ARRAY)
+        {
+            if (ST_string_eq_cstr(e->field.name, "len"))
+                return ST_ir_const_int(c->cur, e->ty, (i64)ftb->count);
+            if (ST_string_eq_cstr(e->field.name, "ptr"))
+            {
+                b8 through_ptr = fb->ty && fb->ty->kind == ST_TY_PTR;
+                ST_ir_inst_t *base = through_ptr ?
+                    ST_lower_expr(c, fb) : ST_lower_lvalue_addr(c, fb);
+                return base ? base : ST_ir_const_int(c->cur, e->ty, 0);
+            }
+        }
         ST_ir_inst_t *a = ST_lower_lvalue_addr(c, e);
         if (!a) return ST_ir_const_int(c->cur, e->ty, 0);
         if (!ST_lower_ty_is_scalar(e->ty))
