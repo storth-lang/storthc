@@ -839,12 +839,21 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p) {
                     return NULL;
                 ST_da_append_arena(p->arena, &c.values, v);
             }
-            if (!ST_expect_sym(p, "{"))
-                return NULL;
-            if (!ST_parse_body(p, &c.body))
-                return NULL;
-            if (!ST_expect_sym(p, "}"))
-                return NULL;
+            if (ST_at_symbol(p, ":")) {
+                // 'case Label: stmt;' -- a single statement, no block braces.
+                p->pos++;
+                ST_stmt_t *one = ST_parse_stmt(p);
+                if (!one)
+                    return NULL;
+                ST_da_append_arena(p->arena, &c.body, one);
+            } else {
+                if (!ST_expect_sym(p, "{"))
+                    return NULL;
+                if (!ST_parse_body(p, &c.body))
+                    return NULL;
+                if (!ST_expect_sym(p, "}"))
+                    return NULL;
+            }
             ST_da_append_arena(p->arena, &s->switch_.cases, c);
         }
         if (!ST_expect_sym(p, "}"))
@@ -934,6 +943,7 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
     p->pos++;
 
     if (ST_at_symbol(p, ":=") || ST_at_symbol(p, "::")) {
+        s->decl.is_const = ST_at_symbol(p, "::");
         p->pos++;
         s->decl.init = ST_parse_expr(p);
         if (!s->decl.init)
@@ -1498,12 +1508,10 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
         v.name = ST_expect_ident(p, "a variant name");
         if (!v.name.len)
             return NULL;
-        if (ST_at_symbol(p, "(")) {
+        if (ST_at_symbol(p, ":")) {
             p->pos++;
             v.payload = ST_parse_type(p);
             if (!v.payload)
-                return NULL;
-            if (!ST_expect_sym(p, ")"))
                 return NULL;
         }
         ST_da_append_arena(p->arena, &d->tag_union.variants, v);

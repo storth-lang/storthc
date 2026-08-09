@@ -51,6 +51,10 @@ static ST_ir_inst_t *ST_lower_short_and(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *st,
                                  u32 line, u32 col);
+static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST_ir_inst_t *src,
+                                 i32 soff, ST_ty_t *st, u32 line, u32 col);
+static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *st,
+                                     ST_expr_t *e);
 static void ST_lower_scan_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ir_inst_t *ST_lower_struct_addr(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *st);
 
@@ -363,6 +367,71 @@ static ST_ir_inst_t *ST_lower_field_ptr(ST_lower_ctx_t *c, ST_ir_inst_t *base, i
     return ST_ir_addr(c->cur, pty, base, NULL, 0, off, line, col);
 }
 
+static b8 ST_lower_is_union_construct(ST_expr_t *e) {
+    return e->kind == ST_EX_STRUCT_LIT && e->ty && e->ty->kind == ST_TY_TAG_UNION;
+}
+
+static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
+                                          ST_ty_t *ut, ST_expr_t *lit) {
+    ST_string_t vname = lit->struct_lit.inits.items[0].value->name;
+    ST_decl_t *ud = ut->decl;
+    i64 idx = -1;
+    ST_ty_t *payload_ty = NULL;
+    ST_forrange(0, ud->tag_union.variants.count) {
+        if (!ST_string_eq(ud->tag_union.variants.items[i].name, vname))
+            continue;
+        idx = (i64)i;
+        if (ud->tag_union.variants.items[i].payload)
+            payload_ty = ST_lower_tyexpr(c, ud->tag_union.variants.items[i].payload);
+        break;
+    }
+
+    ST_ty_t *tagty = c->sema->tys.prim[ST_ti64];
+    ST_ir_inst_t *tagp = ST_lower_field_ptr(c, base, off, tagty, lit->line, lit->col);
+    ST_ir_store(c->cur, tagty, tagp, ST_ir_const_int(c->cur, tagty, idx), lit->line, lit->col);
+
+    if (lit->struct_lit.inits.count == 2) {
+        ST_expr_t *pval = lit->struct_lit.inits.items[1].value;
+        if (payload_ty && payload_ty->kind == ST_TY_STRUCT) {
+            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, off + 8, payload_ty, lit->line, lit->col);
+            ST_lower_struct_zero(c, pp, 0, payload_ty, lit->line, lit->col);
+            if (pval->kind == ST_EX_STRUCT_LIT)
+                ST_lower_struct_lit_into(c, pp, 0, payload_ty, pval);
+            else {
+                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, pval);
+                if (src)
+                    ST_lower_struct_copy(c, pp, 0, src, 0, payload_ty, lit->line, lit->col);
+            }
+        } else if (payload_ty && ST_lower_ty_is_scalar(payload_ty)) {
+            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, off + 8, payload_ty, lit->line, lit->col);
+            ST_ir_inst_t *v = ST_lower_expr(c, pval);
+            ST_ir_store(c->cur, payload_ty, pp, v, lit->line, lit->col);
+        } else {
+            ST_diag_error(&c->diag, lit->line, lit->col,
+                          "internal: this tag_union payload type isn't lowered yet");
+        }
+    } else {
+        // No payload: zero the payload region for a clean, deterministic value.
+        u32 payload_bytes = ut->size > 8 ? ut->size - 8 : 0;
+        i32 poff = off + 8;
+        while (payload_bytes >= 8) {
+            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, poff, tagty, lit->line, lit->col);
+            ST_ir_store(c->cur, tagty, pp, ST_ir_const_int(c->cur, tagty, 0), lit->line, lit->col);
+            poff += 8;
+            payload_bytes -= 8;
+        }
+    }
+}
+
+// Allocates a fresh temp slot, constructs into it, and returns its address
+// -- the generic fallback for a union-construct literal used as a plain
+// expression value (matches ST_lower_struct_addr's role for struct literals).
+static ST_ir_inst_t *ST_lower_union_construct_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
+    ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, e->line, e->col);
+    ST_lower_union_construct_into(c, slot, 0, e->ty, e);
+    return slot;
+}
+
 static ST_ir_inst_t *ST_lower_string_lit_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
     u32 idx = ST_ir_module_intern_str(c->module, e->sval);
     ST_ty_t *pty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tstring]);
@@ -457,6 +526,24 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
                           "lowered yet (arrays in structs come later)",
                           ST_sv_args(f->name));
         }
+    }
+}
+
+// Copies 'size' bytes as-is between two addresses, 8 bytes at a time (size
+// is always a multiple of 8 for anything this gets called on: tag_unions
+// are laid out {tag: i64, payload}, both 8-aligned). Used for tag_union
+// values, which -- unlike structs -- have no per-field layout to walk field
+// by field; the payload is opaque bytes as far as the copy is concerned.
+static void ST_lower_raw_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST_ir_inst_t *src,
+                              i32 soff, u32 size, u32 line, u32 col) {
+    ST_ty_t *chunk_ty = c->sema->tys.prim[ST_ti64];
+    u32 off = 0;
+    while (off + 8 <= size) {
+        ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)off, chunk_ty, line, col);
+        ST_ir_inst_t *v = ST_ir_load(c->cur, chunk_ty, sp, line, col);
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)off, chunk_ty, line, col);
+        ST_ir_store(c->cur, chunk_ty, dp, v, line, col);
+        off += 8;
     }
 }
 
@@ -559,6 +646,8 @@ static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 
 }
 
 static ST_ir_inst_t *ST_lower_struct_addr(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *st) {
+    if (ST_lower_is_union_construct(e))
+        return ST_lower_union_construct_addr(c, e);
     if (e->kind == ST_EX_STRUCT_LIT) {
         ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, st, e->line, e->col);
         ST_lower_struct_lit_into(c, slot, 0, st, e);
@@ -723,6 +812,21 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
                                               e->col);
             }
 
+            if (bt->kind == ST_TY_TAG_UNION) {
+                if (ST_string_eq_cstr(e->field.name, "kind"))
+                    return ST_lower_field_ptr(c, base, 0, c->sema->tys.prim[ST_ti64], e->line,
+                                              e->col);
+                ST_variant_specs_t *vs = &bt->decl->tag_union.variants;
+                ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name)) {
+                    ST_ty_t *pty = ST_lower_tyexpr(c, vs->items[i].payload);
+                    return ST_lower_field_ptr(c, base, 8, pty, e->line, e->col);
+                }
+                ST_diag_error(&c->diag, e->line, e->col,
+                              "internal: unknown tag_union variant '" ST_sv_fmt "'",
+                              ST_sv_args(e->field.name));
+                return NULL;
+            }
+
             if (bt->kind != ST_TY_STRUCT) {
                 ST_diag_error(&c->diag, e->line, e->col,
                               "internal: field access on this type isn't lowered yet ");
@@ -835,6 +939,11 @@ static ST_ir_op_t ST_lower_compound_op(ST_diag_t *diag, ST_string_t op, u32 line
     return ST_IR_ADD;
 }
 
+// Named '::' constants aren't stored anywhere (they're folded into their use
+// sites), but '&N' needs a real address to hand back. The first time a
+// constant's address is taken, this materializes a same-named, initialized
+// global for it (reusing the exact same .data emission path as 'x := expr;'
+// globals) so every subsequent '&N' in the module reuses the same storage.
 static ST_ir_global_var_t *ST_lower_ensure_const_global(ST_lower_ctx_t *c, ST_sym_t *sym) {
     ST_ir_global_var_t *g = ST_ir_module_find_global(c->module, sym->name);
     if (g)
@@ -927,14 +1036,15 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
 
     ST_ir_inst_t **args;
     u32 n_args, n_extra = 0;
-    b8 has_struct_ret = e->ty && e->ty->kind == ST_TY_STRUCT && e->ty->size > 16;
+    b8 has_agg_ret = e->ty && (e->ty->kind == ST_TY_STRUCT || e->ty->kind == ST_TY_TAG_UNION) &&
+                    e->ty->size > 16;
 
     ST_ir_inst_t *ret_slot = NULL;
-    if (has_struct_ret)
+    if (has_agg_ret)
         n_extra = 1;
 
     u32 max_args = 0;
-    if (has_struct_ret)
+    if (has_agg_ret)
         ret_slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, e->line, e->col);
 
     if (sig && !sig->is_variadic) {
@@ -978,7 +1088,7 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
 
         args = max_args ? ST_arena_push_zeroed(c->arena, sizeof(*args) * max_args) : NULL;
         n_args = 0;
-        if (has_struct_ret) {
+        if (has_agg_ret) {
             args[n_args++] = ret_slot;
         }
 
@@ -988,7 +1098,8 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
                 args[n_args++] = ST_ir_const_int(c->cur, c->sema->tys.prim[ST_ti32], 0);
                 continue;
             }
-            if (re->ty && (re->ty->kind == ST_TY_STRUCT || re->ty->kind == ST_TY_STRING))
+            if (re->ty && (re->ty->kind == ST_TY_STRUCT || re->ty->kind == ST_TY_STRING ||
+                          re->ty->kind == ST_TY_TAG_UNION))
                 ST_lower_push_struct_arg(c, args, &n_args, re, re->ty);
             else
                 args[n_args++] = ST_lower_expr(c, re);
@@ -997,13 +1108,14 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
         n_args = e->call.args.count * 2 + n_extra;
         args = n_args ? ST_arena_push(c->arena, sizeof(*args) * n_args) : NULL;
         u32 idx = 0;
-        if (has_struct_ret) {
+        if (has_agg_ret) {
             args[idx++] = ret_slot;
         }
 
         ST_forrange(0, e->call.args.count) {
             ST_expr_t *ae = e->call.args.items[i].value;
-            if (ae->ty && (ae->ty->kind == ST_TY_STRUCT || ae->ty->kind == ST_TY_STRING))
+            if (ae->ty && (ae->ty->kind == ST_TY_STRUCT || ae->ty->kind == ST_TY_STRING ||
+                          ae->ty->kind == ST_TY_TAG_UNION))
                 ST_lower_push_struct_arg(c, args, &idx, ae, ae->ty);
             else
                 args[idx++] = ST_lower_expr(c, ae);
@@ -1023,7 +1135,7 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
         ST_ir_inst_t *ptr = ST_lower_expr(c, e->call.callee);
         result = ST_ir_call_indirect(c->cur, e->ty, ptr, args, n_args, e->line, e->col);
     }
-    if (has_struct_ret && ret_slot)
+    if (has_agg_ret && ret_slot)
         return ret_slot;
 
     return result;
@@ -1067,6 +1179,10 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
                 return ST_ir_load(c->cur, e->ty, addr, e->line, e->col);
             }
             {
+                // 'x :: expr;' / 'x : T : expr;' constants aren't stored
+                // anywhere; using one as a value just lowers its defining
+                // expression in place, coercing to the identifier's (possibly
+                // annotated) type when that differs from the raw literal's.
                 ST_ht_generic_t key = {.tag = e->name.data, .size = e->name.len};
                 ST_sym_t *sym = ST_ht_get(&c->sema->globals, key).tag;
                 if (sym && sym->kind == ST_SYM_CONST && sym->decl &&
@@ -1149,6 +1265,9 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
         case ST_EX_FIELD: {
             ST_expr_t *fb = e->field.base;
             {
+                // Type.Variant (enum / enum_flag) folds to a constant; this
+                // must be checked before any of the lvalue-address paths
+                // below, which only know how to handle struct field access.
                 i64 v;
                 if (ST_const_eval(c->sema, e, &v))
                     return ST_ir_const_int(c->cur, e->ty, v);
@@ -1195,6 +1314,8 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
             return ST_lower_string_lit_addr(c, e);
 
         case ST_EX_CALL:
+            if (ST_lower_is_union_construct(e))
+                return ST_lower_union_construct_addr(c, e);
             return ST_lower_call(c, e);
 
         case ST_EX_CAST:
@@ -1458,6 +1579,21 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 break;
             }
 
+            if (ty->kind == ST_TY_TAG_UNION) {
+                ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->line, s->col);
+                if (s->decl.init) {
+                    if (ST_lower_is_union_construct(s->decl.init))
+                        ST_lower_union_construct_into(c, slot, 0, ty, s->decl.init);
+                    else {
+                        ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->decl.init);
+                        if (src)
+                            ST_lower_raw_copy(c, slot, 0, src, 0, ty->size, s->line, s->col);
+                    }
+                }
+                ST_lower_bind_addr(c, s->decl.name, slot, ty);
+                break;
+            }
+
             if (ty->kind == ST_TY_STRING) {
                 ST_ir_inst_t *slots = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->line, s->col);
                 if (s->decl.init) {
@@ -1548,6 +1684,25 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                     ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->assign.rhs);
                     if (src)
                         ST_lower_struct_copy(c, dst, 0, src, 0, lhs->ty, s->line, s->col);
+                }
+                break;
+            }
+            if (lhs->ty && lhs->ty->kind == ST_TY_TAG_UNION) {
+                if (!ST_string_eq_cstr(s->assign.op, "=")) {
+                    ST_diag_error(&c->diag, s->line, s->col,
+                                  "internal: compound assignment on tag_union values "
+                                  "isn't a thing");
+                    break;
+                }
+                ST_ir_inst_t *dst = ST_lower_lvalue_addr(c, lhs);
+                if (!dst)
+                    break;
+                if (ST_lower_is_union_construct(s->assign.rhs))
+                    ST_lower_union_construct_into(c, dst, 0, lhs->ty, s->assign.rhs);
+                else {
+                    ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->assign.rhs);
+                    if (src)
+                        ST_lower_raw_copy(c, dst, 0, src, 0, lhs->ty->size, s->line, s->col);
                 }
                 break;
             }
@@ -2016,17 +2171,29 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
         } break;
 
         case ST_ST_SWITCH: {
-            ST_ir_inst_t *cond_v = ST_lower_expr(c, s->switch_.cond);
+            ST_ty_t *cond_ty = s->switch_.cond->ty;
+            b8 is_union = cond_ty && cond_ty->kind == ST_TY_TAG_UNION;
+
+            ST_ir_inst_t *cond_v;
+            if (is_union) {
+                ST_ir_inst_t *addr = ST_lower_lvalue_addr(c, s->switch_.cond);
+                if (!addr)
+                    break;
+                ST_ir_inst_t *kindp =
+                    ST_lower_field_ptr(c, addr, 0, c->sema->tys.prim[ST_ti64], s->line, s->col);
+                cond_v = ST_ir_load(c->cur, c->sema->tys.prim[ST_ti64], kindp, s->line, s->col);
+            } else {
+                cond_v = ST_lower_expr(c, s->switch_.cond);
+            }
             if (!cond_v)
                 break;
-            ST_ty_t *cond_ty = s->switch_.cond->ty;
-            if (!ST_lower_ty_is_scalar(cond_ty)) {
+            if (!is_union && !ST_lower_ty_is_scalar(cond_ty)) {
                 ST_diag_error(&c->diag, s->line, s->col,
                               "internal: switching on this type is not lowered yet");
                 break;
             }
 
-            b8 is_f = ST_ty_is_float(cond_ty);
+            b8 is_f = !is_union && ST_ty_is_float(cond_ty);
             ST_ty_t *bty = c->sema->tys.prim[ST_tbool];
             ST_case_t *default_case = NULL;
             ST_forrange(0, s->switch_.cases.count) {
@@ -2042,7 +2209,19 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 if (cs->values.count == 0)
                     continue;
 
-                ST_ir_inst_t *case_v = ST_lower_expr(c, cs->values.items[0]);
+                ST_ir_inst_t *case_v;
+                if (is_union) {
+                    ST_string_t vname = cs->values.items[0]->name;
+                    i64 idx = -1;
+                    ST_forrange(0, cond_ty->decl->tag_union.variants.count)
+                        if (ST_string_eq(cond_ty->decl->tag_union.variants.items[i].name, vname)) {
+                            idx = (i64)i;
+                            break;
+                        }
+                    case_v = ST_ir_const_int(c->cur, c->sema->tys.prim[ST_ti64], idx);
+                } else {
+                    case_v = ST_lower_expr(c, cs->values.items[0]);
+                }
                 ST_ir_op_t eq_op = is_f ? ST_IR_FCMP_EQ : ST_IR_ICMP_EQ;
                 ST_ir_inst_t *eq =
                     ST_ir_binop(c->cur, eq_op, bty, cond_v, case_v, cs->line, cs->col);
@@ -2212,6 +2391,30 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                 ST_ir_inst_t *ptr = ST_ir_param(entry, ST_ty_ptr(&c->sema->tys, pty), i, p->name);
                 param_index++;
                 ST_lower_struct_copy_direct(c, slot, ptr, pty, d->line, d->col);
+            } else if (pty->size <= 8) {
+                ST_ir_inst_t *pv = ST_ir_param(entry, pty, i, p->name);
+                param_index++;
+                ST_ir_store(entry, pty, slot, pv, d->line, d->col);
+            } else {
+                u32 n_eb = ST_lower_eight_bytes_count(pty);
+                for (u32 k = 0; k < n_eb; k++) {
+                    ST_ty_t *ebty = ST_lower_eight_byte_ty(c, pty, k);
+                    ST_ir_inst_t *pv = ST_ir_param(entry, ebty, i, p->name);
+                    param_index++;
+                    ST_ir_inst_t *fp =
+                        ST_lower_field_ptr(c, slot, (i32)(k * 8), ebty, d->line, d->col);
+                    ST_ir_store(entry, ebty, fp, pv, d->line, d->col);
+                }
+            }
+            ST_lower_bind_addr(c, p->name, slot, pty);
+            continue;
+        }
+        if (pty && pty->kind == ST_TY_TAG_UNION) {
+            ST_ir_inst_t *slot = ST_ir_alloca(fn, &c->sema->tys, pty, d->line, d->col);
+            if (pty->size > 16) {
+                ST_ir_inst_t *ptr = ST_ir_param(entry, ST_ty_ptr(&c->sema->tys, pty), i, p->name);
+                param_index++;
+                ST_lower_raw_copy(c, slot, 0, ptr, 0, pty->size, d->line, d->col);
             } else if (pty->size <= 8) {
                 ST_ir_inst_t *pv = ST_ir_param(entry, pty, i, p->name);
                 param_index++;

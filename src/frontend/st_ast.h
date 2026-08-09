@@ -191,6 +191,7 @@ struct ST_stmt_t {
             ST_tyexpr_t *te;
             ST_expr_t *init;
             b8 is_static;
+            b8 is_const;
         } decl;
         struct {
             ST_expr_t *lhs;
@@ -309,7 +310,7 @@ typedef struct {
 struct ST_decl_t {
     ST_decl_kind_t kind;
     ST_string_t name;
-    ST_string_t display_name; // for error reporting
+    ST_string_t display_name;
     b8 is_pub;
     u32 line, col;
     union {

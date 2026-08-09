@@ -73,15 +73,22 @@ static const char *ST_sym_kind_str(ST_sym_kind_t kind) {
     return "symbol";
 }
 
+// The name to show a person for a decl in a diagnostic: for a generic
+// instantiation this is the readable 'Foo(i32, i32)' form, not the mangled
+// internal name ('Foo$i32$i32').
 static ST_string_t ST_decl_display_name(ST_decl_t *d) {
     return d->display_name.len ? d->display_name : d->name;
 }
 
+// The name to show a person in a diagnostic: for a generic function
+// instantiation this is the original template name they actually wrote
+// ('mod'), not the mangled per-instantiation symbol name ('mod$i32$string').
 static ST_string_t ST_sym_display_name(ST_sym_t *sym) {
     return sym->template_name.len ? sym->template_name : sym->name;
 }
 
-static void ST_declare_local(ST_sema_t *se, ST_string_t name, ST_ty_t *t, u32 line, u32 col) {
+static void ST_declare_local_ex(ST_sema_t *se, ST_string_t name, ST_ty_t *t, u32 line, u32 col,
+                                b8 is_const) {
     ST_sym_t *prev = ST_sym_find_in(&se->scope->table, name);
     if (prev) {
         ST_diag_error(&se->diag, line, col, "redeclaration of '" ST_sv_fmt "' in the same scope",
@@ -89,7 +96,13 @@ static void ST_declare_local(ST_sema_t *se, ST_string_t name, ST_ty_t *t, u32 li
         ST_diag_note(&se->diag, prev->line, prev->col, "previous declaration is here");
         return;
     }
-    ST_sym_insert(se, &se->scope->table, ST_sym_new(se, ST_SYM_VAR, name, NULL, t, line, col));
+    ST_sym_t *sym = ST_sym_new(se, ST_SYM_VAR, name, NULL, t, line, col);
+    sym->is_const = is_const;
+    ST_sym_insert(se, &se->scope->table, sym);
+}
+
+static void ST_declare_local(ST_sema_t *se, ST_string_t name, ST_ty_t *t, u32 line, u32 col) {
+    ST_declare_local_ex(se, name, t, line, col, 0);
 }
 
 // short-hand: a NULL type means "already reported".
@@ -171,6 +184,7 @@ static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
+static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
 static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig);
@@ -286,16 +300,31 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
             if (!base || base->kind != ST_EX_IDENT)
                 return 0;
             ST_sym_t *sym = ST_sym_find(se, base->name);
-            if (!sym || sym->kind != ST_SYM_TYPE || !sym->decl || sym->decl->kind != ST_DE_ENUM)
+            if (!sym || sym->kind != ST_SYM_TYPE || !sym->decl)
                 return 0;
-            ST_variant_specs_t *vs = &sym->decl->enum_.variants;
-            ST_forrange(0, vs->count) {
-                if (!ST_string_eq(vs->items[i].name, e->field.name))
-                    continue;
-                if (!vs->items[i].has_computed)
-                    return 0; // not resolved yet (shouldn't happen post layout pass)
-                *out = vs->items[i].computed;
-                return 1;
+            if (sym->decl->kind == ST_DE_ENUM) {
+                ST_variant_specs_t *vs = &sym->decl->enum_.variants;
+                ST_forrange(0, vs->count) {
+                    if (!ST_string_eq(vs->items[i].name, e->field.name))
+                        continue;
+                    if (!vs->items[i].has_computed)
+                        return 0; // not resolved yet (shouldn't happen post layout pass)
+                    *out = vs->items[i].computed;
+                    return 1;
+                }
+                return 0;
+            }
+            if (sym->decl->kind == ST_DE_TAG_UNION) {
+                // bare 'TagUnionName.Variant' (no call) folds to its
+                // declaration-order ordinal, comparable against '.kind'.
+                ST_variant_specs_t *vs = &sym->decl->tag_union.variants;
+                ST_forrange(0, vs->count) {
+                    if (!ST_string_eq(vs->items[i].name, e->field.name))
+                        continue;
+                    *out = (i64)i;
+                    return 1;
+                }
+                return 0;
             }
             return 0;
         }
@@ -445,7 +474,16 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                              ST_sv_args(te->name));
                 return NULL;
             }
-
+            // A bare reference to a generic struct (no explicit '($T,$U)')
+            // used somewhere that's currently being instantiated with its
+            // own generic bindings active (e.g. a generic function param
+            // 'f: *Foo' inside 'fn mod($T, $U, f: *Foo, ...)') implicitly
+            // means 'Foo' instantiated with whichever of ITS OWN generic
+            // parameter names are already bound in that scope -- so
+            // 'f: *Foo' behaves exactly like 'f: *Foo($T, $U)' as long as
+            // every one of Foo's generic names has a same-named binding
+            // available. If any name isn't bound this way, fall through to
+            // the plain (uninstantiated) skeleton type as before.
             if (se->generic_bindings && sym->decl->kind == ST_DE_STRUCT &&
                 sym->decl->struct_.generics.count) {
                 ST_tys_t args = {0};
@@ -1103,6 +1141,15 @@ static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+// Determines whether 'e' denotes a location whose address can be taken with
+// '&'. Named '::' constants are folded into their use sites everywhere else,
+// but taking their address is allowed: the compiler lazily materializes a
+// read-only backing symbol for a constant the moment its address is taken
+// (see ST_lower_addr_of), so '&N' behaves like a pointer to read-only
+// storage holding N's value. Enum/enum_flag variant access (Type.Variant) is
+// NOT covered by this — a variant has no identity of its own to point at, so
+// it stays non-addressable. Only variables (locals, params, globals, extern
+// vars), functions, and now named constants are addressable.
 static b8 ST_expr_is_addressable(ST_sema_t *se, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT: {
@@ -1493,16 +1540,19 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
 static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
     ST_expr_t *base = e->field.base;
 
-    // TODO(segfault): tag_union construction
-    // Type.Member: enum variants
+    // Type.Member: enum variants fold to a value of the enum type;
+    // tag_union variants named bare (no call) fold to their ordinal as an
+    // integer, so they can be compared against '.kind'. Constructing an
+    // actual tag_union value is 'Type.Member(payload)' -- see ST_type_call.
     if (base && base->kind == ST_EX_IDENT) {
         ST_sym_t *sym = ST_sym_find(se, base->name);
         if (sym && sym->kind == ST_SYM_TYPE && sym->decl) {
             ST_ty_t *t = ST_ty_for_decls(&se->tys, sym->decl);
             ST_variant_specs_t *vs = NULL;
+            b8 is_union = sym->decl->kind == ST_DE_TAG_UNION;
             if (sym->decl->kind == ST_DE_ENUM)
                 vs = &sym->decl->enum_.variants;
-            else if (sym->decl->kind == ST_DE_TAG_UNION)
+            else if (is_union)
                 vs = &sym->decl->tag_union.variants;
             if (!vs) {
                 ST_diag_error(&se->diag, e->line, e->col,
@@ -1511,7 +1561,8 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
                               ST_sv_args(base->name));
                 return NULL;
             }
-            ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name)) return t;
+            ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name))
+                return is_union ? se->tys.prim[ST_ti64] : t;
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' has no variant '" ST_sv_fmt "'", ST_sv_args(base->name),
                           ST_sv_args(e->field.name));
@@ -1537,6 +1588,34 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
         if (t->decl)
             ST_diag_note(&se->diag, t->decl->line, t->decl->col, "'" ST_sv_fmt "' is declared here",
                          ST_sv_args(ST_decl_display_name(t->decl)));
+        return NULL;
+    }
+
+    // 'u.kind' reads the active variant's ordinal (comparable against bare
+    // 'TagUnionName.Variant'); 'u.VariantName' reinterprets the payload
+    // region as that variant's payload type -- an unchecked reinterpret,
+    // same spirit as a C union, since checking it would need real pattern
+    // matching this language doesn't have yet.
+    if (t->kind == ST_TY_TAG_UNION) {
+        ST_complete_ty(se, t);
+        if (ST_string_eq_cstr(e->field.name, "kind"))
+            return se->tys.prim[ST_ti64];
+        ST_variant_specs_t *vs = &t->decl->tag_union.variants;
+        ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name)) {
+            if (!ST_variant_has_payload(se, &vs->items[i])) {
+                ST_diag_error(&se->diag, e->line, e->col,
+                              "'" ST_sv_fmt "' has no payload; compare '.kind' against '"
+                              ST_sv_fmt "." ST_sv_fmt "' instead",
+                              ST_sv_args(e->field.name), ST_sv_args(ST_decl_display_name(t->decl)),
+                              ST_sv_args(e->field.name));
+                return NULL;
+            }
+            return ST_resolve_tyexpr(se, vs->items[i].payload);
+        }
+        ST_diag_error(&se->diag, e->line, e->col, "'%s' has no variant '" ST_sv_fmt "'",
+                      ST_tstr(se, t), ST_sv_args(e->field.name));
+        ST_diag_note(&se->diag, t->decl->line, t->decl->col, "'" ST_sv_fmt "' is declared here",
+                     ST_sv_args(ST_decl_display_name(t->decl)));
         return NULL;
     }
 
@@ -1608,6 +1687,11 @@ static ST_ty_t *ST_type_cast(ST_sema_t *se, ST_expr_t *e) {
     return to;
 }
 
+// Infers $-generic bindings for 'td' (a generic struct template) from a
+// literal's field-init values, unifying each init against the matching
+// field's declared (possibly generic) type, then instantiates 'td' with the
+// inferred args. Shared by both the named ('Foo{ .. }') and unnamed
+// ('x : Foo = { .. }') struct-literal forms so both get the same inference.
 static ST_ty_t *ST_infer_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) {
     ST_ht_t bindings;
     ST_ht_init(se->arena, &bindings, 8);
@@ -1650,6 +1734,89 @@ static ST_ty_t *ST_infer_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) 
     return ST_instantiate_struct(se, td, args, e->line, e->col);
 }
 
+static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
+
+// Validates and types a tag_union literal 'Foo { variant, payload }' /
+// 'Foo { variant }'. The first (unnamed) init must be a bare identifier
+// naming one of 'ut's variants -- not a general expression, since there's
+// nothing named that at the value level, it's purely a selector. The second
+// init, if the variant takes a payload, is its value (checked against the
+// variant's payload type, which can be anything, including another struct
+// literal for a nested-struct payload).
+// A variant declared 'name : void;' has no real value to carry -- 'void'
+// isn't a type you can hold, it's the "nothing" annotation, same spirit as
+// a function returning void. Treat it identically to a bare 'name;' variant
+// everywhere: no payload required or accepted at construction, and no
+// payload readable via '.name'.
+static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v) {
+    if (!v->payload)
+        return 0;
+    ST_ty_t *pt = ST_resolve_tyexpr(se, v->payload);
+    return pt && pt->kind != ST_TY_VOID;
+}
+
+static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
+    ST_complete_ty(se, ut);
+    u32 n = e->struct_lit.inits.count;
+    ST_string_t uname = ST_decl_display_name(ut->decl);
+    if (n == 0 || n > 2) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' literal needs a variant name and, if that variant "
+                      "has a payload, its value: '" ST_sv_fmt "{ variant, value }'",
+                      ST_sv_args(uname), ST_sv_args(uname));
+        return NULL;
+    }
+    ST_field_init_t *tag_fi = &e->struct_lit.inits.items[0];
+    if (tag_fi->name.len || tag_fi->value->kind != ST_EX_IDENT) {
+        ST_diag_error(&se->diag, tag_fi->value->line, tag_fi->value->col,
+                      "expected a variant name here, e.g. '" ST_sv_fmt "{ SomeVariant, .. }'",
+                      ST_sv_args(uname));
+        return NULL;
+    }
+    ST_string_t vname = tag_fi->value->name;
+    ST_variant_spec_t *variant = NULL;
+    ST_forrange(0, ut->decl->tag_union.variants.count)
+        if (ST_string_eq(ut->decl->tag_union.variants.items[i].name, vname)) {
+            variant = &ut->decl->tag_union.variants.items[i];
+            break;
+        }
+    if (!variant) {
+        ST_diag_error(&se->diag, tag_fi->value->line, tag_fi->value->col,
+                      "'" ST_sv_fmt "' has no variant '" ST_sv_fmt "'", ST_sv_args(uname),
+                      ST_sv_args(vname));
+        ST_diag_note(&se->diag, ut->decl->line, ut->decl->col, "'" ST_sv_fmt "' is declared here",
+                     ST_sv_args(uname));
+        return NULL;
+    }
+    b8 has_payload = ST_variant_has_payload(se, variant);
+    if (!has_payload && n == 2) {
+        ST_diag_error(&se->diag, e->line, e->col, "'" ST_sv_fmt "' takes no payload",
+                      ST_sv_args(vname));
+        return NULL;
+    }
+    if (has_payload && n != 2) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' needs a payload value: '" ST_sv_fmt "{ " ST_sv_fmt ", .. }'",
+                      ST_sv_args(vname), ST_sv_args(uname), ST_sv_args(vname));
+        return NULL;
+    }
+    if (n == 2) {
+        ST_ty_t *pt = ST_resolve_tyexpr(se, variant->payload);
+        ST_field_init_t *pfi = &e->struct_lit.inits.items[1];
+        ST_ty_t *vt;
+        if (pfi->value->kind == ST_EX_STRUCT_LIT && !pfi->value->struct_lit.type_name.len && pt)
+            vt = ST_type_struct_lit(se, pfi->value, pt);
+        else
+            vt = ST_type_expr(se, pfi->value);
+        if (pt && vt && !ST_ty_coerces(se, vt, pt))
+            ST_diag_error(&se->diag, pfi->value->line, pfi->value->col,
+                          "'" ST_sv_fmt "' expects a payload of '%s', got '%s'",
+                          ST_sv_args(vname), ST_tstr(se, pt), ST_tstr(se, vt));
+    }
+    e->ty = ut;
+    return ut;
+}
+
 static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
     ST_ty_t *t = NULL;
     ST_sym_t *lit_tmpl = e->struct_lit.type_name.len
@@ -1684,13 +1851,19 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
             ST_diag_error(&se->diag, e->line, e->col,
                           "unknown type '" ST_sv_fmt "' in struct literal",
                           ST_sv_args(e->struct_lit.type_name));
-        else if (sym->kind != ST_SYM_TYPE || sym->decl->kind != ST_DE_STRUCT) {
+        else if (sym->kind != ST_SYM_TYPE ||
+                 (sym->decl->kind != ST_DE_STRUCT && sym->decl->kind != ST_DE_TAG_UNION)) {
             ST_diag_error(&se->diag, e->line, e->col, "'" ST_sv_fmt "' is not a struct type",
                           ST_sv_args(e->struct_lit.type_name));
             ST_diag_note(&se->diag, sym->line, sym->col, "'" ST_sv_fmt "' is declared here",
                          ST_sv_args(e->struct_lit.type_name));
-        } else
+        } else if (sym->decl->kind == ST_DE_TAG_UNION)
+            return ST_type_union_lit(se, e, ST_ty_for_decls(&se->tys, sym->decl));
+        else
             t = ST_ty_for_decls(&se->tys, sym->decl);
+    } else if (expect && expect->kind == ST_TY_TAG_UNION) {
+        // Unnamed literal against a declared tag_union type: 'f : Foo = { x, 33 };'.
+        return ST_type_union_lit(se, e, expect);
     } else if (expect && expect->kind == ST_TY_STRUCT && expect->decl &&
                expect->decl->struct_.generics.count) {
         // Unnamed literal against a declared generic type: 'x : Foo = { .. }'.
@@ -1899,7 +2072,12 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
     ST_ty_t *dt = NULL;
     if (s->decl.te && !infer_count)
         dt = ST_resolve_tyexpr(se, s->decl.te);
-
+    // A generic struct referenced bare (no '(args)') is still an
+    // uninstantiated template skeleton at this point -- completing it here
+    // would try to lay out its still-generic '$T'/'$U' fields and fail.
+    // When the initializer is an unnamed struct literal, 'ST_type_struct_lit'
+    // below infers the generic args from the literal's values instead; only
+    // complete eagerly once we're not relying on that inference.
     b8 dt_is_generic_struct = dt && dt->kind == ST_TY_STRUCT && dt->decl &&
                               dt->decl->struct_.generics.count > 0;
     b8 infers_from_lit = dt_is_generic_struct && s->decl.init &&
@@ -1949,9 +2127,35 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
     if (t && t->kind == ST_TY_VOID)
         ST_diag_error(&se->diag, s->line, s->col, "cannot declare '" ST_sv_fmt "' of type 'void'",
                       ST_sv_args(s->decl.name));
-    ST_declare_local(se, s->decl.name, t, s->line, s->col);
+
+    // '&N' where 'N' is a '::' constant points at read-only backing storage
+    // (see ST_expr_is_addressable). Binding that address into a mutable
+    // (':=') local hands out a writable-looking pointer to storage that's
+    // conceptually immutable, so require the local itself to be const too.
+    if (s->decl.init && s->decl.init->kind == ST_EX_UNARY &&
+        ST_string_eq_cstr(s->decl.init->unary.op, "&") &&
+        s->decl.init->unary.operand->kind == ST_EX_IDENT && !s->decl.is_const) {
+        ST_sym_t *csym = ST_sym_find(se, s->decl.init->unary.operand->name);
+        if (csym && csym->kind == ST_SYM_CONST) {
+            ST_diag_error(&se->diag, s->line, s->col,
+                          "cannot take the address of constant '" ST_sv_fmt
+                          "' into mutable '" ST_sv_fmt "'; declare '" ST_sv_fmt
+                          "' as a constant instead ('" ST_sv_fmt "' :: &" ST_sv_fmt ")",
+                          ST_sv_args(csym->name), ST_sv_args(s->decl.name),
+                          ST_sv_args(s->decl.name), ST_sv_args(s->decl.name),
+                          ST_sv_args(csym->name));
+            ST_diag_note(&se->diag, csym->line, csym->col, "'" ST_sv_fmt "' is declared here",
+                         ST_sv_args(csym->name));
+        }
+    }
+
+    ST_declare_local_ex(se, s->decl.name, t, s->line, s->col, s->decl.is_const);
 }
 
+// Walks down field/index chains to the identifier at the root of an lvalue,
+// e.g. 'a.b[i].c' -> 'a'. Stops (returns NULL) at anything else, including a
+// dereference, since '*p = x' writes through a pointer, not to a named
+// variable, so it's never blocked by a global's own const-ness.
 static ST_expr_t *ST_lvalue_root_ident(ST_expr_t *e) {
     for (;;) {
         if (e->kind == ST_EX_IDENT)
@@ -1978,7 +2182,7 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
         ST_expr_t *root = ST_lvalue_root_ident(lhs);
         if (root) {
             ST_sym_t *sym = ST_sym_find(se, root->name);
-            if (sym && sym->kind == ST_SYM_CONST) {
+            if (sym && (sym->kind == ST_SYM_CONST || (sym->kind == ST_SYM_VAR && sym->is_const))) {
                 ST_diag_error(&se->diag, s->line, s->col,
                               "cannot assign to '" ST_sv_fmt "': it is a constant ('::')",
                               ST_sv_args(root->name));
@@ -2000,6 +2204,26 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
                       "'" ST_sv_fmt "' of a string is read-only; "
                       "reassign the whole string instead",
                       ST_sv_args(lhs->field.name));
+        return;
+    }
+    // Writing a variant's payload field is allowed -- symmetric with reads,
+    // which are already documented as an unchecked reinterpret of the
+    // payload region (same spirit as a C union). This does NOT touch the
+    // tag, so it's only meaningful when that variant is already active;
+    // it's on the caller to keep that in sync, exactly like a C union.
+    // '.kind' itself stays protected: that's the tag, and changing it
+    // without also changing the payload is how the two get out of sync, so
+    // it can only be set by constructing a new value.
+    if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty &&
+        lhs->field.base->ty->kind == ST_TY_TAG_UNION &&
+        ST_string_eq_cstr(lhs->field.name, "kind")) {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "cannot assign to '.kind' directly; construct a new '" ST_sv_fmt
+                      "' value instead, e.g. '" ST_sv_fmt "{ SomeVariant, .. }' "
+                      "-- this keeps the active variant and its payload from getting out "
+                      "of sync",
+                      ST_sv_args(ST_decl_display_name(lhs->field.base->ty->decl)),
+                      ST_sv_args(ST_decl_display_name(lhs->field.base->ty->decl)));
         return;
     }
     ST_string_t op = s->assign.op;
@@ -2128,6 +2352,45 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         case ST_ST_SWITCH: {
             ST_ty_t *ct = ST_type_expr(se, s->switch_.cond);
+            if (ct && ct->kind == ST_TY_TAG_UNION) {
+                ST_complete_ty(se, ct);
+                ST_forrange(0, s->switch_.cases.count) {
+                    ST_case_t *c = &s->switch_.cases.items[i];
+                    if (c->values.count == 0) {
+                        // 'default:' / 'case:' - matches whatever no other
+                        // case did; nothing to validate.
+                        ST_check_body(se, &c->body);
+                        continue;
+                    }
+                    if (c->values.count != 1 || c->values.items[0]->kind != ST_EX_IDENT) {
+                        ST_diag_error(&se->diag, c->line, c->col,
+                                      "expected a single variant name here, e.g. 'case "
+                                      "SomeVariant:'");
+                        ST_check_body(se, &c->body);
+                        continue;
+                    }
+                    ST_string_t vname = c->values.items[0]->name;
+                    b8 found = 0;
+                    ST_forrange(0, ct->decl->tag_union.variants.count)
+                        if (ST_string_eq(ct->decl->tag_union.variants.items[i].name, vname)) {
+                            found = 1;
+                            break;
+                        }
+                    if (!found) {
+                        ST_diag_error(&se->diag, c->values.items[0]->line,
+                                      c->values.items[0]->col,
+                                      "'" ST_sv_fmt "' has no variant '" ST_sv_fmt "'",
+                                      ST_sv_args(ST_decl_display_name(ct->decl)),
+                                      ST_sv_args(vname));
+                        ST_diag_note(&se->diag, ct->decl->line, ct->decl->col,
+                                     "'" ST_sv_fmt "' is declared here",
+                                     ST_sv_args(ST_decl_display_name(ct->decl)));
+                    }
+                    c->values.items[0]->ty = se->tys.prim[ST_ti64]; // stamp: it's a tag ordinal, not a real value
+                    ST_check_body(se, &c->body);
+                }
+                break;
+            }
             ST_forrange(0, s->switch_.cases.count) {
                 ST_case_t *c = &s->switch_.cases.items[i];
                 for (u32 k = 0; k < c->values.count; k++) {
@@ -2353,7 +2616,11 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
                 }
                 continue;
             }
-
+            // Multiple files (e.g. several imported modules) independently
+            // declaring the same 'extern fn'/'extern var' is normal -- it's
+            // just re-announcing the same real external symbol, not a
+            // conflicting definition. Keep the first and skip re-inserting,
+            // as long as the shapes actually match.
             if (prev->decl && prev->decl->kind == d->kind &&
                 (d->kind == ST_DE_EXTERN_FN || d->kind == ST_DE_EXTERN_VAR)) {
                 b8 same_shape = 1;
@@ -2423,6 +2690,12 @@ static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig) {
     sym->t = t;
 }
 
+// Assigns a constant integer value to every variant of an 'enum'/'enum_flag'
+// declaration. Regular enums start at 0 and increment by 1, with any variant
+// free to override its value with '= expr'. 'enum_flag' enums are bit flags:
+// only the first variant may specify a value ('= expr', defaulting to 1 if
+// omitted); every following variant is that base value shifted left by its
+// index (1, 2, 4, 8, ...) and may NOT specify its own value.
 static void ST_sema_enum_values(ST_sema_t *se, ST_decl_t *d) {
     ST_variant_specs_t *vs = &d->enum_.variants;
     if (d->enum_.is_flag) {
