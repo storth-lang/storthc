@@ -7,6 +7,7 @@
 
 #include "../utils/st_string.h"
 #include "st_lexer.h"
+#include "st_load.h"
 #include "st_parser.h"
 
 // ---------------------------------------------------------------------
@@ -147,6 +148,50 @@ static ST_string_t ST_mangle(ST_arena_t *a, ST_string_t prefix, ST_string_t name
     return (ST_string_t){.data = buf, .len = total};
 }
 
+// Sentinel value for an auto-exposed name that turned out ambiguous (two or
+// more imported modules export the same bare name). It stays present in the
+// map -- rather than being removed -- specifically so the lookup in
+// ST_modrw_expr can tell "not exposed by anything" apart from "exposed by
+// more than one thing, must be qualified", without a second table.
+#define ST_MOD_AMBIGUOUS ((ST_string_t *)1)
+
+// Merges one freshly-resolved import's public exports into the importing
+// file's shared 'auto_exposed' map, so a name unique across all of that
+// file's imports can be used bare (no 'alias.' prefix needed), while a name
+// exported by more than one import falls back to requiring qualification
+// rather than silently picking whichever import happened to be processed
+// first.
+static void ST_mod_merge_exports(ST_arena_t *arena, ST_ht_t *auto_exposed,
+                                 ST_module_entry_t *dep) {
+    ST_forrange(0, dep->exports.capacity) {
+        ST_ht_generic_t *k = dep->exports.slots[i].key;
+        if (!k || k == (ST_ht_generic_t *)1)
+            continue; // empty slot or tombstone
+        ST_string_t bare = {.data = k->tag, .len = k->size};
+        ST_string_t *mangled = (ST_string_t *)dep->exports.slots[i].value->tag;
+
+        ST_ht_generic_t existing = ST_ht_get(auto_exposed, ST_mod_key(bare));
+        if (existing.tag == (void *)ST_MOD_AMBIGUOUS)
+            continue; // already known-ambiguous, stays that way
+        if (existing.tag && existing.tag != (void *)mangled) {
+            // Second (or later) module exporting this same bare name --
+            // mark ambiguous instead of overwriting with whichever export
+            // happens to be seen now.
+            ST_ht_generic_t *hk = ST_arena_push(arena, sizeof(*hk));
+            hk->tag = bare.data;
+            hk->size = bare.len;
+            ST_ht_set(auto_exposed, hk, (ST_ht_generic_t){.tag = ST_MOD_AMBIGUOUS, .size = 0});
+            continue;
+        }
+        if (existing.tag)
+            continue; // same module re-seen (e.g. diamond import), no-op
+        ST_ht_generic_t *hk = ST_arena_push(arena, sizeof(*hk));
+        hk->tag = bare.data;
+        hk->size = bare.len;
+        ST_ht_set(auto_exposed, hk, (ST_ht_generic_t){.tag = mangled, .size = 0});
+    }
+}
+
 // ---------------------------------------------------------------------
 // Rewrite pass: applies a module's self-renames (bare top-level name ->
 // mangled name) and cross-module rewrites ('alias.member' -> mangled
@@ -158,6 +203,7 @@ typedef struct {
     ST_module_ctx_t *ctx;
     ST_ht_t *self_renames;   // bare name -> ST_string_t* (this file's own decls)
     ST_ht_t *import_aliases; // alias -> ST_module_entry_t*
+    ST_ht_t *auto_exposed;   // bare name -> ST_string_t* mangled, or ST_MOD_AMBIGUOUS
 } ST_module_rw_t;
 
 static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e);
@@ -197,8 +243,15 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
 
         case ST_EX_IDENT: {
             ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(e->name));
-            if (r.tag)
+            if (r.tag) {
                 e->name = *(ST_string_t *)r.tag;
+                break;
+            }
+            if (rw->auto_exposed) {
+                ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(e->name));
+                if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                    e->name = *(ST_string_t *)a.tag;
+            }
             break;
         }
 
@@ -406,16 +459,32 @@ static void ST_modrw_decl(ST_module_rw_t *rw, ST_decl_t *d) {
 
 static b8 ST_module_load_file(ST_module_ctx_t *ctx, ST_string_t path, ST_program_t *out) {
     ctx->diag->file = path;
+
+    // ST_load_file both reads 'path' and recursively expands any '#load
+    // "sibling.st";' directives reachable from it into one flat token
+    // stream, the same way the root file is loaded -- calling ST_lex
+    // directly here (as this used to) skips that expansion entirely, so a
+    // module.st using '#load' would have the raw '#load' token reach the
+    // parser unexpanded and get rejected as an unsupported directive.
+    ST_tokens_t toks;
+    if (!ST_load_file(ctx->arena, path, ctx->srcs, &toks)) {
+        ST_diag_error(ctx->diag, 0, 0, "could not load module file '" ST_sv_fmt "'",
+                      ST_sv_args(path));
+        return 0;
+    }
+
+    // ST_load_file doesn't hand back 'path's own source text (only the
+    // expanded tokens, registering every file it touched into ctx->srcs
+    // along the way) -- read it separately here just for diag/parse
+    // bookkeeping; per-token diagnostics resolve their own source via each
+    // token's own .file against ctx->srcs regardless of what's passed here.
     ST_string_t src;
     if (!ST_read_entire_file(ctx->arena, &src, ST_mod_cstr(ctx->arena, path))) {
         ST_diag_error(ctx->diag, 0, 0, "could not read module file '" ST_sv_fmt "'",
                       ST_sv_args(path));
         return 0;
     }
-    ST_srcmap_put(ctx->srcs, path, src);
-    ST_tokens_t toks = ST_lex(ctx->arena, src, path);
-    if (!toks.ok)
-        return 0;
+
     u32 save_n = ctx->diag->n_errors;
     ctx->diag->src = src;
     ctx->diag->file = path;
@@ -473,6 +542,8 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
     ST_ht_init(ctx->arena, &self_renames, 16);
     ST_ht_t import_aliases;
     ST_ht_init(ctx->arena, &import_aliases, 8);
+    ST_ht_t auto_exposed;
+    ST_ht_init(ctx->arena, &auto_exposed, 16);
 
     b8 ok = 1;
     ST_forrange(0, prog.decls.count) {
@@ -503,6 +574,7 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
             hk->tag = d->import_.alias.data;
             hk->size = d->import_.alias.len;
             ST_ht_set(&import_aliases, hk, (ST_ht_generic_t){.tag = dep, .size = 0});
+            ST_mod_merge_exports(ctx->arena, &auto_exposed, dep);
             continue;
         }
         if (!is_root) {
@@ -522,7 +594,7 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
 
     // Pass 2: rewrite every decl's internals (self-renames + alias.member),
     // then rename the decl itself and append it to the merged program.
-    ST_module_rw_t rw = {.ctx = ctx, .self_renames = &self_renames, .import_aliases = &import_aliases};
+    ST_module_rw_t rw = {.ctx = ctx, .self_renames = &self_renames, .import_aliases = &import_aliases, .auto_exposed = &auto_exposed};
     ctx->diag->src = ST_srcmap_get(ctx->srcs, path);
     ctx->diag->file = path;
     ST_forrange(0, prog.decls.count) {
@@ -563,9 +635,10 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
     // self-renaming), reusing 'root_prog->decls' as the source and building
     // a fresh merged list that replaces it.
     ST_decls_t merged = {0};
-    ST_ht_t self_renames, import_aliases;
+    ST_ht_t self_renames, import_aliases, auto_exposed;
     ST_ht_init(arena, &self_renames, 1);
     ST_ht_init(arena, &import_aliases, 8);
+    ST_ht_init(arena, &auto_exposed, 16);
 
     b8 ok = 1;
     ST_forrange(0, root_prog->decls.count) {
@@ -594,9 +667,10 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
         hk->tag = d->import_.alias.data;
         hk->size = d->import_.alias.len;
         ST_ht_set(&import_aliases, hk, (ST_ht_generic_t){.tag = dep, .size = 0});
+        ST_mod_merge_exports(arena, &auto_exposed, dep);
     }
 
-    ST_module_rw_t rw = {.ctx = &ctx, .self_renames = &self_renames, .import_aliases = &import_aliases};
+    ST_module_rw_t rw = {.ctx = &ctx, .self_renames = &self_renames, .import_aliases = &import_aliases, .auto_exposed = &auto_exposed};
     diag->src = ST_srcmap_get(srcs, root_file);
     diag->file = root_file;
     ST_forrange(0, root_prog->decls.count) {

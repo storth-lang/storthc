@@ -4,6 +4,8 @@ void ST_ir_module_init(ST_arena_t *arena, ST_string_t name, ST_ir_module_t *out)
     out->arena = arena;
     out->name = name;
     out->fns = (ST_ir_fns_t){0};
+    out->strs = (ST_ir_strs_t){0};
+    out->globals = (ST_ir_global_vars_t){0};
 }
 
 ST_ir_fn_t *ST_ir_fn_new(ST_ir_module_t *m, ST_string_t name, ST_ty_t *fn_ty) {
@@ -362,7 +364,11 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_
 ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, u32 line, u32 col) {
     ST_assert(fn->entry != NULL);
     ST_ir_inst_t *inst = ST_ir_emit(fn->entry, ST_IR_ALLOCA, ST_ty_ptr(ctx, p), line, col);
-    inst->alloca_.size = p->size;
+    u32 size = p->size;
+    if ((p->kind == ST_TY_STRUCT || p->kind == ST_TY_ARRAY || p->kind == ST_TY_TAG_UNION) &&
+        size > 8)
+        size = (size + 7u) & ~7u;
+    inst->alloca_.size = size;
     inst->alloca_.align = p->align;
     return inst;
 }
@@ -404,10 +410,11 @@ ST_ir_inst_t *ST_ir_global_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_string_t n
 }
 
 ST_ir_inst_t *ST_ir_inline_asm(ST_ir_block_t *b, ST_string_t tmpl, ST_ir_inst_t **refs, u32 n_refs,
-                               u32 line, u32 col) {
-    // @note: no result value, so ty is NULL; the backend's generic
-    // "spill result to my slot" tail skips instructions with ty == NULL.
-    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_INLINE_ASM, NULL, line, col);
+                               ST_ty_t *ty, u32 line, u32 col) {
+    // @note: ty is NULL for the statement form (no result value); the
+    // backend's generic "spill result to my slot" tail skips instructions
+    // whose ty is NULL/void. Non-NULL 'ty' (expression form) makes it fire.
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_INLINE_ASM, ty, line, col);
     inst->inline_asm.tmpl = tmpl;
     ST_forrange(0, n_refs) {
         ST_da_append_arena(b->fn->arena, &inst->inline_asm.refs, refs[i]);

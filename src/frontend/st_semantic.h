@@ -53,6 +53,14 @@ typedef struct {
 
     b8 stamp_tyexprs;
     u32 n_fn_instances;
+
+    b8 has_pack;
+    ST_string_t cur_pack_name;
+    u32 cur_pack_count;
+
+    b8 has_bound_str;
+    ST_string_t cur_bound_str_param;
+    ST_string_t cur_bound_str_value;
 } ST_sema_t;
 
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string_t file,

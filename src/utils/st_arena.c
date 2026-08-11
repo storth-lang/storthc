@@ -42,6 +42,8 @@ void ST_arena_free(ST_arena_t *arena) {
 
 void *ST_arena_push(ST_arena_t *arena, u64 size) {
     ST_assert(arena != NULL);
+    if (size == 0)
+        return arena->cur->data + arena->cur->pos; // no-op: don't touch chunk->pos at all
     ST_arena_chunk_t *chunk = arena->cur;
     u64 pos = ST_allign_mem(chunk->pos, size);
     if (pos + size > chunk->cap) {

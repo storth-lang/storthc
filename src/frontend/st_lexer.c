@@ -433,7 +433,7 @@ static b8 ST_lx_number(ST_lexer_t *l, ST_token_t *t) {
         if (is_float)
             t->val.f = strtod(buf, NULL);
         else
-            t->val.i = (i64)strtoll(buf, NULL, 10);
+            t->val.i = (i64)strtoull(buf, NULL, 10);
     }
 
     if (ST_isalpha(ST_lx_peek_char(l))) {

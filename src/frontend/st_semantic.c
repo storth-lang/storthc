@@ -1,5 +1,7 @@
 #include "st_semantic.h"
 #include "st_lexer.h"
+#include "comptime/st_comptime.h"
+#include "comptime/st_comptime_compile.h"
 
 static const char *ST_builtin_fns[] = {"typeof"};
 static ST_tys_t ST_builtin_rets;
@@ -147,8 +149,7 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
         return 1;
     if (to->kind == ST_TY_ANY)
         return 1;
-    if (from->kind == ST_TY_UNTYPED_INT &&
-        (to->kind == ST_TY_INT || to->kind == ST_TY_FLOAT || to->kind == ST_TY_UNTYPED_FLOAT))
+    if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_INT)
         return 1;
     if (from->kind == ST_TY_UNTYPED_FLOAT && to->kind == ST_TY_FLOAT)
         return 1;
@@ -184,6 +185,7 @@ static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
+static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out);
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
@@ -339,6 +341,10 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
         case ST_EX_CSTR:
+        case ST_EX_FIELDS:
+        case ST_EX_COMP_ERROR:
+        case ST_EX_ASM:
+        case ST_EX_STR_FROM_RAW:
             return 0;
         case ST_EX_COUNT:
             ST_assert(0);
@@ -636,6 +642,12 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
     case ST_EX_BOOL:
     case ST_EX_NULL:
     case ST_EX_IDENT:
+    case ST_EX_ASM:
+        break;
+
+    case ST_EX_STR_FROM_RAW:
+        n->str_from_raw.ptr = ST_clone_expr(a, e->str_from_raw.ptr);
+        n->str_from_raw.len = ST_clone_expr(a, e->str_from_raw.len);
         break;
 
     case ST_EX_UNARY:
@@ -693,8 +705,14 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
     case ST_EX_TYPEINFO:
     case ST_EX_KIND:
     case ST_EX_CSTR:
+    case ST_EX_FIELDS:
         n->tyop.te = ST_clone_tyexpr(a, e->tyop.te);
         n->tyop.operand = ST_clone_expr(a, e->tyop.operand);
+        break;
+    case ST_EX_COMP_ERROR:
+        n->comp_error.args = (ST_exprs_t){0};
+        ST_forrange(0, e->comp_error.args.count)
+            ST_da_append_arena(a, &n->comp_error.args, ST_clone_expr(a, e->comp_error.args.items[i]));
         break;
     case ST_EX_COUNT:
         ST_assert(0);
@@ -933,11 +951,77 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
     return 1;
 }
 
-static ST_sym_t *ST_instantiate_fn(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bindings,
-                                   u32 line, u32 col) {
+// Builds a clone of 'elem_te' (the pack param's declared element type, e.g.
+// '$T') with its generic-param name suffixed '#k'. This is the one place
+// that decides a pack element's *type* binding key; both the call-site
+// unify loop (in ST_type_call) and ST_instantiate_fn_ex's param expansion
+// call this, and MUST stay in lockstep -- if they ever compute different
+// strings, a bound type silently fails to be found and you get a bogus
+// "could not infer generic parameter" error pointing at the wrong thing.
+static ST_tyexpr_t *ST_pack_elem_te(ST_sema_t *se, ST_tyexpr_t *elem_te, u32 k) {
+    if (elem_te->kind != ST_TE_NAME || !elem_te->is_generic_param)
+        return NULL; // nested pack element types ('*$T...') aren't wired up yet
+    ST_tyexpr_t *indexed = ST_tyexpr_new(se->arena, elem_te->kind, elem_te->line, elem_te->col);
+    *indexed = *elem_te;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), ST_sv_fmt "#%u", ST_sv_args(elem_te->name), k);
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    indexed->name = (ST_string_t){.data = nb, .len = (u32)n};
+    return indexed;
+}
+
+// Same idea, but for the synthetic *parameter's* name (a different
+// namespace from the type-binding key above -- 'args: $T...' has param
+// name 'args' and generic name 'T', which need not match). 'args#0' etc.
+// is also the name a future 'args[0]' indexed-access sugar would need to
+// resolve to deterministically, without a side table -- see the note on
+// ST_type_index in the design writeup.
+static ST_string_t ST_pack_param_name(ST_sema_t *se, ST_string_t base, u32 k) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), ST_sv_fmt "#%u", ST_sv_args(base), k);
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    return (ST_string_t){.data = nb, .len = (u32)n};
+}
+
+static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bindings,
+                                      b8 has_pack, u32 n_pack_args, b8 has_bound_str,
+                                      ST_string_t bound_str_param, ST_string_t bound_str_value,
+                                      u32 line, u32 col) {
+    i32 pack_idx = has_pack ? (i32)tmpl->fn.sig.params.count - 1 : -1;
+    ST_tyexpr_t *pack_elem_te = pack_idx >= 0 ? tmpl->fn.sig.params.items[pack_idx].te : NULL;
+
     ST_tys_t args = {0};
     ST_forrange(0, tmpl->fn.sig.generics.count) {
         ST_string_t g = tmpl->fn.sig.generics.items[i];
+        // If 'g' is the pack's own generic name, it was never bound under
+        // its bare name (the call-site loop binds "T#0", "T#1", ... --
+        // see ST_pack_elem_te) -- walk all n_pack_args indexed keys
+        // instead. Each bound type gets appended to 'args', so the mangled
+        // name naturally differs both by pack element types *and* by pack
+        // length (more elements -> more appended types -> different
+        // mangled string), with no separate length-encoding needed.
+        b8 is_pack_generic = pack_elem_te && pack_elem_te->kind == ST_TE_NAME &&
+                             pack_elem_te->is_generic_param &&
+                             ST_string_eq(pack_elem_te->name, g);
+        if (is_pack_generic) {
+            for (u32 j = 0; j < n_pack_args; j++) {
+                char buf[64];
+                int n = snprintf(buf, sizeof(buf), ST_sv_fmt "#%u", ST_sv_args(g), j);
+                ST_ht_generic_t k = {.tag = buf, .size = (u32)n};
+                ST_ty_t *bound = (ST_ty_t *)ST_ht_get(bindings, k).tag;
+                if (!bound) {
+                    ST_diag_error(&se->diag, line, col,
+                                  "could not infer pack element %u of '$" ST_sv_fmt
+                                  "...' for call to '" ST_sv_fmt "'",
+                                  j, ST_sv_args(g), ST_sv_args(tmpl->name));
+                    return NULL;
+                }
+                ST_da_append_arena(se->arena, &args, bound);
+            }
+            continue;
+        }
         ST_ht_generic_t k = { .tag = g.data, .size = g.len };
         ST_ty_t *bound = (ST_ty_t *)ST_ht_get(bindings, k).tag;
         if (!bound) {
@@ -953,6 +1037,29 @@ static ST_sym_t *ST_instantiate_fn(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bind
     }
 
     ST_string_t mangled = ST_ty_mangle_instance_name(se->arena, tmpl->name, &args);
+    if (has_pack && args.count == 0) {
+        char buf[600];
+        int n = snprintf(buf, sizeof(buf), ST_sv_fmt "$0pack", ST_sv_args(mangled));
+        u8 *nb = ST_arena_push(se->arena, (u32)n);
+        memcpy(nb, buf, (u32)n);
+        mangled = (ST_string_t){.data = nb, .len = (u32)n};
+    }
+    if (has_bound_str) {
+        // Fold the bound value's content into the mangled name via a plain
+        // hash (not the raw text) so the mangled name stays identifier-safe
+        // regardless of what characters the string contains.
+        u64 h = 1469598103934665603ULL;
+        ST_forrange(0, bound_str_value.len) {
+            h ^= (u64)bound_str_value.data[i];
+            h *= 1099511628211ULL;
+        }
+        char buf[700];
+        int n = snprintf(buf, sizeof(buf), ST_sv_fmt "$s%llx", ST_sv_args(mangled),
+                         (unsigned long long)h);
+        u8 *nb = ST_arena_push(se->arena, (u32)n);
+        memcpy(nb, buf, (u32)n);
+        mangled = (ST_string_t){.data = nb, .len = (u32)n};
+    }
     ST_ht_generic_t key = { .tag = mangled.data, .size = mangled.len };
     ST_sym_t *existing = ST_ht_get(&se->fn_instantiations, key).tag;
     if (existing)
@@ -970,8 +1077,33 @@ static ST_sym_t *ST_instantiate_fn(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bind
     inst->name = mangled;
     inst->is_pub = tmpl->is_pub;
     inst->fn.sig = ST_clone_fn_sig(se->arena, &tmpl->fn.sig);
+    inst->fn.sig.generics = (ST_strings_t){0}; // fully resolved now -- see ST_lower_program's
+                                                // 'sig.generics.count -> skip, still a template'
+                                                // check; leaving the cloned list in place meant
+                                                // every instantiation was silently never lowered
     inst->fn.is_prototype = tmpl->fn.is_prototype;
     inst->fn.body = ST_clone_body(se->arena, &tmpl->fn.body);
+    inst->fn.has_bound_str = has_bound_str;
+    inst->fn.bound_str_param = bound_str_param;
+    inst->fn.bound_str_value = bound_str_value;
+
+    if (pack_idx >= 0) {
+        // Replace the template's single pack slot with 'n_pack_args' real
+        // params, each independently typed.
+        ST_param_t pack_param = inst->fn.sig.params.items[pack_idx];
+        inst->fn.sig.params.count = (u32)pack_idx; // drop the pack slot itself
+        for (u32 j = 0; j < n_pack_args; j++) {
+            ST_param_t p = {0};
+            p.name = ST_pack_param_name(se, pack_param.name, j);
+            p.line = pack_param.line;
+            p.col = pack_param.col;
+            p.te = ST_pack_elem_te(se, pack_param.te, j);
+            ST_da_append_arena(se->arena, &inst->fn.sig.params, p);
+        }
+        inst->fn.had_pack = 1;
+        inst->fn.pack_name = pack_param.name;
+        inst->fn.pack_count = n_pack_args;
+    }
 
     ST_ht_t *pb = ST_arena_push_zeroed(se->arena, sizeof(*pb));
     *pb = *bindings;
@@ -1399,7 +1531,17 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         ST_ht_t bindings;
         ST_ht_init(se->arena, &bindings, 8);
         ST_fn_sig_t *tsig = &fn_tmpl->fn.sig;
+
+        // A pack, if the template has one, is always the last param.
+        i32 pack_idx = -1;
+        if (tsig->has_generic_pack)
+            pack_idx = (i32)tsig->params.count - 1;
+
+        b8 has_bound_str = 0;
+        ST_string_t bound_str_param = {0}, bound_str_value = {0};
+
         u32 pos = 0;
+        u32 n_pack_args = 0;
         b8 unify_ok = 1;
         ST_forrange(0, e->call.args.count) {
             ST_arg_t *arg = &e->call.args.items[i];
@@ -1410,18 +1552,68 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                         idx = k;
                         break;
                     }
+                if (pack_idx >= 0 && (i32)idx >= pack_idx) {
+                    ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                                  "cannot pass a named argument into '" ST_sv_fmt "...' -- pack "
+                                  "elements are always positional",
+                                  ST_sv_args(tsig->params.items[pack_idx].name));
+                    unify_ok = 0;
+                    continue;
+                }
             } else
                 idx = pos++;
+
+            if (pack_idx >= 0 && (i32)idx >= pack_idx) {
+                // 'idx' would run off the end of tsig->params (it only has
+                // one slot for the whole pack) -- reroute every positional
+                // arg from here on into its own indexed binding key instead.
+                u32 k = idx - (u32)pack_idx;
+                n_pack_args = k + 1;
+                ST_tyexpr_t *elem_te = tsig->params.items[pack_idx].te;
+                ST_tyexpr_t *indexed = ST_pack_elem_te(se, elem_te, k);
+                if (!indexed) {
+                    ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                                  "only a bare '$T...' pack element type is supported right now "
+                                  "(not '*$T...' or similar)");
+                    unify_ok = 0;
+                    continue;
+                }
+                if (arg->value->ty)
+                    if (!ST_unify_tyexpr(se, indexed, arg->value->ty, &bindings, arg->value->line,
+                                         arg->value->col))
+                        unify_ok = 0;
+                continue;
+            }
 
             if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty)
                 if (!ST_unify_tyexpr(se, tsig->params.items[idx].te, arg->value->ty, &bindings,
                                      arg->value->line, arg->value->col))
                     unify_ok = 0;
+
+            // A plain (non-generic) 'string' param whose call-site argument
+            // happens to be a compile-time-constant string: bind its value
+            // too, not just its type. Only the first such param is tracked.
+            if (!has_bound_str && idx < tsig->params.count && tsig->params.items[idx].te &&
+                !tsig->params.items[idx].te->is_generic_param) {
+                ST_ty_t *pty = ST_resolve_tyexpr(se, tsig->params.items[idx].te);
+                if (pty && pty->kind == ST_TY_STRING) {
+                    ST_ct_val_t val;
+                    if (ST_ct_eval_expr(se, arg->value, &val) && val.kind == ST_CT_STRING) {
+                        has_bound_str = 1;
+                        bound_str_param = tsig->params.items[idx].name;
+                        u8 *buf = ST_arena_push(se->arena, val.str.len);
+                        memcpy(buf, val.str.data, val.str.len);
+                        bound_str_value = (ST_string_t){.data = buf, .len = val.str.len};
+                    }
+                }
+            }
         }
         if (!unify_ok)
             return NULL;
 
-        sym = ST_instantiate_fn(se, fn_tmpl, &bindings, e->line, e->col);
+        sym = ST_instantiate_fn_ex(se, fn_tmpl, &bindings, pack_idx >= 0, n_pack_args,
+                                   has_bound_str, bound_str_param, bound_str_value, e->line,
+                                   e->col);
         if (!sym)
             return NULL;
 
@@ -1483,14 +1675,15 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     u32 min_args = max_p;
     if (sig) {
         min_args = 0;
-        ST_forrange(0, sig->params.count) if (!sig->params.items[i].def) min_args++;
+        ST_forrange(0, sig->params.count)
+            if (!sig->params.items[i].def && !sig->params.items[i].is_pack) min_args++;
     }
 
-    if (n < min_args || (!fnty->is_variadic && n > max_p)) {
+    if (n < min_args || (!fnty->is_variadic && !fnty->has_any_pack && n > max_p)) {
         u32 line = sym ? sym->line : (callee ? callee->line : e->line);
         u32 col = sym ? sym->col : (callee ? callee->col : e->col);
         ST_string_t name = sym ? ST_sym_display_name(sym) : ST_cstr_to_str("function");
-        if (fnty->is_variadic)
+        if (fnty->is_variadic || fnty->has_any_pack)
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' expects at least %u argument%s, got %u",
                           ST_sv_args(name), min_args, min_args == 1 ? "" : "s", n);
@@ -1528,6 +1721,23 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         ST_forrange(max_p, n) {
             ST_arg_t *arg = &e->call.args.items[i];
             ST_arg_extern_decay(se, sym, NULL, arg);
+            if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_INT)
+                arg->value->ty = se->tys.prim[ST_ti32];
+            else if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_FLOAT)
+                arg->value->ty = se->tys.prim[ST_tf32];
+        }
+    }
+    // Args past the pack slot itself (max_p already covers arg #max_p-1,
+    // the first pack element, via the normal positional loop above since
+    // its declared type is 'any' and everything coerces to 'any') --
+    // these just need untyped literals resolved to a concrete size before
+    // they get boxed into an 'any' at the call site. No decay: unlike the
+    // raw C-ABI variadic path, the actual static type has to survive into
+    // codegen so the boxed 'any' carries correct RTTI, not be flattened to
+    // a bare pointer.
+    if (fnty->has_any_pack) {
+        ST_forrange(max_p, n) {
+            ST_arg_t *arg = &e->call.args.items[i];
             if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_INT)
                 arg->value->ty = se->tys.prim[ST_ti32];
             else if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_FLOAT)
@@ -1897,12 +2107,48 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                               ST_sv_args(fi->name));
                 continue;
             }
-            ST_ty_t *vt = ST_type_expr(se, fi->value);
-            if (i >= t->fields.count || !vt)
+            ST_ty_t *vt;
+            if (fi->value->kind == ST_EX_STRUCT_LIT && !fi->value->struct_lit.type_name.len) {
+                vt = ST_type_struct_lit(se, fi->value, ety);
+                fi->value->ty = vt;
+            } else {
+                vt = ST_type_expr(se, fi->value);
+            }
+            if (i >= t->count || !vt)
                 continue;
             if (!ST_ty_coerces(se, vt, ety)) {
-                ST_diag_error(&se->diag, e->line, e->col, "array element expects '%s', got '%s'.",
-                              ST_tstr(se, ety), ST_tstr(se, vt));
+                ST_diag_error(&se->diag, fi->value->line, fi->value->col,
+                              "array element expects '%s', got '%s'.", ST_tstr(se, ety),
+                              ST_tstr(se, vt));
+                if (vt && vt->kind == ST_TY_UNTYPED_INT && ST_ty_is_float(ety))
+                    ST_diag_note(&se->diag, fi->value->line, fi->value->col,
+                                 "whole-number float literals need an explicit '.0', "
+                                 "e.g. '%lld.0'",
+                                 (long long)fi->value->ival);
+            } else if (vt != ety) {
+                // The literal coerces (e.g. an untyped int/float literal
+                // into a narrower/wider or differently-kinded destination
+                // element type) -- retype it to the real destination type
+                // now, rather than leaving its own natural (untyped_int /
+                // untyped_float) type in place. Left alone, ST_default_expr
+                // would default it independently of 'ety' (e.g. untyped_int
+                // -> i32, untyped_float -> f64) and lowering would build the
+                // constant with that mismatched width/register-class,
+                // corrupting whatever a later float/int load reinterprets
+                // those spilled bits as.
+                //
+                // An int literal landing in a float slot needs its VALUE
+                // converted too, not just its type label -- otherwise
+                // lowering still emits an integer constant (ST_EX_INT ->
+                // ST_ir_const_int) now mislabeled with a float type, and the
+                // generic per-instruction spill picks the float path
+                // (movsd from xmm0) for an instruction that only ever wrote
+                // to rax, spilling whatever was last left in xmm0.
+                if (fi->value->kind == ST_EX_INT && ST_ty_is_float(ety)) {
+                    fi->value->kind = ST_EX_FLOAT;
+                    fi->value->fval = (f64)fi->value->ival;
+                }
+                fi->value->ty = ety;
             }
         }
         return t;
@@ -1910,13 +2156,10 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
 
     ST_forrange(0, e->struct_lit.inits.count) {
         ST_field_init_t *fi = &e->struct_lit.inits.items[i];
-        ST_ty_t *vt = ST_type_expr(se, fi->value);
-        if (!t)
-            continue;
 
         ST_ty_t *ft = NULL;
         ST_string_t fname = fi->name;
-        if (fi->name.len) {
+        if (t && fi->name.len) {
             for (u32 k = 0; k < t->fields.count; k++)
                 if (ST_string_eq(t->fields.items[k].name, fi->name)) {
                     ft = t->fields.items[k].ty;
@@ -1929,25 +2172,55 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                 ST_diag_note(&se->diag, t->decl->line, t->decl->col,
                              "'" ST_sv_fmt "' is declared here",
                              ST_sv_args(ST_decl_display_name(t->decl)));
+                ST_type_expr(se, fi->value); // still walk it so e.g. undeclared names get caught
                 continue;
             }
-        } else if (i >= t->fields.count) {
-            ST_diag_error(&se->diag, fi->line, fi->col,
-                          "too many initializers for struct '" ST_sv_fmt "', it has %u field%s",
-                          ST_sv_args(ST_decl_display_name(t->decl)), t->fields.count,
-                          t->fields.count == 1 ? "" : "s");
-            ST_diag_note(&se->diag, t->decl->line, t->decl->col, "'" ST_sv_fmt "' is declared here",
-                         ST_sv_args(ST_decl_display_name(t->decl)));
-            break;
-        } else {
+        } else if (t && !fi->name.len) {
+            if (i >= t->fields.count) {
+                ST_diag_error(&se->diag, fi->line, fi->col,
+                              "too many initializers for struct '" ST_sv_fmt "', it has %u field%s",
+                              ST_sv_args(ST_decl_display_name(t->decl)), t->fields.count,
+                              t->fields.count == 1 ? "" : "s");
+                ST_diag_note(&se->diag, t->decl->line, t->decl->col,
+                             "'" ST_sv_fmt "' is declared here",
+                             ST_sv_args(ST_decl_display_name(t->decl)));
+                break;
+            }
             ft = t->fields.items[i].ty;
             fname = t->fields.items[i].name;
         }
 
-        if (ft && vt && !ST_ty_coerces(se, vt, ft))
-            ST_diag_error(&se->diag, fi->line, fi->col,
+        ST_ty_t *vt;
+        if (fi->value->kind == ST_EX_STRUCT_LIT && !fi->value->struct_lit.type_name.len && ft) {
+            vt = ST_type_struct_lit(se, fi->value, ft);
+            fi->value->ty = vt;
+        } else {
+            vt = ST_type_expr(se, fi->value);
+        }
+        if (!t)
+            continue;
+
+        if (ft && vt && !ST_ty_coerces(se, vt, ft)) {
+            ST_diag_error(&se->diag, fi->value->line, fi->value->col,
                           "field '" ST_sv_fmt "' expects '%s', got '%s'", ST_sv_args(fname),
                           ST_tstr(se, ft), ST_tstr(se, vt));
+            if (vt->kind == ST_TY_UNTYPED_INT && ST_ty_is_float(ft))
+                ST_diag_note(&se->diag, fi->value->line, fi->value->col,
+                             "whole-number float literals need an explicit '.0', e.g. '%lld.0'",
+                             (long long)fi->value->ival);
+        } else if (ft && vt && vt != ft) {
+            // Same reasoning as the array-element branch above: retype a
+            // coercing scalar literal to the field's real declared type so
+            // it doesn't get defaulted (and lowered) at its own natural,
+            // possibly mismatched-width/kind type instead. An int literal
+            // into a float field needs its VALUE converted too -- see the
+            // longer comment in the array-element branch.
+            if (fi->value->kind == ST_EX_INT && ST_ty_is_float(ft)) {
+                fi->value->kind = ST_EX_FLOAT;
+                fi->value->fval = (f64)fi->value->ival;
+            }
+            fi->value->ty = ft;
+        }
     }
     return t;
 }
@@ -2035,12 +2308,70 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             ST_type_expr(se, e->tyop.operand);
             t = se->tys.prim[ST_tu64];
             break;
+        case ST_EX_FIELDS:
+            ST_type_expr(se, e->tyop.operand);
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'fields(...)' is only valid as the target of a comptime '#for'");
+            t = se->tys.prim[ST_tvoid];
+            break;
         case ST_EX_CSTR: {
             ST_ty_t *ot = ST_type_expr(se, e->tyop.operand);
             if (ot && ot->kind != ST_TY_STRING)
                 ST_diag_error(&se->diag, e->line, e->col, "'cstr' needs a 'string', got '%s'",
                               ST_tstr(se, ot));
             t = ST_ty_ptr(&se->tys, se->tys.prim[ST_tchar]);
+            break;
+        }
+        case ST_EX_STR_FROM_RAW: {
+            // 'str_from_raw(ptr, len)' -- the sanctioned way to build a
+            // 'string' from a raw '*char' + length (e.g. a buffer written
+            // by a raw syscall in an '#asm' block). Mirrors 'cstr' but in
+            // reverse; a dedicated intrinsic rather than field assignment
+            // because a string's '.ptr'/'.len' are otherwise read-only --
+            // strings are meant to be treated as immutable value objects,
+            // so this is the one blessed place a new one gets assembled.
+            ST_ty_t *pt = ST_type_expr(se, e->str_from_raw.ptr);
+            ST_ty_t *lt = ST_type_expr(se, e->str_from_raw.len);
+            if (pt && !(pt->kind == ST_TY_PTR && pt->inner && pt->inner->kind == ST_TY_CHAR))
+                ST_diag_error(&se->diag, e->str_from_raw.ptr->line, e->str_from_raw.ptr->col,
+                              "'str_from_raw' needs a '*char' pointer, got '%s'", ST_tstr(se, pt));
+            if (lt && !ST_ty_is_int(lt))
+                ST_diag_error(&se->diag, e->str_from_raw.len->line, e->str_from_raw.len->col,
+                              "'str_from_raw' needs an integer length, got '%s'", ST_tstr(se, lt));
+            t = se->tys.prim[ST_tstring];
+            break;
+        }
+        case ST_EX_ASM:
+            // an '#asm { .. }' block used as an expression yields whatever
+            // ends up in rax (see ST_lower_asm_tokens / ST_IR_INLINE_ASM) --
+            // typed as untyped_int, same as an integer literal, so it
+            // freely coerces to whatever int/float type the context wants
+            // (the return type, an assignment target, etc).
+            t = se->tys.untyped_int;
+            break;
+        case ST_EX_COMP_ERROR: {
+            ST_ct_chunk_t chunk;
+            ST_ct_chunk_init(se->arena, &chunk);
+            ST_ct_compiler_t cc;
+            ST_ct_compiler_init(&cc, se->arena, &chunk);
+            ST_ct_compile_expr_return(&cc, e);
+            if (cc.failed) {
+                ST_diag_error(&se->diag, cc.err_line, cc.err_col, "%s", cc.err_msg);
+            } else {
+                ST_ct_vm_t vm;
+                ST_ct_vm_init(&vm);
+                ST_ct_val_t out;
+                ST_ct_status_t st = ST_ct_run(&vm, &chunk, &out);
+                if (st == ST_CT_ERR_COMPTIME)
+                    ST_diag_error(&se->diag, vm.err_line, e->col, "%s", vm.err_msg);
+                else if (st == ST_CT_ERR_RUNTIME)
+                    ST_diag_error(&se->diag, e->line, e->col, "internal: comptime VM error: %s",
+                                  vm.err_msg);
+                // ST_CT_OK shouldn't happen -- ST_OP_COMP_ERROR always
+                // ends the run with ST_CT_ERR_COMPTIME -- but isn't itself
+                // an error worth reporting if it somehow does.
+            }
+            t = se->tys.prim[ST_tvoid];
             break;
         }
         case ST_EX_COUNT:
@@ -2052,6 +2383,8 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
 }
 
 static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s);
+static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s);
+static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s);
 
 static void ST_check_body(ST_sema_t *se, ST_stmts_t *body) {
     ST_scope_push(se);
@@ -2113,11 +2446,16 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
             it = ST_type_expr(se, s->decl.init);
     }
 
-    if (dt && it && !ST_ty_coerces(se, it, dt))
+    if (dt && it && !ST_ty_coerces(se, it, dt)) {
         ST_diag_error(&se->diag, s->line, s->col,
                       "cannot initialize '" ST_sv_fmt "' of type '%s' "
                       "with a value of type '%s'",
                       ST_sv_args(s->decl.name), ST_tstr(se, dt), ST_tstr(se, it));
+        if (it->kind == ST_TY_UNTYPED_INT && ST_ty_is_float(dt) && s->decl.init)
+            ST_diag_note(&se->diag, s->decl.init->line, s->decl.init->col,
+                         "whole-number float literals need an explicit '.0', e.g. '%lld.0'",
+                         (long long)s->decl.init->ival);
+    }
 
     if (!dt && !s->decl.init)
         ST_diag_error(&se->diag, s->line, s->col, "'" ST_sv_fmt "' needs a type or an initializer",
@@ -2315,15 +2653,462 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
                           want, want == 1 ? "" : "s", got);
     }
     ST_forrange(0, got) {
-        ST_ty_t *t = ST_type_expr(se, s->ret.values.items[i]);
+        ST_expr_t *rv = s->ret.values.items[i];
+        ST_ty_t *rt = (i < want && se->cur_rets) ? se->cur_rets->items[i] : NULL;
+        ST_ty_t *t;
+        // unnamed struct/array literal takes the declared return type, same
+        // as an unnamed literal against an annotated 'x : T = { .. }' decl.
+        if (rv->kind == ST_EX_STRUCT_LIT && !rv->struct_lit.type_name.len && rt) {
+            t = ST_type_struct_lit(se, rv, rt);
+            rv->ty = t;
+        } else
+            t = ST_type_expr(se, rv);
         if (i >= want || !se->cur_rets)
             continue;
-        ST_ty_t *rt = se->cur_rets->items[i];
         if (t && rt && !ST_ty_coerces(se, t, rt))
             ST_diag_error(&se->diag, s->ret.values.items[i]->line, s->ret.values.items[i]->col,
                           "return value %u expects '%s', got '%s'", i + 1, ST_tstr(se, rt),
                           ST_tstr(se, t));
     }
+}
+
+// Runs 'e' through the comptime compiler+VM and returns its value. On
+// failure (uncompilable expression, or a runtime VM error -- both compiler
+// bugs or genuinely invalid comptime code, not user-facing #comp_errors)
+// reports a diagnostic and returns nil; the caller should treat that as "no
+// branch matched, stop here" rather than press on with a bogus mutation.
+static void ST_stamp_kind_operands(ST_sema_t *se, ST_expr_t *e) {
+    if (!e)
+        return;
+    switch (e->kind) {
+        case ST_EX_KIND:
+        case ST_EX_FIELDS:
+            ST_type_expr(se, e->tyop.operand);
+            return;
+        case ST_EX_UNARY:
+            ST_stamp_kind_operands(se, e->unary.operand);
+            return;
+        case ST_EX_BINARY:
+            ST_stamp_kind_operands(se, e->bin.l);
+            ST_stamp_kind_operands(se, e->bin.r);
+            return;
+        case ST_EX_FIELD:
+            ST_stamp_kind_operands(se, e->field.base);
+            return;
+        case ST_EX_INDEX:
+            ST_stamp_kind_operands(se, e->index.base);
+            ST_stamp_kind_operands(se, e->index.index);
+            return;
+        case ST_EX_COMP_ERROR:
+            ST_forrange(0, e->comp_error.args.count)
+                ST_stamp_kind_operands(se, e->comp_error.args.items[i]);
+            return;
+        default:
+            return; // literals, idents, etc: nothing to stamp
+    }
+}
+
+static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out) {
+    ST_stamp_kind_operands(se, e);
+    ST_ct_chunk_t chunk;
+    ST_ct_chunk_init(se->arena, &chunk);
+    ST_ct_compiler_t cc;
+    ST_ct_compiler_init(&cc, se->arena, &chunk);
+    ST_ct_compile_expr_return(&cc, e);
+    if (cc.failed) {
+        ST_diag_error(&se->diag, cc.err_line, cc.err_col, "%s", cc.err_msg);
+        return 0;
+    }
+    ST_ct_vm_t vm;
+    ST_ct_vm_init(&vm);
+    ST_ct_status_t st = ST_ct_run(&vm, &chunk, out);
+    if (st == ST_CT_ERR_COMPTIME) {
+        ST_diag_error(&se->diag, vm.err_line, e->col, "%s", vm.err_msg);
+        return 0;
+    }
+    if (st == ST_CT_ERR_RUNTIME) {
+        ST_diag_error(&se->diag, e->line, e->col, "internal: comptime VM error: %s", vm.err_msg);
+        return 0;
+    }
+    return 1;
+}
+
+// Turns 's' into a plain block wrapping exactly 'body', then type-checks
+// (and, later, lowers) only that. The untaken branch's ST_stmts_t is simply
+// dropped -- nothing downstream (lowering, control-flow checks) ever sees
+// it, since this rewrite happens before any of those passes run.
+static void ST_rewrite_as_block(ST_stmt_t *s, ST_stmts_t body) {
+    s->kind = ST_ST_BLOCK;
+    s->block = body;
+}
+
+static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s) {
+    ST_ct_val_t cond;
+    if (!ST_ct_eval_expr(se, s->if_.cond, &cond)) {
+        ST_rewrite_as_block(s, (ST_stmts_t){0}); // already reported; leave nothing to check further
+        return;
+    }
+    if (ST_ct_truthy(cond)) {
+        ST_rewrite_as_block(s, s->if_.then_body);
+    } else if (s->if_.else_stmt) {
+        // else_stmt is itself ST_ST_BLOCK (plain '#else { }') or ST_ST_IF
+        // (an '#else if' link in the chain, already marked is_comptime by
+        // the parser) -- either way just splice it in and let the normal
+        // dispatch below (recursive ST_check_stmt) handle which one it is.
+        *s = *s->if_.else_stmt;
+    } else {
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+    }
+    ST_check_stmt(se, s);
+}
+
+static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s) {
+    ST_ct_val_t scrutinee;
+    if (!ST_ct_eval_expr(se, s->switch_.cond, &scrutinee)) {
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+        return;
+    }
+    ST_case_t *matched = NULL, *default_case = NULL;
+    ST_forrange(0, s->switch_.cases.count) {
+        ST_case_t *c = &s->switch_.cases.items[i];
+        if (c->values.count == 0) {
+            default_case = c; // '#default:' / '#case:' -- fallback if nothing else matches
+            continue;
+        }
+        b8 hit = 0;
+        for (u32 k = 0; k < c->values.count && !hit; k++) {
+            ST_ct_val_t v;
+            if (!ST_ct_eval_expr(se, c->values.items[k], &v)) {
+                ST_rewrite_as_block(s, (ST_stmts_t){0});
+                return;
+            }
+            if (v.kind != scrutinee.kind) {
+                // no implicit cross-kind matching -- '#case 1' never
+                // matches a string scrutinee, etc. Mirrors the strictness
+                // ST_OP_EQ already has for '=='/'!=' on mismatched kinds.
+                continue;
+            }
+            switch (v.kind) {
+                case ST_CT_INT: hit = v.i == scrutinee.i; break;
+                case ST_CT_BOOL: hit = v.b == scrutinee.b; break;
+                case ST_CT_STRING:
+                    hit = v.str.len == scrutinee.str.len &&
+                          memcmp(v.str.data, scrutinee.str.data, v.str.len) == 0;
+                    break;
+                default: hit = 0; break;
+            }
+        }
+        if (hit) {
+            matched = c;
+            break;
+        }
+    }
+    if (!matched)
+        matched = default_case;
+    if (matched)
+        ST_rewrite_as_block(s, matched->body);
+    else
+        ST_rewrite_as_block(s, (ST_stmts_t){0}); // no arm matched and no default -- compiles to nothing
+    ST_check_stmt(se, s);
+}
+
+// Replaces every ST_EX_IDENT named 'target' with a fresh clone of
+// 'replacement' (used for '#for' loop-variable substitution: each unrolled
+// copy gets 'i' replaced by a literal). Also replaces 'pack_name[K]' (K
+// const-foldable) with an ident named 'pack_name#K', and 'pack_name.count'
+// with a literal -- both no-ops when se->has_pack is false or K isn't
+// foldable yet (e.g. still contains the loop var pre-substitution), so it's
+// safe to call unconditionally at multiple points without double-rewriting
+// something already rewritten (an ST_EX_IDENT named 'args#2' doesn't match
+// 'target' or 'pack_name' on a second pass).
+static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t target,
+                                   ST_expr_t *replacement) {
+    if (!e)
+        return;
+    switch (e->kind) {
+        case ST_EX_IDENT:
+            if (target.len && ST_string_eq(e->name, target)) {
+                ST_ty_t *save_ty = e->ty;
+                u32 save_line = e->line, save_col = e->col;
+                *e = *replacement;
+                e->ty = save_ty; // let normal re-typechecking overwrite this properly
+                e->line = save_line;
+                e->col = save_col;
+            }
+            return;
+        case ST_EX_INDEX: {
+            ST_ast_substitute_expr(se, e->index.base, target, replacement);
+            ST_ast_substitute_expr(se, e->index.index, target, replacement);
+            if (se->has_pack && e->index.base->kind == ST_EX_IDENT &&
+                ST_string_eq(e->index.base->name, se->cur_pack_name)) {
+                i64 k;
+                if (ST_const_eval(se, e->index.index, &k) && k >= 0 &&
+                    (u32)k < se->cur_pack_count) {
+                    ST_string_t nm = ST_pack_param_name(se, se->cur_pack_name, (u32)k);
+                    e->kind = ST_EX_IDENT;
+                    e->name = nm;
+                }
+            }
+            return;
+        }
+        case ST_EX_FIELD:
+            ST_ast_substitute_expr(se, e->field.base, target, replacement);
+            if (se->has_pack && e->field.base->kind == ST_EX_IDENT &&
+                ST_string_eq(e->field.base->name, se->cur_pack_name) &&
+                ST_string_eq_cstr(e->field.name, "count")) {
+                e->kind = ST_EX_INT;
+                e->ival = (i64)se->cur_pack_count;
+            }
+            return;
+        case ST_EX_UNARY:
+            ST_ast_substitute_expr(se, e->unary.operand, target, replacement);
+            return;
+        case ST_EX_SIZEOF:
+        case ST_EX_TYPEOF:
+        case ST_EX_TYPEINFO:
+        case ST_EX_KIND:
+        case ST_EX_CSTR:
+        case ST_EX_FIELDS:
+            ST_ast_substitute_expr(se, e->tyop.operand, target, replacement);
+            return;
+        case ST_EX_BINARY:
+            ST_ast_substitute_expr(se, e->bin.l, target, replacement);
+            ST_ast_substitute_expr(se, e->bin.r, target, replacement);
+            return;
+        case ST_EX_CALL:
+            ST_ast_substitute_expr(se, e->call.callee, target, replacement);
+            ST_forrange(0, e->call.args.count)
+                ST_ast_substitute_expr(se, e->call.args.items[i].value, target, replacement);
+            return;
+        case ST_EX_CAST:
+            ST_ast_substitute_expr(se, e->cast.operand, target, replacement);
+            return;
+        case ST_EX_COMP_ERROR:
+            ST_forrange(0, e->comp_error.args.count)
+                ST_ast_substitute_expr(se, e->comp_error.args.items[i], target, replacement);
+            return;
+        default:
+            return; // literals: nothing to substitute
+    }
+}
+
+static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t target,
+                                   ST_expr_t *replacement) {
+    if (!s)
+        return;
+    switch (s->kind) {
+        case ST_ST_EXPR:
+            ST_ast_substitute_expr(se, s->expr, target, replacement);
+            return;
+        case ST_ST_DECL:
+            ST_ast_substitute_expr(se, s->decl.init, target, replacement);
+            return;
+        case ST_ST_ASSIGN:
+            ST_ast_substitute_expr(se, s->assign.lhs, target, replacement);
+            ST_ast_substitute_expr(se, s->assign.rhs, target, replacement);
+            return;
+        case ST_ST_IF:
+            ST_ast_substitute_expr(se, s->if_.cond, target, replacement);
+            ST_forrange(0, s->if_.then_body.count)
+                ST_ast_substitute_stmt(se, s->if_.then_body.items[i], target, replacement);
+            ST_ast_substitute_stmt(se, s->if_.else_stmt, target, replacement);
+            return;
+        case ST_ST_SWITCH:
+            ST_ast_substitute_expr(se, s->switch_.cond, target, replacement);
+            ST_forrange(0, s->switch_.cases.count) {
+                ST_case_t *c = &s->switch_.cases.items[i];
+                for (u32 k = 0; k < c->values.count; k++)
+                    ST_ast_substitute_expr(se, c->values.items[k], target, replacement);
+                for (u32 k = 0; k < c->body.count; k++)
+                    ST_ast_substitute_stmt(se, c->body.items[k], target, replacement);
+            }
+            return;
+        case ST_ST_WHILE:
+            ST_ast_substitute_expr(se, s->while_.cond, target, replacement);
+            ST_forrange(0, s->while_.body.count)
+                ST_ast_substitute_stmt(se, s->while_.body.items[i], target, replacement);
+            return;
+        case ST_ST_FOR_RANGE:
+            ST_ast_substitute_expr(se, s->for_range.lo, target, replacement);
+            ST_ast_substitute_expr(se, s->for_range.hi, target, replacement);
+            ST_forrange(0, s->for_range.body.count)
+                ST_ast_substitute_stmt(se, s->for_range.body.items[i], target, replacement);
+            return;
+        case ST_ST_FOR_ARRAY:
+            ST_ast_substitute_expr(se, s->for_array.target, target, replacement);
+            ST_forrange(0, s->for_array.body.count)
+                ST_ast_substitute_stmt(se, s->for_array.body.items[i], target, replacement);
+            return;
+        case ST_ST_RETURN:
+            ST_forrange(0, s->ret.values.count)
+                ST_ast_substitute_expr(se, s->ret.values.items[i], target, replacement);
+            return;
+        case ST_ST_BLOCK:
+            ST_forrange(0, s->block.count)
+                ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
+            return;
+        case ST_ST_DEFER:
+            ST_ast_substitute_stmt(se, s->defer_stmt, target, replacement);
+            return;
+        default:
+            return;
+    }
+}
+
+// Runs just the pack-substitution half (no loop-var target) over a whole
+// body -- called once by ST_check_fn_body before any statement checking, so
+// e.g. a '#for i: 0..args.count' loop bound is already a literal by the
+// time its own is_comptime handling tries to const-eval it.
+static void ST_pack_substitute_body(ST_sema_t *se, ST_stmts_t *body) {
+    if (!se->has_pack)
+        return;
+    ST_string_t no_target = {0};
+    ST_forrange(0, body->count) ST_ast_substitute_stmt(se, body->items[i], no_target, NULL);
+}
+
+static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
+    ST_expr_t *operand = s->for_array.target->tyop.operand;
+    ST_ty_t *t = ST_type_expr(se, operand);
+    if (!t) {
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+        return;
+    }
+    if (t->kind == ST_TY_PTR)
+        t = t->inner; // '#fields(&x)' -- one auto-deref, same courtesy '.field' access gives
+    if (t->kind != ST_TY_STRUCT && t->kind != ST_TY_ARRAY) {
+        ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
+                      "'fields(...)' needs a struct or a fixed-size array, got '%s'", ST_tstr(se, t));
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+        return;
+    }
+    b8 is_struct = t->kind == ST_TY_STRUCT;
+    if (is_struct)
+        ST_complete_ty(se, t);
+    u32 count = is_struct ? t->fields.count : (u32)t->count;
+
+    ST_stmts_t unrolled = {0};
+    ST_forrange(0, count) {
+        ST_expr_t *access;
+        if (is_struct) {
+            access = ST_expr_new(se->arena, ST_EX_FIELD, s->line, s->col);
+            access->field.base = ST_clone_expr(se->arena, operand);
+            access->field.name = t->fields.items[i].name;
+        } else {
+            ST_expr_t *idx = ST_expr_new(se->arena, ST_EX_INT, s->line, s->col);
+            idx->ival = (i64)i;
+            access = ST_expr_new(se->arena, ST_EX_INDEX, s->line, s->col);
+            access->index.base = ST_clone_expr(se->arena, operand);
+            access->index.index = idx;
+        }
+
+        ST_expr_t idx_lit = {0};
+        idx_lit.kind = ST_EX_INT;
+        idx_lit.line = s->line;
+        idx_lit.col = s->col;
+        idx_lit.ival = (i64)i;
+
+        ST_stmts_t copy = ST_clone_body(se->arena, &s->for_array.body);
+        ST_forrange(0, copy.count)
+            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, access);
+        if (s->for_array.spec_iter.len)
+            ST_forrange(0, copy.count)
+                ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &idx_lit);
+        if (se->has_pack) {
+            ST_string_t no_target = {0};
+            ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
+        }
+        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+    }
+
+    ST_rewrite_as_block(s, unrolled);
+    ST_check_stmt(se, s);
+}
+
+static void ST_check_comptime_for_array(ST_sema_t *se, ST_stmt_t *s) {
+    ST_ct_val_t str;
+    if (!ST_ct_eval_expr(se, s->for_array.target, &str) || str.kind != ST_CT_STRING) {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "'#for' over a value needs a compile-time-constant string here "
+                      "(e.g. a string literal or a 'string ::' constant)");
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+        return;
+    }
+
+    ST_stmts_t unrolled = {0};
+    u32 spec = 0;
+    for (u32 pos = 0; pos < str.str.len; pos++) {
+        u8 ch = (u8)str.str.data[pos];
+
+        ST_expr_t ch_lit = {0};
+        ch_lit.kind = ST_EX_INT;
+        ch_lit.line = s->line;
+        ch_lit.col = s->col;
+        ch_lit.ival = (i64)ch;
+
+        ST_expr_t spec_lit = {0};
+        spec_lit.kind = ST_EX_INT;
+        spec_lit.line = s->line;
+        spec_lit.col = s->col;
+        spec_lit.ival = (i64)spec; // running count of '%' strictly before 'pos'
+
+        ST_stmts_t copy = ST_clone_body(se->arena, &s->for_array.body);
+        ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, &ch_lit);
+        if (s->for_array.spec_iter.len)
+            ST_forrange(0, copy.count)
+                ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
+        if (se->has_pack) {
+            ST_string_t no_target = {0};
+            ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
+        }
+        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+
+        if (ch == '%')
+            spec++;
+    }
+
+    if (se->has_pack && spec != se->cur_pack_count)
+        ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
+                      "format string has %u '%%' but %u argument%s were passed", spec,
+                      se->cur_pack_count, se->cur_pack_count == 1 ? "" : "s");
+
+    ST_rewrite_as_block(s, unrolled);
+    ST_check_stmt(se, s);
+}
+
+static void ST_check_comptime_for(ST_sema_t *se, ST_stmt_t *s) {
+    i64 lo, hi;
+    if (!ST_const_eval(se, s->for_range.lo, &lo) || !ST_const_eval(se, s->for_range.hi, &hi)) {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "'#for' bounds must be compile-time constants (e.g. a literal, or "
+                      "'args.count' inside a '$T...' pack)");
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+        return;
+    }
+    if (s->for_range.inclusive)
+        hi++;
+    if (hi < lo)
+        hi = lo; // empty range, not an error -- same as the runtime 'for' would just not iterate
+
+    ST_stmts_t unrolled = {0};
+    for (i64 k = lo; k < hi; k++) {
+        ST_expr_t lit = {0};
+        lit.kind = ST_EX_INT;
+        lit.line = s->line;
+        lit.col = s->col;
+        lit.ival = k;
+        ST_stmts_t copy = ST_clone_body(se->arena, &s->for_range.body);
+        ST_forrange(0, copy.count)
+            ST_ast_substitute_stmt(se, copy.items[i], s->for_range.iter, &lit);
+        // Substituting 'i' above can turn e.g. 'args[i]' into 'args[2]' --
+        // now foldable, so run the pack half again to catch it.
+        if (se->has_pack) {
+            ST_string_t no_target = {0};
+            ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
+        }
+        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+    }
+    ST_rewrite_as_block(s, unrolled);
+    ST_check_stmt(se, s);
 }
 
 static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
@@ -2346,11 +3131,19 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             ST_check_multi(se, s);
             break;
         case ST_ST_IF:
+            if (s->if_.is_comptime) {
+                ST_check_comptime_if(se, s);
+                break;
+            }
             ST_check_cond(se, s->if_.cond, "'if'");
             ST_check_body(se, &s->if_.then_body);
             ST_check_stmt(se, s->if_.else_stmt);
             break;
         case ST_ST_SWITCH: {
+            if (s->switch_.is_comptime) {
+                ST_check_comptime_switch(se, s);
+                break;
+            }
             ST_ty_t *ct = ST_type_expr(se, s->switch_.cond);
             if (ct && ct->kind == ST_TY_TAG_UNION) {
                 ST_complete_ty(se, ct);
@@ -2410,6 +3203,10 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             ST_check_body(se, &s->while_.body);
             break;
         case ST_ST_FOR_RANGE: {
+            if (s->for_range.is_comptime) {
+                ST_check_comptime_for(se, s);
+                break;
+            }
             ST_ty_t *lo = ST_type_expr(se, s->for_range.lo);
             ST_ty_t *hi = ST_type_expr(se, s->for_range.hi);
             if (lo && !ST_ty_is_int(lo))
@@ -2447,6 +3244,13 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         }
         case ST_ST_FOR_ARRAY: {
+            if (s->for_array.is_comptime) {
+                if (s->for_array.target->kind == ST_EX_FIELDS)
+                    ST_check_comptime_for_fields(se, s);
+                else
+                    ST_check_comptime_for_array(se, s);
+                break;
+            }
             ST_ty_t *tt = ST_type_expr(se, s->for_array.target);
             ST_ty_t *iter = NULL;
             if (tt) {
@@ -2667,6 +3471,7 @@ static void ST_check_dup_fields(ST_sema_t *se, ST_decl_t *d) {
 static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig) {
     ST_ty_t *t = ST_ty_fn_new(&se->tys);
     t->is_variadic = sig->is_variadic;
+    t->has_any_pack = sig->has_any_pack;
     ST_forrange(0, sig->params.count) {
         ST_param_t *p = &sig->params.items[i];
         ST_ty_t *pt = p->te ? ST_resolve_tyexpr(se, p->te) : NULL;
@@ -2872,6 +3677,32 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     if (!d->fn.is_prototype)
         ST_collect_labels(se, &labels, &d->fn.body);
 
+    b8 save_has_pack = se->has_pack;
+    ST_string_t save_pack_name = se->cur_pack_name;
+    u32 save_pack_count = se->cur_pack_count;
+    b8 save_has_bound_str = se->has_bound_str;
+    ST_string_t save_bound_str_param = se->cur_bound_str_param;
+    ST_string_t save_bound_str_value = se->cur_bound_str_value;
+
+    se->has_bound_str = d->fn.has_bound_str;
+    se->cur_bound_str_param = d->fn.bound_str_param;
+    se->cur_bound_str_value = d->fn.bound_str_value;
+    if (se->has_bound_str && !d->fn.is_prototype) {
+        ST_expr_t lit = {0};
+        lit.kind = ST_EX_STR;
+        lit.sval = d->fn.bound_str_value;
+        lit.line = d->line;
+        lit.col = d->col;
+        ST_forrange(0, d->fn.body.count)
+            ST_ast_substitute_stmt(se, d->fn.body.items[i], d->fn.bound_str_param, &lit);
+    }
+
+    se->has_pack = d->fn.had_pack;
+    se->cur_pack_name = d->fn.pack_name;
+    se->cur_pack_count = d->fn.pack_count;
+    if (se->has_pack && !d->fn.is_prototype)
+        ST_pack_substitute_body(se, &d->fn.body);
+
     ST_scope_push(se);
     ST_forrange(0, sig->params.count) {
         ST_param_t *p = &sig->params.items[i];
@@ -2887,6 +3718,12 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     ST_scope_pop(se);
     se->labels = NULL;
 
+    se->has_pack = save_has_pack;
+    se->cur_pack_name = save_pack_name;
+    se->cur_pack_count = save_pack_count;
+    se->has_bound_str = save_has_bound_str;
+    se->cur_bound_str_param = save_bound_str_param;
+    se->cur_bound_str_value = save_bound_str_value;
     se->stamp_tyexprs = save_stamp;
     se->generic_bindings = save_bindings;
 }
@@ -2995,6 +3832,11 @@ static void ST_default_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_IDENT:
         case ST_EX_ARRAY_NEW:
         case ST_EX_SIZEOF:
+        case ST_EX_ASM:
+            break;
+        case ST_EX_STR_FROM_RAW:
+            ST_default_expr(se, e->str_from_raw.ptr);
+            ST_default_expr(se, e->str_from_raw.len);
             break;
         case ST_EX_UNARY:
             ST_default_expr(se, e->unary.operand);
@@ -3024,11 +3866,15 @@ static void ST_default_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_TYPEOF:
         case ST_EX_KIND:
         case ST_EX_CSTR:
+        case ST_EX_FIELDS:
             ST_default_expr(se, e->tyop.operand);
             break;
         case ST_EX_TYPEINFO:
             if (!e->tyop.te)
                 ST_default_expr(se, e->tyop.operand);
+            break;
+        case ST_EX_COMP_ERROR:
+            ST_forrange(0, e->comp_error.args.count) ST_default_expr(se, e->comp_error.args.items[i]);
             break;
         case ST_EX_COUNT:
             ST_assert(0);

@@ -380,9 +380,14 @@ ST_ir_inst_t *ST_ir_global_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_string_t n
 // @note: ST_ir_inline_asm emits a raw inline-assembly instruction. 'tmpl' is
 // the already-expanded template text (see the union comment in this header
 // for the placeholder format) and 'refs' are the ST_IR_ALLOCA instructions
-// that the template's placeholders index into, in placeholder order.
+// that the template's placeholders index into, in placeholder order. 'ty' is
+// NULL for a statement-form asm block with no result value, or the expected
+// type when the block is used as an expression (e.g. 'return #asm { .. };')
+// -- the backend spills whatever's in rax/xmm0 to this instruction's slot
+// whenever 'ty' is non-void, so a non-NULL 'ty' here is what makes the
+// asm block's result usable as a value.
 ST_ir_inst_t *ST_ir_inline_asm(ST_ir_block_t *b, ST_string_t tmpl, ST_ir_inst_t **refs, u32 n_refs,
-                               u32 line, u32 col);
+                               ST_ty_t *ty, u32 line, u32 col);
 
 // @note: ST_ir_term_ret will make a block return values as the values and their
 // count is passed in the function parameter.

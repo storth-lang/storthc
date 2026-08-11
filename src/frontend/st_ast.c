@@ -225,9 +225,25 @@ void ST_dump_expr(FILE *out, ST_expr_t *e, u32 depth) {
             fprintf(out, "kind\n");
             ST_dump_expr(out, e->tyop.operand, depth + 1);
             break;
+        case ST_EX_FIELDS:
+            fprintf(out, "fields\n");
+            ST_dump_expr(out, e->tyop.operand, depth + 1);
+            break;
         case ST_EX_CSTR:
             fprintf(out, "cstr\n");
             ST_dump_expr(out, e->tyop.operand, depth + 1);
+            break;
+        case ST_EX_ASM:
+            fprintf(out, "asm_expr (%u tokens)\n", e->asm_.n_tokens);
+            break;
+        case ST_EX_STR_FROM_RAW:
+            fprintf(out, "str_from_raw\n");
+            ST_dump_expr(out, e->str_from_raw.ptr, depth + 1);
+            ST_dump_expr(out, e->str_from_raw.len, depth + 1);
+            break;
+        case ST_EX_COMP_ERROR:
+            fprintf(out, "comp_error\n");
+            ST_forrange(0, e->comp_error.args.count) ST_dump_expr(out, e->comp_error.args.items[i], depth + 1);
             break;
         case ST_EX_COUNT:
             ST_assert(0);

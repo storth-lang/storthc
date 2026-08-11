@@ -57,6 +57,7 @@ struct ST_ty_t {
     ST_ty_fields_t fields;
     ST_tys_t params, rets;
     b8 is_variadic;
+    b8 has_any_pack;
     ST_ty_state_t state;
 };
 

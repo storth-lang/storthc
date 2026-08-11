@@ -139,3 +139,7 @@
 
 - There is some bugs again in regards to parsing which is totally fine but asm working means I can just do sys calls perfectly
   I want to work on templates and monompoization to make things easier.
+
+2026:08:09
+
+- Tag union support finally added. 

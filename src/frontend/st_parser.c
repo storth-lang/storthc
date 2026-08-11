@@ -34,6 +34,11 @@ static b8 ST_at_keyword(ST_parser_t *p, const char *s) {
     return ST_tok_is_keyword(ST_peek(p), s);
 }
 
+static b8 ST_at_then(ST_parser_t *p) {
+    ST_token_t *t = ST_peek(p);
+    return t && t->kind == ST_TIDENT && ST_string_eq_cstr(t->text, "then");
+}
+
 static b8 ST_tok_is_compound_assign(ST_token_t *t) {
     static const char *ops[] = {"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="};
     if (!t || t->kind != ST_TSYMBOL)
@@ -224,6 +229,7 @@ static ST_string_t ST_expect_ident(ST_parser_t *p, const char *what) {
 
 static ST_expr_t *ST_parse_expr(ST_parser_t *p);
 static ST_stmt_t *ST_parse_stmt(ST_parser_t *p);
+static b8 ST_parse_asm_tokens(ST_parser_t *p, ST_token_t **out_toks, u32 *out_n);
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out);
 
 static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
@@ -540,11 +546,63 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
-    if (ST_tok_is_ident(t) && ST_tok_is_symbol(ST_peek2(p), "(") &&
-        (ST_string_eq_cstr(t->text, "kind") || ST_string_eq_cstr(t->text, "cstr"))) {
-        b8 is_kind = ST_string_eq_cstr(t->text, "kind");
+    if (ST_tok_is_symbol(t, "#asm")) {
+        p->pos++;
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_ASM, t->line, t->col);
+        if (!ST_parse_asm_tokens(p, &e->asm_.tokens, &e->asm_.n_tokens))
+            return NULL;
+        return e;
+    }
+
+    if (ST_tok_is_symbol(t, "#comp_error")) {
+        p->pos++;
+        if (!ST_expect_sym(p, "("))
+            return NULL;
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_COMP_ERROR, t->line, t->col);
+        if (!ST_at_symbol(p, ")")) {
+            for (;;) {
+                ST_expr_t *arg = ST_parse_expr(p);
+                if (!arg)
+                    return NULL;
+                ST_da_append_arena(p->arena, &e->comp_error.args, arg);
+                if (ST_at_symbol(p, ",")) {
+                    p->pos++;
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+        return e;
+    }
+
+    if (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "str_from_raw") &&
+        ST_tok_is_symbol(ST_peek2(p), "(")) {
         p->pos += 2;
-        ST_expr_t *e = ST_expr_new(p->arena, is_kind ? ST_EX_KIND : ST_EX_CSTR, t->line, t->col);
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_STR_FROM_RAW, t->line, t->col);
+        e->str_from_raw.ptr = ST_parse_expr(p);
+        if (!e->str_from_raw.ptr)
+            return NULL;
+        if (!ST_expect_sym(p, ","))
+            return NULL;
+        e->str_from_raw.len = ST_parse_expr(p);
+        if (!e->str_from_raw.len)
+            return NULL;
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+        return e;
+    }
+
+    if ((ST_tok_is_ident(t) && ST_tok_is_symbol(ST_peek2(p), "(") &&
+         (ST_string_eq_cstr(t->text, "kind") || ST_string_eq_cstr(t->text, "cstr") ||
+          ST_string_eq_cstr(t->text, "fields"))) ||
+        (ST_tok_is_symbol(t, "#fields") && ST_tok_is_symbol(ST_peek2(p), "("))) {
+        ST_expr_kind_t kind = ST_string_eq_cstr(t->text, "kind")   ? ST_EX_KIND
+                              : ST_string_eq_cstr(t->text, "cstr") ? ST_EX_CSTR
+                                                                    : ST_EX_FIELDS;
+        p->pos += 2;
+        ST_expr_t *e = ST_expr_new(p->arena, kind, t->line, t->col);
         e->tyop.operand = ST_parse_expr(p);
         if (!e->tyop.operand)
             return NULL;
@@ -794,18 +852,80 @@ static b8 ST_is_lvalue(ST_expr_t *e) {
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
         case ST_EX_CSTR:
+        case ST_EX_FIELDS:
+        case ST_EX_COMP_ERROR:
         case ST_EX_COUNT:
             return 0;
     }
     return 0;
 }
 
-static ST_stmt_t *ST_parse_if(ST_parser_t *p) {
+static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime);
+
+// Handles whatever follows an if/switch's own body (brace or 'then' form):
+// an optional 'else'/'#else', itself either another if ('else if ...'),
+// a braced block, or -- new -- a single inline 'else then STMT;' statement.
+static ST_stmt_t *ST_parse_if_else(ST_parser_t *p, ST_stmt_t *s, b8 is_comptime) {
+    if (ST_at_keyword(p, "else") || ST_at_symbol(p, "#else")) {
+        ST_token_t *et = ST_peek(p);
+        b8 else_is_comptime = ST_tok_is_symbol(et, "#else");
+        if (is_comptime && !else_is_comptime) {
+            ST_perr_tok(p, et,
+                        "'#if' needs '#else', not plain 'else' -- "
+                        "otherwise this arm looks comptime-pruned but isn't");
+            return NULL;
+        }
+        if (!is_comptime && else_is_comptime) {
+            ST_perr_tok(p, et, "'#else' needs a matching '#if', not plain 'if'");
+            return NULL;
+        }
+        p->pos++;
+        if (ST_at_keyword(p, "if")) {
+            s->if_.else_stmt = ST_parse_if(p, is_comptime);
+            if (!s->if_.else_stmt)
+                return NULL;
+        } else if (ST_at_then(p)) {
+            p->pos++;
+            ST_stmt_t *one = ST_parse_stmt(p);
+            if (!one)
+                return NULL;
+            ST_stmt_t *blk = ST_stmt_new(p->arena, ST_ST_BLOCK, et->line, et->col);
+            ST_da_append_arena(p->arena, &blk->block, one);
+            s->if_.else_stmt = blk;
+        } else {
+            ST_stmt_t *blk = ST_stmt_new(p->arena, ST_ST_BLOCK, et->line, et->col);
+            if (!ST_expect_sym(p, "{"))
+                return NULL;
+            if (!ST_parse_body(p, &blk->block))
+                return NULL;
+            if (!ST_expect_sym(p, "}"))
+                return NULL;
+            s->if_.else_stmt = blk;
+        }
+    }
+    return s;
+}
+
+static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime) {
     ST_token_t *t = ST_peek(p);
+    b8 is_comptime = force_comptime || ST_tok_is_symbol(t, "#if");
     p->pos++;
     ST_expr_t *cond = ST_parse_cond(p);
     if (!cond)
         return NULL;
+
+    if (ST_at_then(p)) {
+        p->pos++;
+        ST_stmt_t *one = ST_parse_stmt(p);
+        if (!one)
+            return NULL;
+        ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_IF, t->line, t->col);
+        s->if_.cond = cond;
+        s->if_.is_comptime = is_comptime;
+        ST_da_append_arena(p->arena, &s->if_.then_body, one);
+        return ST_parse_if_else(p, s, is_comptime);
+    }
+
     if (!ST_expect_sym(p, "{"))
         return NULL;
 
@@ -813,17 +933,23 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p) {
     while (scan < p->n_tokens && ST_tok_is_symbol(&p->tokens[scan], ";"))
         scan++;
     ST_token_t *first = ST_tok_at(p, scan);
-    if (ST_tok_is_keyword(first, "case") || ST_tok_is_keyword(first, "default")) {
+    if (ST_tok_is_keyword(first, "case") || ST_tok_is_keyword(first, "default") ||
+        ST_tok_is_symbol(first, "#case") || ST_tok_is_symbol(first, "#default")) {
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_SWITCH, t->line, t->col);
         s->switch_.cond = cond;
+        s->switch_.is_comptime = is_comptime;
         while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
             if (ST_at_symbol(p, ";")) {
                 p->pos++;
                 continue;
             }
             ST_token_t *ct = ST_peek(p);
-            b8 is_case = ST_tok_is_keyword(ct, "case");
-            b8 is_default = ST_tok_is_keyword(ct, "default");
+            // '#case'/'#default' are accepted as plain synonyms for
+            // 'case'/'default' -- purely for readability inside a '#if'
+            // body (so the whole construct visually reads as comptime),
+            // they don't carry any meaning of their own.
+            b8 is_case = ST_tok_is_keyword(ct, "case") || ST_tok_is_symbol(ct, "#case");
+            b8 is_default = ST_tok_is_keyword(ct, "default") || ST_tok_is_symbol(ct, "#default");
             if (!is_case && !is_default) {
                 ST_perr_tok(p, ct, "expected 'case' or 'default' inside a switch body");
                 ST_sync_stmt(p);
@@ -839,8 +965,9 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p) {
                     return NULL;
                 ST_da_append_arena(p->arena, &c.values, v);
             }
-            if (ST_at_symbol(p, ":")) {
-                // 'case Label: stmt;' -- a single statement, no block braces.
+            if (ST_at_symbol(p, ":") || ST_at_then(p)) {
+                // 'case Label: stmt;' / 'case Label then stmt;' -- a single
+                // statement, no block braces either way.
                 p->pos++;
                 ST_stmt_t *one = ST_parse_stmt(p);
                 if (!one)
@@ -863,37 +990,30 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p) {
 
     ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_IF, t->line, t->col);
     s->if_.cond = cond;
+    s->if_.is_comptime = is_comptime;
     if (!ST_parse_body(p, &s->if_.then_body))
         return NULL;
     if (!ST_expect_sym(p, "}"))
         return NULL;
-    if (ST_at_keyword(p, "else")) {
-        ST_token_t *et = ST_peek(p);
-        p->pos++;
-        if (ST_at_keyword(p, "if")) {
-            s->if_.else_stmt = ST_parse_if(p);
-            if (!s->if_.else_stmt)
-                return NULL;
-        } else {
-            ST_stmt_t *blk = ST_stmt_new(p->arena, ST_ST_BLOCK, et->line, et->col);
-            if (!ST_expect_sym(p, "{"))
-                return NULL;
-            if (!ST_parse_body(p, &blk->block))
-                return NULL;
-            if (!ST_expect_sym(p, "}"))
-                return NULL;
-            s->if_.else_stmt = blk;
-        }
-    }
-    return s;
+    return ST_parse_if_else(p, s, is_comptime);
 }
 
 static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
     ST_token_t *t = ST_peek(p);
+    b8 is_comptime = ST_tok_is_symbol(t, "#for");
     p->pos++;
     ST_string_t iter = ST_expect_ident(p, "an iterator name after 'for'");
     if (!iter.len)
         return NULL;
+
+    ST_string_t spec_iter = {0};
+    if (ST_at_symbol(p, ",")) {
+        p->pos++;
+        spec_iter = ST_expect_ident(p, "a second iterator name after ','");
+        if (!spec_iter.len)
+            return NULL;
+    }
+
     if (!ST_expect_sym(p, ":"))
         return NULL;
 
@@ -904,12 +1024,20 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
         return NULL;
 
     if (ST_at_symbol(p, "..") || ST_at_symbol(p, "..=")) {
+        if (spec_iter.len) {
+            ST_perr_here(p,
+                         "a second iterator name ('" ST_sv_fmt "') only makes sense when "
+                         "iterating a string, not a range",
+                         ST_sv_args(spec_iter));
+            return NULL;
+        }
         b8 inclusive = ST_at_symbol(p, "..=");
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_FOR_RANGE, t->line, t->col);
         s->for_range.iter = iter;
         s->for_range.lo = first;
         s->for_range.inclusive = inclusive;
+        s->for_range.is_comptime = is_comptime;
         p->no_struct_lit++;
         s->for_range.hi = ST_parse_expr(p);
         p->no_struct_lit--;
@@ -924,9 +1052,19 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
         return s;
     }
 
+    if (!is_comptime && spec_iter.len) {
+        ST_perr_here(p,
+                     "a second iterator name ('" ST_sv_fmt "') is only meaningful in a "
+                     "'#for' comptime string walk, not a plain runtime 'for'",
+                     ST_sv_args(spec_iter));
+        return NULL;
+    }
+
     ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_FOR_ARRAY, t->line, t->col);
     s->for_array.iter = iter;
+    s->for_array.spec_iter = spec_iter;
     s->for_array.target = first;
+    s->for_array.is_comptime = is_comptime;
     if (!ST_expect_sym(p, "{"))
         return NULL;
     if (!ST_parse_body(p, &s->for_array.body))
@@ -1023,13 +1161,14 @@ static ST_stmt_t *ST_parse_multi(ST_parser_t *p) {
     return s;
 }
 
-static ST_stmt_t *ST_parse_asm_stmt(ST_parser_t *p) {
-    ST_token_t *t = ST_peek(p);
-    p->pos++;
+// @note: collects the raw token stream inside a '#asm { .. }' block
+// (balanced on '{'/'}'), used by both the statement form (ST_parse_asm_stmt)
+// and the expression form (ST_parse_primary's '#asm' branch). Leaves the
+// parser positioned just past the closing '}'. Returns 0 on error.
+static b8 ST_parse_asm_tokens(ST_parser_t *p, ST_token_t **out_toks, u32 *out_n) {
     if (!ST_expect_sym(p, "{"))
-        return NULL;
+        return 0;
 
-    ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_ASM, t->line, t->col);
     struct {
         ST_token_t *items;
         u32 count, capacity;
@@ -1040,7 +1179,7 @@ static ST_stmt_t *ST_parse_asm_stmt(ST_parser_t *p) {
         ST_token_t *cur = ST_peek(p);
         if (!cur) {
             ST_perr_here(p, "unterminated '#asm' block, expected '}'");
-            return NULL;
+            return 0;
         }
         if (ST_tok_is_symbol(cur, "{"))
             depth++;
@@ -1053,10 +1192,20 @@ static ST_stmt_t *ST_parse_asm_stmt(ST_parser_t *p) {
         p->pos++;
     }
     if (!ST_expect_sym(p, "}"))
-        return NULL;
+        return 0;
 
-    s->asm_.tokens = toks.items;
-    s->asm_.n_tokens = toks.count;
+    *out_toks = toks.items;
+    *out_n = toks.count;
+    return 1;
+}
+
+static ST_stmt_t *ST_parse_asm_stmt(ST_parser_t *p) {
+    ST_token_t *t = ST_peek(p);
+    p->pos++;
+
+    ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_ASM, t->line, t->col);
+    if (!ST_parse_asm_tokens(p, &s->asm_.tokens, &s->asm_.n_tokens))
+        return NULL;
     return s;
 }
 
@@ -1074,7 +1223,8 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return ST_parse_asm_stmt(p);
 
     if (t->kind == ST_TSYMBOL && t->text.len > 1 && t->text.data[0] == '#' &&
-        !ST_string_eq_cstr(t->text, "#as")) {
+        !ST_string_eq_cstr(t->text, "#as") && !ST_string_eq_cstr(t->text, "#if") &&
+        !ST_string_eq_cstr(t->text, "#comp_error") && !ST_string_eq_cstr(t->text, "#for")) {
         ST_perr_tok(p, t, "'" ST_sv_fmt "' is not supported in storthc yet", ST_sv_args(t->text));
         return NULL;
     }
@@ -1100,9 +1250,9 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
-    if (ST_tok_is_keyword(t, "if"))
-        return ST_parse_if(p);
-    if (ST_tok_is_keyword(t, "for"))
+    if (ST_tok_is_keyword(t, "if") || ST_tok_is_symbol(t, "#if"))
+        return ST_parse_if(p, 0);
+    if (ST_tok_is_keyword(t, "for") || ST_tok_is_symbol(t, "#for"))
         return ST_parse_for(p);
 
     if (ST_tok_is_keyword(t, "while")) {
@@ -1564,6 +1714,41 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                 return 0;
             }
 
+            if (ST_at_symbol(p, "..") || ST_at_symbol(p, "...")) {
+                p->pos++;
+                if (ST_at_symbol(p, "."))
+                    p->pos++;
+                if (is_extern) {
+                    ST_perr_here(p,
+                                 "'" ST_sv_fmt ": T...' isn't the extern C variadic -- extern "
+                                 "functions use a bare trailing '...' with no name/type",
+                                 ST_sv_args(param.name));
+                    return 0;
+                }
+                b8 is_any = param.te->kind == ST_TE_NAME && ST_string_eq_cstr(param.te->name, "any");
+                b8 is_generic = param.te->is_generic_param;
+                if (!is_any && !is_generic) {
+                    ST_perr_here(p,
+                                 "'" ST_sv_fmt "...' needs 'any' (a runtime RTTI pack) or a "
+                                 "generic '$T' (a compile-time pack), not a concrete type",
+                                 ST_sv_args(param.name));
+                    return 0;
+                }
+                param.is_pack = 1;
+                if (is_any)
+                    sig->has_any_pack = 1; // runtime: collected into a real array, see ST_lower.c
+                else
+                    sig->has_generic_pack = 1; // comptime: one synthetic param per call-site arg,
+                                                // see ST_instantiate_fn's pack-expansion below
+                ST_da_append_arena(p->arena, &sig->params, param);
+                if (!ST_at_symbol(p, ")")) {
+                    ST_perr_here(p, "'" ST_sv_fmt "...' must be the last parameter",
+                                 ST_sv_args(param.name));
+                    return 0;
+                }
+                break;
+            }
+
             if (ST_at_symbol(p, "=")) {
                 p->pos++;
                 param.def = ST_parse_expr(p);
@@ -1834,9 +2019,11 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         d->name = st->str;
         d->import_.alias = st->str;
         if (ST_tok_is_keyword(ST_peek(p), "as") ||
-            (ST_tok_is_ident(ST_peek(p)) && ST_string_eq_cstr(ST_peek(p)->text, "as"))) {
+            (ST_tok_is_ident(ST_peek(p)) && ST_string_eq_cstr(ST_peek(p)->text, "as")) ||
+            ST_tok_is_keyword(ST_peek(p), "using") ||
+            (ST_tok_is_ident(ST_peek(p)) && ST_string_eq_cstr(ST_peek(p)->text, "using"))) {
             p->pos++;
-            d->import_.alias = ST_expect_ident(p, "an alias after 'as'");
+            d->import_.alias = ST_expect_ident(p, "an alias after 'as'/'using'");
             if (!d->import_.alias.len)
                 return NULL;
             d->name = d->import_.alias;

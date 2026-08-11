@@ -76,6 +76,10 @@ typedef enum {
     ST_EX_TYPEINFO,
     ST_EX_KIND,
     ST_EX_CSTR,
+    ST_EX_FIELDS,
+    ST_EX_COMP_ERROR,
+    ST_EX_ASM,
+    ST_EX_STR_FROM_RAW,
     ST_EX_COUNT,
 } ST_expr_kind_t;
 
@@ -146,6 +150,17 @@ struct ST_expr_t {
             ST_expr_t *operand;
             b8 is_align;
         } tyop;
+        struct {
+            ST_exprs_t args; // '#comp_error(a, b, c)' -- concatenated into one diagnostic when reached
+        } comp_error;
+        struct {
+            ST_token_t *tokens;
+            u32 n_tokens;
+        } asm_; // '#asm { .. }' used as an expression, e.g. 'return #asm { .. };'
+        struct {
+            ST_expr_t *ptr;
+            ST_expr_t *len;
+        } str_from_raw; // 'str_from_raw(ptr, len)' -- builds a 'string' from a raw '*char' + length
     };
 };
 
@@ -208,10 +223,12 @@ struct ST_stmt_t {
             ST_expr_t *cond;
             ST_stmts_t then_body;
             ST_stmt_t *else_stmt;
+            b8 is_comptime; // leading token was '#if', not 'if'
         } if_;
         struct {
             ST_expr_t *cond;
             ST_cases_t cases;
+            b8 is_comptime; // same '#if { case ... }' form, comptime-pruned
         } switch_;
         struct {
             ST_expr_t *cond;
@@ -222,11 +239,14 @@ struct ST_stmt_t {
             ST_expr_t *lo, *hi;
             ST_tyexpr_t *iter_te;
             b8 inclusive;
+            b8 is_comptime; // '#for' -- unrolled at compile time, not a real loop
             ST_stmts_t body;
         } for_range;
         struct {
             ST_string_t iter;
+            ST_string_t spec_iter; // optional second binding, len==0 if unused (see '#for' parsing)
             ST_expr_t *target;
+            b8 is_comptime; // '#for ch[, spec]: string_expr' -- unrolled at compile time
             ST_stmts_t body;
         } for_array;
         struct {
@@ -292,6 +312,7 @@ typedef struct {
     ST_tyexpr_t *te;
     ST_expr_t *def;
     u32 line, col;
+    b8 is_pack; // 'name: any...' -- collects all trailing call args into a real array
 } ST_param_t;
 
 typedef struct {
@@ -303,7 +324,9 @@ typedef struct {
     ST_params_t params;
     ST_tyexprs_t rets;
     b8 has_ret_ann;
-    b8 is_variadic;
+    b8 is_variadic;   // raw C-ABI '...' (extern only)
+    b8 has_any_pack;  // trailing 'name: any...' (non-extern; collected into an array)
+    b8 has_generic_pack; // trailing 'name: $T...' (comptime; one synthetic param per call-site arg)
     ST_strings_t generics;
 } ST_fn_sig_t;
 
@@ -345,6 +368,12 @@ struct ST_decl_t {
             ST_fn_sig_t sig;
             ST_stmts_t body;
             b8 is_prototype;
+            b8 had_pack;         // true if this decl came from a '$T...' pack instantiation
+            ST_string_t pack_name; // the pack param's original declared name, e.g. 'args'
+            u32 pack_count;       // how many real args landed in the pack at this call site
+            b8 has_bound_str;      // a plain 'string' param whose value was compile-time-known
+            ST_string_t bound_str_param; // that param's declared name, e.g. 'fmt'
+            ST_string_t bound_str_value; // the literal value bound at this call site
         } fn;
         struct {
             ST_string_t module_name; // directory name under modules/
