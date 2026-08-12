@@ -502,9 +502,19 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             return NULL;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_SIZEOF, t->line, t->col);
         e->tyop.is_align = is_align;
-        e->tyop.te = ST_parse_type(p);
-        if (!e->tyop.te)
-            return NULL;
+        u32 save = p->pos;
+        ST_tyexpr_t *te = ST_try_type(p);
+        if (te && ST_at_symbol(p, ")") && te->kind != ST_TE_NAME)
+            e->tyop.te = te;
+        else if (te && ST_at_symbol(p, ")") && te->kind == ST_TE_NAME &&
+                 ST_tok_at(p, save)->kind == ST_TTYPE)
+            e->tyop.te = te;
+        else {
+            p->pos = save;
+            e->tyop.operand = ST_parse_expr(p);
+            if (!e->tyop.operand)
+                return NULL;
+        }
         if (!ST_expect_sym(p, ")"))
             return NULL;
         return e;
@@ -854,6 +864,8 @@ static b8 ST_is_lvalue(ST_expr_t *e) {
         case ST_EX_CSTR:
         case ST_EX_FIELDS:
         case ST_EX_COMP_ERROR:
+        case ST_EX_ASM:
+        case ST_EX_STR_FROM_RAW:
         case ST_EX_COUNT:
             return 0;
     }

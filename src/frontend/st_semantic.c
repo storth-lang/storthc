@@ -290,7 +290,12 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_CAST:
             return ST_const_eval(se, e->cast.operand, out);
         case ST_EX_SIZEOF: {
-            ST_ty_t *t = ST_resolve_tyexpr(se, e->tyop.te);
+            ST_ty_t *t;
+            if (e->tyop.te) {
+                t = ST_resolve_tyexpr(se, e->tyop.te);
+            } else {
+                t = ST_type_expr(se, e->tyop.operand);
+            }
             if (!t)
                 return 0;
             ST_complete_ty(se, t);
@@ -2287,9 +2292,15 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             t = ST_resolve_tyexpr(se, e->array_new.te);
             break;
         case ST_EX_SIZEOF: {
-            ST_ty_t *st = ST_resolve_tyexpr(se, e->tyop.te);
-            if (st)
-                ST_complete_ty(se, st);
+            if (e->tyop.te) {
+                ST_ty_t *st = ST_resolve_tyexpr(se, e->tyop.te);
+                if (st)
+                    ST_complete_ty(se, st);
+            } else {
+                ST_ty_t *ot = ST_type_expr(se, e->tyop.operand);
+                if (ot)
+                    ST_complete_ty(se, ot);
+            }
             t = se->tys.untyped_int;
             break;
         }
@@ -3831,8 +3842,11 @@ static void ST_default_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_NULL:
         case ST_EX_IDENT:
         case ST_EX_ARRAY_NEW:
-        case ST_EX_SIZEOF:
         case ST_EX_ASM:
+            break;
+        case ST_EX_SIZEOF:
+            if (!e->tyop.te)
+                ST_default_expr(se, e->tyop.operand);
             break;
         case ST_EX_STR_FROM_RAW:
             ST_default_expr(se, e->str_from_raw.ptr);

@@ -1412,6 +1412,15 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
             return ST_ir_load(c->cur, e->ty, p, e->line, e->col);
         } break;
 
+        case ST_EX_SIZEOF: {
+            i64 v;
+            if (ST_const_eval(c->sema, e, &v))
+                return ST_ir_const_int(c->cur, e->ty, v);
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: 'sizeof'/'align_of' operand did not resolve to a type");
+            return ST_ir_const_int(c->cur, e->ty, 0);
+        }
+
         default:
             ST_diag_error(&c->diag, e->line, e->col,
                           "internal: this expression form isn't lowered yet");

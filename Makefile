@@ -4,7 +4,7 @@ SRCROOT := src
 OBJROOT := obj
 BINDIR := bin
 
-CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g
+CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g
 LDLIBS := -lm
 TARGET := $(BINDIR)/storthc
 
@@ -38,10 +38,10 @@ $(OBJROOT)/%.o: $(SRCROOT)/%.c | $(OBJROOT)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 install: $(TARGET)
-	install -d $(INSTALL_DIR) 
-	install -m 755 $(TARGET) $(INSTALL_DIR)/storthc 
-	install -d $(MODULES_DIR) 
-	cp -r modules/. $(MODULES_DIR)/ 
+	install -d $(INSTALL_DIR)
+	install -m 755 $(TARGET) $(INSTALL_DIR)/storthc
+	install -d $(MODULES_DIR)
+	cp -r modules/. $(MODULES_DIR)/
 	@echo 'export STORTHC_MODULE_PATH="$(MODULES_DIR)"' > ~/.bashrc
 
 $(BINDIR):

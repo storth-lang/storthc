@@ -328,8 +328,21 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
         case ST_EX_CSTR:
+        case ST_EX_FIELDS:
             ST_modrw_tyexpr(rw, e->tyop.te);
             ST_modrw_expr(rw, e->tyop.operand);
+            break;
+
+        case ST_EX_COMP_ERROR:
+            ST_forrange(0, e->comp_error.args.count) ST_modrw_expr(rw, e->comp_error.args.items[i]);
+            break;
+
+        case ST_EX_ASM:
+            break;
+
+        case ST_EX_STR_FROM_RAW:
+            ST_modrw_expr(rw, e->str_from_raw.ptr);
+            ST_modrw_expr(rw, e->str_from_raw.len);
             break;
 
         case ST_EX_COUNT:

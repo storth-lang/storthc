@@ -1,20 +1,6 @@
 #ifndef ST_COMPTIME_COMPILE_H
 #define ST_COMPTIME_COMPILE_H
 
-// AST -> bytecode. Compiles the subset of ST_expr_t / ST_stmt_t that's
-// actually reachable inside a #comptime-evaluated expression or statement
-// into an ST_ct_chunk_t, then st_semantic.c runs it through ST_ct_run.
-//
-// Deliberately NOT a general compiler for the whole language: it only
-// handles what #if / #case conditions and #comptime blocks need --
-// literals, idents bound to *comptime* locals (a separate, tiny symbol
-// table from the real ST_sema_t scope chain -- see ST_ct_compiler_t below),
-// binary/unary ops, '.len' / indexing on strings, if/while control flow,
-// and '#comp_error(...)' calls. Anything else it can't fold (a call to a
-// runtime function, a load through a runtime pointer, etc.) is reported as
-// "not comptime-evaluable" at the offending expression's line/col -- it is
-// not this compiler's job to guess.
-
 #include "../st_ast.h"
 #include "../st_types.h"
 #include "st_comptime.h"
