@@ -351,6 +351,7 @@ static b8 ST_lower_ty_is_scalar(ST_ty_t *t) {
         case ST_TY_PTR:
         case ST_TY_ENUM:
         case ST_TY_FN:
+        case ST_TY_TYPEID:
             return 1;
         default:
             return 0;
@@ -1421,6 +1422,41 @@ static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
             return ST_ir_const_int(c->cur, e->ty, 0);
         }
 
+        case ST_EX_TYPEINFO: {
+            ST_ty_t *ot = e->tyop.te ? e->tyop.te->resolved : e->tyop.operand->ty;
+            if (!ot) {
+                ST_diag_error(&c->diag, e->line, e->col,
+                              "internal: 'type_info' operand has no resolved type");
+                return ST_ir_const_int(c->cur, e->ty, 0);
+            }
+            ST_ty_t *tity = c->sema->type_info_ty;
+            ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, tity, e->line, e->col);
+            const char *name_c = ST_ty_cstr(c->arena, ot);
+            ST_string_t name_sv = ST_cstr_to_str((char *)name_c);
+
+            ST_forrange(0, tity->fields.count) {
+                ST_ty_field_t *f = &tity->fields.items[i];
+                ST_ir_inst_t *fp =
+                    ST_lower_field_ptr(c, slot, (i32)f->offset, f->ty, e->line, e->col);
+                if (ST_string_eq_cstr(f->name, "kind")) {
+                    ST_ir_store(c->cur, f->ty, fp,
+                               ST_ir_const_int(c->cur, f->ty, (i64)ot->kind), e->line, e->col);
+                } else if (ST_string_eq_cstr(f->name, "size")) {
+                    ST_ir_store(c->cur, f->ty, fp,
+                               ST_ir_const_int(c->cur, f->ty, (i64)ot->size), e->line, e->col);
+                } else if (ST_string_eq_cstr(f->name, "align")) {
+                    ST_ir_store(c->cur, f->ty, fp,
+                               ST_ir_const_int(c->cur, f->ty, (i64)ot->align), e->line, e->col);
+                } else if (ST_string_eq_cstr(f->name, "name")) {
+                    u32 idx = ST_ir_module_intern_str(c->module, name_sv);
+                    ST_ty_t *sptr_ty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tstring]);
+                    ST_ir_inst_t *str_addr = ST_ir_const_str(c->cur, sptr_ty, idx);
+                    ST_lower_string_copy(c, fp, str_addr, e->line, e->col);
+                }
+            }
+            return slot;
+        }
+
         default:
             ST_diag_error(&c->diag, e->line, e->col,
                           "internal: this expression form isn't lowered yet");
@@ -2224,7 +2260,8 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 len_v = ST_ir_const_int(c->cur, ity, (i64)tt->count);
             } else if (tt->kind == ST_TY_DYN_ARRAY || tt->kind == ST_TY_STRING) {
                 elem_ty = tt->kind == ST_TY_STRING ? c->sema->tys.prim[ST_tchar] : tt->inner;
-                ST_ir_inst_t *base = ST_lower_lvalue_addr(c, target);
+                ST_ir_inst_t *base = tt->kind == ST_TY_STRING ? ST_lower_string_addr(c, target)
+                                                               : ST_lower_lvalue_addr(c, target);
                 if (!base)
                     break;
                 ST_ty_t *dptr_ty = ST_ty_ptr(&c->sema->tys, elem_ty);
@@ -2254,6 +2291,19 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_ir_term_condbr(c->cur, cond, for_body, for_end, s->line, s->col);
             ST_ir_block_seal(for_body);
             c->cur = for_body;
+
+            if (s->for_array.spec_iter.len) {
+                b8 idx_taken = ST_lower_is_addr_taken(c, s->for_array.spec_iter);
+                if (idx_taken) {
+                    ST_ir_inst_t *islot = ST_ir_alloca(c->fn, &c->sema->tys, ity, s->line, s->col);
+                    ST_ir_store(c->cur, ity, islot, idx, s->line, s->col);
+                    ST_lower_bind_addr(c, s->for_array.spec_iter, islot, ity);
+                } else {
+                    ST_ir_write_var(c->cur, &s->for_array.spec_iter, idx);
+                    ST_lower_bind_ssa(c, s->for_array.spec_iter, &s->for_array.spec_iter, ity);
+                }
+            }
+
             ST_ty_t *eptr_ty = ST_ty_ptr(&c->sema->tys, elem_ty);
             u32 scale = elem_ty->size ? elem_ty->size : 1;
             ST_ir_inst_t *elem_ptr =

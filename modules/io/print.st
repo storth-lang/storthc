@@ -1,6 +1,5 @@
 STDOUT :: 1;
 STDERR :: 2;
-
 fn io_write_byte(fd: i32, b: i8) {
     #asm {
         xor rbx, rbx
@@ -43,25 +42,27 @@ fn io_write_float(fd: i32, f: f32) {
     io_write_byte(fd, '.' #as i8);
     frac := f - (whole #as f32);
     if frac < 0.0 then frac *= -1;
-
     frac = frac * 1000.0;
-    io_write_int(fd, frac #as i64);
+    frac_int := frac #as i64;
+    if frac_int < 100 then io_write_byte(fd, '0' #as i8);
+    if frac_int < 10 then io_write_byte(fd, '0' #as i8);
+    io_write_int(fd, frac_int);
 }
 
 fn print_value(fd: i32, v: $V) {
     #if kind(v) {
-        #case "i8"  then io_write_int(fd, v #as i64);
-        #case "i16" then io_write_int(fd, v #as i64);
-        #case "i32" then io_write_int(fd, v #as i64);
-        #case "char" then io_write_char(fd, v);
-        #case "i64" then io_write_int(fd, v);
-        #case "u8"  then io_write_uint(fd, v #as u64);
-        #case "u16" then io_write_uint(fd, v #as u64);
-        #case "u32" then io_write_uint(fd, v #as u64);
-        #case "u64" then io_write_uint(fd, v);
-        #case "f32" then io_write_float(fd, v);
-        #case "string" then io_write_str(fd, v);
-        #case "struct" {
+        case "i8"  then io_write_int(fd, v #as i64);
+        case "i16" then io_write_int(fd, v #as i64);
+        case "i32" then io_write_int(fd, v #as i64);
+        case "char" then io_write_byte(fd, v #as i8);
+        case "i64" then io_write_int(fd, v);
+        case "u8"  then io_write_uint(fd, v #as u64);
+        case "u16" then io_write_uint(fd, v #as u64);
+        case "u32" then io_write_uint(fd, v #as u64);
+        case "u64" then io_write_uint(fd, v);
+        case "f32" then io_write_float(fd, v);
+        case "string" then io_write_str(fd, v);
+        case "struct" {
             io_write_byte(fd, '{' #as i8);
             #for field, idx: #fields(v) {
                 #if idx > 0 {
@@ -72,10 +73,10 @@ fn print_value(fd: i32, v: $V) {
             }
             io_write_byte(fd, '}' #as i8);
         }
-        #case "array" {
+        case "array" {
             io_write_byte(fd, '[' #as i8);
             #for field, idx: #fields(v) {
-                #if idx > 0 {
+                if idx > 0 {
                     io_write_byte(fd, ',' #as i8);
                     io_write_byte(fd, ' ' #as i8);
                 }
@@ -83,10 +84,16 @@ fn print_value(fd: i32, v: $V) {
             }
             io_write_byte(fd, ']' #as i8);
         }
-        #default then #comp_error("print: no formatter for this argument's type");
+        case "tag_union" {
+            io_write_byte(fd, '{' #as i8);
+            #for field, idx: #fields(v) {
+                print_value(fd, field);
+            }
+            io_write_byte(fd, '}' #as i8);
+        }
+        default { #comp_error(caller, "print: no formatter for this argument's type"); }
     }
 }
-
 pub fn print(fmt: string, args: $T...) {
     #for ch, spec: fmt {
         #if ch == '%' then print_value(STDOUT, args[spec]);

@@ -334,6 +334,7 @@ struct ST_decl_t {
     ST_decl_kind_t kind;
     ST_string_t name;
     ST_string_t display_name;
+    ST_string_t file;
     b8 is_pub;
     u32 line, col;
     union {
@@ -374,6 +375,9 @@ struct ST_decl_t {
             b8 has_bound_str;      // a plain 'string' param whose value was compile-time-known
             ST_string_t bound_str_param; // that param's declared name, e.g. 'fmt'
             ST_string_t bound_str_value; // the literal value bound at this call site
+            b8 has_call_site;
+            ST_string_t call_file;
+            u32 call_line, call_col;
         } fn;
         struct {
             ST_string_t module_name; // directory name under modules/

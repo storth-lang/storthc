@@ -22,6 +22,7 @@ typedef enum {
     ST_TY_ENUM,
     ST_TY_TAG_UNION,
     ST_TY_FN,
+    ST_TY_TYPEID,
     ST_TY_COUNT,
 } ST_ty_kind_t;
 
@@ -67,6 +68,7 @@ typedef struct {
     ST_ty_t *untyped_int;
     ST_ty_t *untyped_float;
     ST_ty_t *null_ptr;
+    ST_ty_t *typeid_ty;
     ST_ht_t interned, decl_type;
 } ST_ty_ctx_t;
 

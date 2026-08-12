@@ -81,7 +81,7 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     }
 
     ST_sema_t sema = {0};
-    if (!ST_sema_run(arena, &prog, src, file, &sema))
+    if (!ST_sema_run(arena, &prog, src, file, &srcs, &sema))
         goto done;
 
     ST_ir_module_t mod = {0};

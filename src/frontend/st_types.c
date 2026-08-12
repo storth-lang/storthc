@@ -53,6 +53,7 @@ void ST_ty_ctx_init(ST_ty_ctx_t *ctx, ST_arena_t *arena) {
     ctx->untyped_float->width = 64;
     ctx->null_ptr = ST_ty_alloc(ctx, ST_TY_PTR, 8, 8);
     ctx->null_ptr->inner = ctx->prim[ST_tvoid];
+    ctx->typeid_ty = ST_ty_alloc(ctx, ST_TY_TYPEID, 8, 8);
 }
 
 ST_ty_t *ST_ty_prim(ST_ty_ctx_t *ctx, ST_type_t t) {
@@ -275,6 +276,9 @@ static void ST_ty_dump(ST_sb_t *sb, ST_ty_t *t) {
                 }
             }
             break;
+        case ST_TY_TYPEID:
+            ST_append_to_builder(sb, "type");
+            break;
         case ST_TY_COUNT:
             ST_assert(0);
             break;
@@ -377,6 +381,9 @@ static void ST_ty_mangle_sb(ST_sb_t *sb, ST_ty_t *t) {
                     ST_ty_mangle_sb(sb, t->rets.items[i]);
                 }
             }
+            break;
+        case ST_TY_TYPEID:
+            ST_append_to_builder(sb, "typeid");
             break;
         case ST_TY_COUNT:
             ST_assert(0);

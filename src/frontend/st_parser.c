@@ -1064,14 +1064,6 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
         return s;
     }
 
-    if (!is_comptime && spec_iter.len) {
-        ST_perr_here(p,
-                     "a second iterator name ('" ST_sv_fmt "') is only meaningful in a "
-                     "'#for' comptime string walk, not a plain runtime 'for'",
-                     ST_sv_args(spec_iter));
-        return NULL;
-    }
-
     ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_FOR_ARRAY, t->line, t->col);
     s->for_array.iter = iter;
     s->for_array.spec_iter = spec_iter;
@@ -2074,12 +2066,14 @@ b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t 
     while (p->pos < p->n_tokens) {
         if (p->n_errors >= ST_PARSE_MAX_ERRORS)
             break;
+        ST_token_t *start_tok = ST_peek(p);
         ST_decl_t *d = ST_parse_top_decl(p);
         if (!d) {
             p->pos++;
             ST_sync_decl(p);
             continue;
         }
+        d->file = start_tok && start_tok->file.len ? start_tok->file : file;
         ST_da_append_arena(arena, &out->decls, d);
     }
     return p->n_errors == 0;

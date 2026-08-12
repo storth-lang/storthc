@@ -580,9 +580,10 @@ static cli_status_t cli_parse_commands(command_t *cmd, int argc, char **argv, in
         }
 
         cli_flag_t *rest = cli_find_rest(cmd);
-        if (rest && strcmp(arg, "-") == 0) {
+        if (rest) {
             strings_t *list = rest->value;
-            (*cursor)++; // consume the '-' sentinel itself, not part of the list
+            if (strcmp(arg, "-") == 0)
+                (*cursor)++; // optional '-' sentinel, if present, is not part of the list
             while (*cursor < argc) {
                 da_append(&cmd->cli->arena, list, argv[*cursor]);
                 (*cursor)++;

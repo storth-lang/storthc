@@ -3,6 +3,7 @@
 
 #include "../utils/st_diagnostic.h"
 #include "../utils/st_ht.h"
+#include "../utils/st_srcmap.h"
 #include "./st_ast.h"
 #include "./st_types.h"
 
@@ -39,11 +40,14 @@ struct ST_scope_t {
 typedef struct {
     ST_arena_t *arena;
     ST_diag_t diag;
+    ST_srcmap_t *srcs;
     ST_ht_t globals;
     ST_scope_t *scope;
     ST_ht_t *labels;
     ST_ty_ctx_t tys;
     ST_tys_t *cur_rets;
+    ST_decl_t *cur_fn_decl;
+    ST_ty_t *type_info_ty;
     ST_program_t *prog;
     ST_ht_t templates;
     ST_ht_t instantiations;
@@ -61,10 +65,12 @@ typedef struct {
     b8 has_bound_str;
     ST_string_t cur_bound_str_param;
     ST_string_t cur_bound_str_value;
+
+    b8 hit_comp_error;
 } ST_sema_t;
 
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string_t file,
-               ST_sema_t *out);
+               ST_srcmap_t *srcs, ST_sema_t *out);
 
 // @note: ST_const_eval evaluates 'e' as a compile-time integer constant
 // (int/char/bool literals, named '::' constants, enum/enum_flag variants,
