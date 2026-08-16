@@ -46,6 +46,12 @@ ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name
     return NULL;
 }
 
+void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                 b8 is_float, i64 i, f64 f) {
+    ST_ir_global_field_init_t fi = {offset, size, is_float, i, f};
+    ST_da_append_arena(arena, &g->field_inits, fi);
+}
+
 ST_ir_block_t *ST_ir_block_new(ST_ir_fn_t *fn, const char *label_hint) {
     ST_ir_block_t *b = ST_arena_push_zeroed(fn->arena, sizeof(*b));
     b->id = fn->next_block_id++;

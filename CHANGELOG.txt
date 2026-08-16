@@ -129,12 +129,12 @@
 
 2026:08:02
 
-- Load finally implemented. #load compile time directive is just #include from C with copy pasting source code of a file 
+- Load finally implemented. #load compile time directive is just #include from C with copy pasting source code of a file
   however it does automatic inclusion meaning if it is already included it will not copy it again making it much more
   pleasant to work with so that will remove macro implemntation crap.
 
 - We finally have #asm directive meaning this will allow the compiler to inject stuff to our assembly backend do note that
-  this is not copy pasting to nasm as we can just refernence variables defined outside without the need to introduce 
+  this is not copy pasting to nasm as we can just refernence variables defined outside without the need to introduce
   anything in the asm block itself it will lower it manually.
 
 - There is some bugs again in regards to parsing which is totally fine but asm working means I can just do sys calls perfectly
@@ -142,4 +142,22 @@
 
 2026:08:09
 
-- Tag union support finally added. 
+- Tag union support finally added.
+
+2026:08:16
+
+- Finally correctly added support for dynamic arrays.
+  The syntax for dynamic arrays is [..]T they are just implicit structure that have member items, count and capacity.
+
+- Also fixed calling global structure as my IR did not account for them.
+
+- Added support for mem module for memory allocation. It contains arena, and heap allocation and reallocating memory.
+  Do note that 'static' and 'using' is not yet implemented so the interface will eventually get updated however the function declaration
+  usage will still be the same.
+
+- Also added support for array module even though it is basic. Do note that the interfaces are just there for helping purpose.
+
+- Type reflection with generic any is not implemented however there is already type_info as we can do inspection on the type information.
+  Such as the names, the alignment the ordinal offset as well.
+
+- We still lack the concept of comptime.

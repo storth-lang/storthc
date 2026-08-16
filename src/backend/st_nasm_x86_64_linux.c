@@ -102,12 +102,71 @@ static void ST_mem_store(FILE *out, ST_ty_t *ty) {
     }
 }
 
+static void ST_gen_scalar_data(FILE *out, u32 size, b8 is_float, i64 iv, f64 fv) {
+    if (is_float) {
+        if (size == 4) {
+            u32 bits;
+            float f = (float)fv;
+            memcpy(&bits, &f, sizeof(bits));
+            fprintf(out, "    dd 0x%08x\n", bits);
+        } else {
+            u64 bits;
+            memcpy(&bits, &fv, sizeof(bits));
+            fprintf(out, "    dq 0x%016llx\n", (unsigned long long)bits);
+        }
+        return;
+    }
+    switch (size) {
+        case 1:
+            fprintf(out, "    db %lld\n", (long long)iv);
+            break;
+        case 2:
+            fprintf(out, "    dw %lld\n", (long long)iv);
+            break;
+        case 4:
+            fprintf(out, "    dd %lld\n", (long long)iv);
+            break;
+        default:
+            fprintf(out, "    dq %lld\n", (long long)iv);
+            break;
+    }
+}
+
+static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
+    u32 n = g->field_inits.count;
+    ST_ir_global_field_init_t sorted[256];
+    ST_assert(n <= ST_array_len(sorted));
+    ST_forrange(0, n) sorted[i] = g->field_inits.items[i];
+    ST_forrange(0, n) {
+        u32 min = i;
+        for (u32 j = i + 1; j < n; j++)
+            if (sorted[j].offset < sorted[min].offset)
+                min = j;
+        if (min != i) {
+            ST_ir_global_field_init_t tmp = sorted[i];
+            sorted[i] = sorted[min];
+            sorted[min] = tmp;
+        }
+    }
+    u32 cursor = 0;
+    ST_forrange(0, n) {
+        ST_ir_global_field_init_t *fi = &sorted[i];
+        if (fi->offset > cursor)
+            fprintf(out, "    times %u db 0\n", fi->offset - cursor);
+        ST_gen_scalar_data(out, fi->size, fi->is_float, fi->i, fi->f);
+        cursor = fi->offset + fi->size;
+    }
+    u32 total = g->ty && g->ty->size ? g->ty->size : cursor;
+    if (total > cursor)
+        fprintf(out, "    times %u db 0\n", total - cursor);
+}
+
 static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
     if (!m->globals.count)
         return;
     b8 any_init = 0, any_uninit = 0;
     ST_forrange(0, m->globals.count) {
-        if (m->globals.items[i].has_init)
+        if (m->globals.items[i].has_init || m->globals.items[i].field_inits.count)
             any_init = 1;
         else
             any_uninit = 1;
@@ -116,48 +175,26 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
         fprintf(out, "\nsection .data\n");
         ST_forrange(0, m->globals.count) {
             ST_ir_global_var_t *g = &m->globals.items[i];
-            if (!g->has_init)
+            if (!g->has_init && !g->field_inits.count)
                 continue;
-            u32 size = g->ty && g->ty->size ? g->ty->size : 8;
             u32 align = g->ty && g->ty->align ? g->ty->align : 8;
             if (g->is_pub)
                 fprintf(out, "global " ST_sv_fmt "\n", ST_sv_args(g->name));
             fprintf(out, "align %u\n", align);
             fprintf(out, ST_sv_fmt ":\n", ST_sv_args(g->name));
-            if (g->init_is_float) {
-                if (size == 4) {
-                    u32 bits;
-                    float f = (float)g->init_float;
-                    memcpy(&bits, &f, sizeof(bits));
-                    fprintf(out, "    dd 0x%08x\n", bits);
-                } else {
-                    u64 bits;
-                    memcpy(&bits, &g->init_float, sizeof(bits));
-                    fprintf(out, "    dq 0x%016llx\n", (unsigned long long)bits);
-                }
-            } else {
-                switch (size) {
-                    case 1:
-                        fprintf(out, "    db %lld\n", (long long)g->init_int);
-                        break;
-                    case 2:
-                        fprintf(out, "    dw %lld\n", (long long)g->init_int);
-                        break;
-                    case 4:
-                        fprintf(out, "    dd %lld\n", (long long)g->init_int);
-                        break;
-                    default:
-                        fprintf(out, "    dq %lld\n", (long long)g->init_int);
-                        break;
-                }
+            if (g->field_inits.count) {
+                ST_gen_struct_global_data(out, g);
+                continue;
             }
+            u32 size = g->ty && g->ty->size ? g->ty->size : 8;
+            ST_gen_scalar_data(out, size, g->init_is_float, g->init_int, g->init_float);
         }
     }
     if (any_uninit) {
         fprintf(out, "\nsection .bss\n");
         ST_forrange(0, m->globals.count) {
             ST_ir_global_var_t *g = &m->globals.items[i];
-            if (g->has_init)
+            if (g->has_init || g->field_inits.count)
                 continue;
             u32 size = g->ty && g->ty->size ? g->ty->size : 8;
             u32 align = g->ty && g->ty->align ? g->ty->align : 8;

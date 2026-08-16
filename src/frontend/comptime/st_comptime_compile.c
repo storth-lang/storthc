@@ -155,6 +155,16 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                 name = "tag_union";
             else if (t->kind == ST_TY_ARRAY)
                 name = "array"; // fixed-size [N]T. #fields() gives indexed element access
+            else if (t->kind == ST_TY_DYN_ARRAY)
+                name = "dyn_array"; // [..]T for any T; distinct from "array" since it has
+                                    // items/count/capacity fields, not #fields() elements
+            else if (t->kind == ST_TY_PTR)
+                name = "ptr"; // *T for any T, including *void (what 'null' resolves to
+                              // with no other context) and *fn(...)->... function pointers
+            else if (t->kind == ST_TY_ENUM)
+                name = "enum"; // dispatchable category, not e.g. "Error"; there's no name
+                               // reverse-lookup yet, so print_value falls back to the
+                               // underlying integer
             else
                 name = ST_ty_cstr(cc->arena, t);
             ST_ct_emit_const(cc->chunk, ST_ct_str(name, (u32)strlen(name)), e->line);

@@ -1425,6 +1425,27 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
                       ST_tstr(se, l), ST_tstr(se, r));
         return NULL;
     }
+
+    if (ST_op_is(op, "+", "-")) {
+        if (l->kind == ST_TY_PTR && ST_ty_is_int(r))
+            return l;
+        if (ST_string_eq_cstr(op, "+") && r->kind == ST_TY_PTR && ST_ty_is_int(l))
+            return r;
+        if (l->kind == ST_TY_PTR && r->kind == ST_TY_PTR) {
+            if (ST_string_eq_cstr(op, "+")) {
+                ST_diag_error(&se->diag, e->line, e->col, "cannot add two pointers");
+                return NULL;
+            }
+            if (!ST_ty_equal(l, r)) {
+                ST_diag_error(&se->diag, e->line, e->col,
+                              "cannot subtract pointers of different types '%s' and '%s'",
+                              ST_tstr(se, l), ST_tstr(se, r));
+                return NULL;
+            }
+            return se->tys.prim[ST_ti64];
+        }
+    }
+
     ST_ty_t *u = ST_ty_num_unify(se, l, r);
     if (!u) {
         ST_diag_error(&se->diag, e->line, e->col,
@@ -1591,7 +1612,10 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
 
             if (!has_bound_str && idx < tsig->params.count && tsig->params.items[idx].te &&
                 !tsig->params.items[idx].te->is_generic_param) {
+                ST_ht_t *save_gb = se->generic_bindings;
+                se->generic_bindings = &bindings;
                 ST_ty_t *pty = ST_resolve_tyexpr(se, tsig->params.items[idx].te);
+                se->generic_bindings = save_gb;
                 if (pty && pty->kind == ST_TY_STRING) {
                     ST_ct_val_t val;
                     if (ST_ct_eval_expr(se, arg->value, &val) && val.kind == ST_CT_STRING) {
@@ -1807,7 +1831,12 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
         return NULL;
     }
 
-    if (t->kind == ST_TY_ARRAY || t->kind == ST_TY_DYN_ARRAY || t->kind == ST_TY_STRING) {
+    if (t->kind == ST_TY_DYN_ARRAY) {
+        ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, e->field.name))
+            return t->fields.items[i].ty;
+    }
+
+    if (t->kind == ST_TY_ARRAY || t->kind == ST_TY_STRING) {
         if (ST_string_eq_cstr(e->field.name, "len"))
             return se->tys.prim[ST_ti32];
         if (ST_string_eq_cstr(e->field.name, "ptr"))
@@ -2216,10 +2245,19 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             t = ST_resolve_tyexpr(se, e->array_new.te);
             break;
         case ST_EX_SIZEOF: {
+            ST_sym_t *tsym = e->tyop.operand && e->tyop.operand->kind == ST_EX_IDENT
+                                 ? ST_sym_find(se, e->tyop.operand->name)
+                                 : NULL;
             if (e->tyop.te) {
                 ST_ty_t *st = ST_resolve_tyexpr(se, e->tyop.te);
                 if (st)
                     ST_complete_ty(se, st);
+            } else if (tsym && tsym->kind == ST_SYM_TYPE) {
+                ST_ty_t *st = ST_ty_for_decls(&se->tys, tsym->decl);
+                if (st) {
+                    ST_complete_ty(se, st);
+                    e->tyop.operand->ty = st;
+                }
             } else {
                 ST_ty_t *ot = ST_type_expr(se, e->tyop.operand);
                 if (ot)

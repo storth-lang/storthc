@@ -228,6 +228,19 @@ typedef struct {
 // initializer) under 'name', addressed the same way as a function (see
 // ST_ir_global_addr).
 typedef struct {
+    u32 offset;
+    u32 size;
+    b8 is_float;
+    i64 i;
+    f64 f;
+} ST_ir_global_field_init_t;
+
+typedef struct {
+    ST_ir_global_field_init_t *items;
+    u32 count, capacity;
+} ST_ir_global_field_inits_t;
+
+typedef struct {
     ST_string_t name;
     ST_ty_t *ty;
     b8 has_init;
@@ -235,6 +248,7 @@ typedef struct {
     i64 init_int;
     f64 init_float;
     b8 is_pub;
+    ST_ir_global_field_inits_t field_inits;
 } ST_ir_global_var_t;
 
 typedef struct {
@@ -274,6 +288,9 @@ void ST_ir_module_add_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty, b
 
 // @note: ST_ir_module_find_global looks up a registered global variable by name.
 ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name);
+
+void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                 b8 is_float, i64 i, f64 f);
 
 // @note: ST_ir_block_new is for creating a new block inside the function with a label.
 ST_ir_block_t *ST_ir_block_new(ST_ir_fn_t *fn, const char *label_hint);

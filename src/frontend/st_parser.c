@@ -507,7 +507,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         if (te && ST_at_symbol(p, ")") && te->kind != ST_TE_NAME)
             e->tyop.te = te;
         else if (te && ST_at_symbol(p, ")") && te->kind == ST_TE_NAME &&
-                 ST_tok_at(p, save)->kind == ST_TTYPE)
+                 (ST_tok_at(p, save)->kind == ST_TTYPE || te->is_generic_param))
             e->tyop.te = te;
         else {
             p->pos = save;
@@ -543,7 +543,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         if (te && ST_at_symbol(p, ")") && te->kind != ST_TE_NAME)
             e->tyop.te = te;
         else if (te && ST_at_symbol(p, ")") && te->kind == ST_TE_NAME &&
-                 ST_tok_at(p, save)->kind == ST_TTYPE)
+                 (ST_tok_at(p, save)->kind == ST_TTYPE || te->is_generic_param))
             e->tyop.te = te;
         else {
             p->pos = save;

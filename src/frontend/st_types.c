@@ -115,7 +115,16 @@ ST_ty_t *ST_ty_array(ST_ty_ctx_t *ctx, ST_ty_t *inner, u64 count) {
 }
 
 ST_ty_t *ST_ty_dyn_array(ST_ty_ctx_t *ctx, ST_ty_t *inner) {
-    return ST_ty_intern(ctx, ST_TY_DYN_ARRAY, inner, 0, 24, 8);
+    ST_ty_t *t = ST_ty_intern(ctx, ST_TY_DYN_ARRAY, inner, 0, 24, 8);
+    if (!t->fields.count) {
+        ST_ty_field_t items = {ST_cstr_to_str("items"), ST_ty_ptr(ctx, inner), 0};
+        ST_ty_field_t count = {ST_cstr_to_str("count"), ctx->prim[ST_ti64], 8};
+        ST_ty_field_t capacity = {ST_cstr_to_str("capacity"), ctx->prim[ST_ti64], 16};
+        ST_da_append_arena(ctx->arena, &t->fields, items);
+        ST_da_append_arena(ctx->arena, &t->fields, count);
+        ST_da_append_arena(ctx->arena, &t->fields, capacity);
+    }
+    return t;
 }
 
 ST_ty_t *ST_ty_fn_new(ST_ty_ctx_t *ctx) {
