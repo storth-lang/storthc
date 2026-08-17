@@ -16,6 +16,8 @@ typedef struct {
 typedef struct {
     ST_proc_opt_t opt;
     i32 id;
+    i32 exit_code;
+    b8 exited_normally;
 } ST_proc_t;
 
 typedef struct {

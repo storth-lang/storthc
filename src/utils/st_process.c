@@ -60,7 +60,9 @@ b8 ST_wait_process(ST_proc_t *proc) {
     proc->id = -1;
     if (r < 0)
         return 0;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    proc->exited_normally = WIFEXITED(status) ? 1 : 0;
+    proc->exit_code = proc->exited_normally ? WEXITSTATUS(status) : -1;
+    return proc->exited_normally && proc->exit_code == 0;
 }
 
 // TODO make customizable with reset or no reset.

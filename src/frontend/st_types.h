@@ -18,6 +18,7 @@ typedef enum {
     ST_TY_PTR,
     ST_TY_ARRAY,
     ST_TY_DYN_ARRAY,
+    ST_TY_SLICE,
     ST_TY_STRUCT,
     ST_TY_ENUM,
     ST_TY_TAG_UNION,
@@ -79,6 +80,7 @@ ST_ty_t *ST_ty_prim_named(ST_ty_ctx_t *ctx, ST_type_t t, ST_string_t name);
 ST_ty_t *ST_ty_ptr(ST_ty_ctx_t *ctx, ST_ty_t *inner);
 ST_ty_t *ST_ty_array(ST_ty_ctx_t *ctx, ST_ty_t *inner, u64 count);
 ST_ty_t *ST_ty_dyn_array(ST_ty_ctx_t *ctx, ST_ty_t *inner);
+ST_ty_t *ST_ty_slice(ST_ty_ctx_t *ctx, ST_ty_t *inner);
 ST_ty_t *ST_ty_fn_new(ST_ty_ctx_t *ctx);
 ST_ty_t *ST_ty_for_decls(ST_ty_ctx_t *ctx, ST_decl_t *d);
 

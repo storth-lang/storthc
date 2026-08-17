@@ -132,6 +132,17 @@ fn print_value(fd: i32, v: $V) {
             }
             io_write_byte(fd, ']' #as i8);
         }
+        case "slice" {
+            io_write_byte(fd, '[' #as i8);
+            for i: 0..v.len {
+                if i > 0 {
+                    io_write_byte(fd, ',' #as i8);
+                    io_write_byte(fd, ' ' #as i8);
+                }
+                print_value(fd, v.ptr[i]);
+            }
+            io_write_byte(fd, ']' #as i8);
+        }
         case "tag_union" {
             io_write_byte(fd, '{' #as i8);
             #for field, idx: #fields(v) {

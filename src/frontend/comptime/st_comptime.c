@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 ST_ct_val_t ST_ct_nil(void) { return (ST_ct_val_t){.kind = ST_CT_NIL}; }
@@ -33,6 +34,7 @@ void ST_ct_val_print(ST_ct_val_t v) {
         case ST_CT_STRING: printf("%.*s", (int)v.str.len, v.str.data); break;
         case ST_CT_PTR: printf("<ptr %p>", v.ptr); break;
         case ST_CT_NATIVE: printf("<native %p/%u>", v.native.fn, v.native.n_args); break;
+        case ST_CT_STRUCT: printf("<struct %u field%s>", v.st.n_fields, v.st.n_fields == 1 ? "" : "s"); break;
     }
 }
 
@@ -124,7 +126,11 @@ u32 ST_ct_emit_jump(ST_ct_chunk_t *c, ST_ct_op_t jump_op, u32 line) {
 }
 
 void ST_ct_patch_jump(ST_ct_chunk_t *c, u32 operand_offset) {
-    i64 target = (i64)c->count - (i64)(operand_offset + 4);
+    ST_ct_patch_jump_to(c, operand_offset, c->count);
+}
+
+void ST_ct_patch_jump_to(ST_ct_chunk_t *c, u32 operand_offset, u32 target_ip) {
+    i64 target = (i64)target_ip - (i64)(operand_offset + 4);
     ST_ct_patch_u32(c, operand_offset, (u32)(i32)target);
 }
 
@@ -133,6 +139,24 @@ void ST_ct_emit_loop(ST_ct_chunk_t *c, u32 loop_start, u32 line) {
     u32 operand_off = c->count;
     i64 target = (i64)loop_start - (i64)(operand_off + 4);
     ST_ct_write_u32(c, (u32)(i32)target, line);
+}
+
+u32 ST_ct_emit_call(ST_ct_chunk_t *c, u32 n_args, u32 line) {
+    ST_ct_write_byte(c, (u8)ST_OP_CALL, line);
+    u32 entry_ip_off = c->count;
+    ST_ct_write_u32(c, 0, line); // placeholder, patched via ST_ct_patch_call
+    ST_ct_write_u32(c, n_args, line);
+    return entry_ip_off;
+}
+
+void ST_ct_patch_call(ST_ct_chunk_t *c, u32 entry_ip_operand_offset, u32 entry_ip) {
+    ST_ct_patch_u32(c, entry_ip_operand_offset, entry_ip);
+}
+
+void ST_ct_emit_pack_struct(ST_ct_chunk_t *c, const u32 *field_sizes, u32 n_fields, u32 line) {
+    ST_ct_write_byte(c, (u8)ST_OP_PACK_STRUCT, line);
+    ST_ct_write_u32(c, n_fields, line);
+    ST_forrange(0, n_fields) ST_ct_write_u32(c, field_sizes[i], line);
 }
 
 void *ST_ct_lib_load(const char *path) {
@@ -175,6 +199,23 @@ i64 ST_ct_call_native(ST_ct_native_t fn, i64 *args, u32 n_args) {
 #else
     typedef i64 (*fn6)(i64, i64, i64, i64, i64, i64);
     return ((fn6)fn.fn)(a0, a1, a2, a3, a4, a5);
+#endif
+}
+
+static i64 ST_ct_do_syscall(i64 nr, i64 a0, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5) {
+#if defined(__x86_64__)
+    i64 ret;
+    register i64 r10_ __asm__("r10") = a3;
+    register i64 r8_ __asm__("r8") = a4;
+    register i64 r9_ __asm__("r9") = a5;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10_), "r"(r8_), "r"(r9_)
+                     : "rcx", "r11", "memory");
+    return ret;
+#else
+    (void)nr; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return -1;
 #endif
 }
 
@@ -335,14 +376,16 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
 
             case ST_OP_GET_LOCAL: {
                 u32 slot = ST_ct_read_u32(chunk, ip); ip += 4;
-                if (slot >= vm->sp) { ST_ct_fail(vm, line, "comptime: bad local slot"); break; }
-                ST_ct_push(vm, vm->stack[slot]);
+                u32 abs = vm->base + slot;
+                if (abs >= vm->sp) { ST_ct_fail(vm, line, "comptime: bad local slot"); break; }
+                ST_ct_push(vm, vm->stack[abs]);
                 break;
             }
             case ST_OP_SET_LOCAL: {
                 u32 slot = ST_ct_read_u32(chunk, ip); ip += 4;
-                if (slot >= vm->sp) { ST_ct_fail(vm, line, "comptime: bad local slot"); break; }
-                vm->stack[slot] = vm->stack[vm->sp - 1];
+                u32 abs = vm->base + slot;
+                if (abs >= vm->sp) { ST_ct_fail(vm, line, "comptime: bad local slot"); break; }
+                vm->stack[abs] = vm->stack[vm->sp - 1];
                 break;
             }
 
@@ -367,11 +410,16 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
             case ST_OP_LOAD_LIB: {
                 ST_ct_val_t path = ST_ct_pop(vm);
                 if (path.kind != ST_CT_STRING) { ST_ct_fail(vm, line, "comptime: lib path must be a string"); break; }
-                char buf[512];
-                u32 n = path.str.len < sizeof(buf) - 1 ? path.str.len : (u32)sizeof(buf) - 1;
-                memcpy(buf, path.str.data, n);
-                buf[n] = 0;
-                void *h = ST_ct_lib_load(buf);
+                void *h;
+                if (path.str.len == 0) {
+                    h = ST_ct_lib_load(NULL);
+                } else {
+                    char buf[512];
+                    u32 n = path.str.len < sizeof(buf) - 1 ? path.str.len : (u32)sizeof(buf) - 1;
+                    memcpy(buf, path.str.data, n);
+                    buf[n] = 0;
+                    h = ST_ct_lib_load(buf);
+                }
                 ST_ct_push(vm, h ? ST_ct_ptr(h) : ST_ct_nil());
                 break;
             }
@@ -407,6 +455,102 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 break;
             }
 
+            case ST_OP_NATIVE_ARG: {
+                ST_ct_val_t v = ST_ct_pop(vm);
+                if (v.kind == ST_CT_STRING) {
+                    char *buf = malloc((size_t)v.str.len + 1);
+                    if (!buf) { ST_ct_fail(vm, line, "comptime: out of memory"); break; }
+                    memcpy(buf, v.str.data, v.str.len);
+                    buf[v.str.len] = 0;
+                    ST_ct_push(vm, ST_ct_ptr(buf));
+                } else if (v.kind == ST_CT_STRUCT) {
+                    ST_ct_fail(vm, line,
+                              "comptime: passing a struct by value to an extern function "
+                              "isn't supported yet");
+                } else {
+                    ST_ct_push(vm, v);
+                }
+                break;
+            }
+
+            case ST_OP_SYSCALL: {
+                i64 vals[7];
+                for (i64 k = 6; k >= 0; k--) {
+                    ST_ct_val_t v = ST_ct_pop(vm);
+                    vals[k] = v.kind == ST_CT_INT ? v.i : (i64)(intptr_t)v.ptr;
+                }
+                i64 r = ST_ct_do_syscall(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+                                         vals[6]);
+                ST_ct_push(vm, ST_ct_int(r));
+                break;
+            }
+
+            case ST_OP_MAKE_STRUCT: {
+                u32 n = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t *fields = n ? malloc(sizeof(ST_ct_val_t) * n) : NULL;
+                if (n && !fields) { ST_ct_fail(vm, line, "comptime: out of memory"); break; }
+                for (i64 k = (i64)n - 1; k >= 0; k--)
+                    fields[k] = ST_ct_pop(vm);
+                ST_ct_val_t v;
+                v.kind = ST_CT_STRUCT;
+                v.st.fields = fields;
+                v.st.n_fields = n;
+                ST_ct_push(vm, v);
+                break;
+            }
+
+            case ST_OP_GET_FIELD: {
+                u32 idx = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t s = ST_ct_pop(vm);
+                if (s.kind != ST_CT_STRUCT) {
+                    ST_ct_fail(vm, line, "comptime: field access on a non-struct value");
+                    break;
+                }
+                if (idx >= s.st.n_fields) {
+                    ST_ct_fail(vm, line, "comptime: struct field index out of range");
+                    break;
+                }
+                ST_ct_push(vm, s.st.fields[idx]);
+                break;
+            }
+
+            case ST_OP_PACK_STRUCT: {
+                u32 n = ST_ct_read_u32(chunk, ip); ip += 4;
+                u32 sizes[64];
+                for (u32 k = 0; k < n; k++) {
+                    u32 sz = ST_ct_read_u32(chunk, ip); ip += 4;
+                    if (k < 64) sizes[k] = sz;
+                }
+                ST_ct_val_t s = ST_ct_pop(vm);
+                if (s.kind != ST_CT_STRUCT) {
+                    ST_ct_fail(vm, line, "comptime: expected a struct to pack for a native call");
+                    break;
+                }
+                u32 nn = n > 64 ? 64 : n;
+                u32 total = 0;
+                for (u32 k = 0; k < nn; k++) total += sizes[k];
+                if (total > 8) {
+                    ST_ct_fail(vm, line,
+                              "comptime: structs bigger than 8 bytes can't be passed by "
+                              "value to an extern function yet");
+                    break;
+                }
+                u64 packed = 0;
+                u32 offset = 0;
+                for (u32 k = 0; k < nn && k < s.st.n_fields; k++) {
+                    u64 raw = 0;
+                    ST_ct_val_t fv = s.st.fields[k];
+                    if (fv.kind == ST_CT_INT) raw = (u64)fv.i;
+                    else if (fv.kind == ST_CT_BOOL) raw = fv.b ? 1u : 0u;
+                    else if (fv.kind == ST_CT_PTR) raw = (u64)(uintptr_t)fv.ptr;
+                    u64 mask = sizes[k] >= 8 ? ~(u64)0 : (((u64)1 << (sizes[k] * 8)) - 1);
+                    packed |= (raw & mask) << (offset * 8);
+                    offset += sizes[k];
+                }
+                ST_ct_push(vm, ST_ct_int((i64)packed));
+                break;
+            }
+
             case ST_OP_COMP_ERROR: {
                 u32 nparts = ST_ct_read_u32(chunk, ip); ip += 4;
                 char msg[512] = {0};
@@ -436,14 +580,51 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 return vm->status;
             }
 
+            case ST_OP_CALL: {
+                u32 entry_ip = ST_ct_read_u32(chunk, ip); ip += 4;
+                u32 n_args = ST_ct_read_u32(chunk, ip); ip += 4;
+                if (n_args > vm->sp) { ST_ct_fail(vm, line, "comptime: bad call argument count"); break; }
+                if (vm->n_frames >= ST_CT_FRAMES_MAX) {
+                    ST_ct_fail(vm, line, "comptime: call stack too deep (max %u; likely runaway "
+                                        "recursion)", (u32)ST_CT_FRAMES_MAX);
+                    break;
+                }
+                vm->frames[vm->n_frames].return_ip = ip;
+                vm->frames[vm->n_frames].saved_base = vm->base;
+                vm->n_frames++;
+                vm->base = vm->sp - n_args;
+                ip = entry_ip;
+                break;
+            }
+
             case ST_OP_RETURN: {
-                ST_ct_val_t v = ST_ct_pop(vm);
-                if (out) *out = v;
-                return vm->status == ST_CT_OK ? ST_CT_OK : vm->status;
+                u32 n = ST_ct_read_u32(chunk, ip); ip += 4;
+                if (n > 8) { ST_ct_fail(vm, line, "comptime: too many return values"); break; }
+                ST_ct_val_t vals[8];
+                for (i64 k = (i64)n - 1; k >= 0; k--)
+                    vals[k] = ST_ct_pop(vm);
+                if (vm->n_frames == 0) {
+                    if (out) *out = n > 0 ? vals[0] : ST_ct_nil();
+                    return vm->status == ST_CT_OK ? ST_CT_OK : vm->status;
+                }
+                vm->n_frames--;
+                vm->sp = vm->base;
+                vm->base = vm->frames[vm->n_frames].saved_base;
+                ip = vm->frames[vm->n_frames].return_ip;
+                ST_forrange(0, n) ST_ct_push(vm, vals[i]);
+                break;
             }
             case ST_OP_HALT:
-                if (out) *out = ST_ct_nil();
-                return vm->status == ST_CT_OK ? ST_CT_OK : vm->status;
+                if (vm->n_frames == 0) {
+                    if (out) *out = ST_ct_nil();
+                    return vm->status == ST_CT_OK ? ST_CT_OK : vm->status;
+                }
+                vm->n_frames--;
+                vm->sp = vm->base;
+                vm->base = vm->frames[vm->n_frames].saved_base;
+                ip = vm->frames[vm->n_frames].return_ip;
+                ST_ct_push(vm, ST_ct_nil());
+                break;
 
             default:
                 ST_ct_fail(vm, line, "comptime: unknown opcode %d", (int)op);

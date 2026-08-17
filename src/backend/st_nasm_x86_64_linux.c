@@ -259,6 +259,8 @@ static u32 ST_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_int_re
         ST_ir_inst_t *arg = args->items[i];
         if (arg->ty && ST_ty_is_float(arg->ty)) {
             ST_fload(out, "xmm0", arg);
+            if (arg->ty->size == 4)
+                fprintf(out, "    cvtsd2ss xmm0, xmm0\n");
             fprintf(out, "    movsd [rsp+%u], xmm0\n", 8u * k);
         } else {
             ST_load(out, "rax", arg);
@@ -275,6 +277,8 @@ static u32 ST_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_int_re
         ST_ir_inst_t *arg = args->items[i];
         if (arg->ty && ST_ty_is_float(arg->ty)) {
             ST_fload(out, xmm_regs[float_idx], arg);
+            if (arg->ty->size == 4)
+                fprintf(out, "    cvtsd2ss %s, %s\n", xmm_regs[float_idx], xmm_regs[float_idx]);
             float_idx++;
         } else {
             ST_load(out, arg_regs[int_idx], arg);
@@ -550,13 +554,19 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
         } break;
         case ST_IR_PARAM: {
             if (in->ty && ST_ty_is_float(in->ty)) {
+                b8 narrow = in->ty->size == 4;
                 if (ctx->next_float_arg >= ST_N_XMM_REGS) {
-                    fprintf(out, "    movsd xmm0, [rbp+%u]\n", 16u + 8u * ctx->next_stack_arg);
+                    fprintf(out, "    %s xmm0, [rbp+%u]\n", narrow ? "movss" : "movsd",
+                            16u + 8u * ctx->next_stack_arg);
                     ctx->next_stack_arg++;
                 } else {
-                    fprintf(out, "movsd xmm0, %s\n", xmm_regs[ctx->next_float_arg]);
+                    fprintf(out, "%s xmm0, %s\n", narrow ? "movss" : "movsd",
+                            xmm_regs[ctx->next_float_arg]);
                     ctx->next_float_arg++;
                 }
+
+                if (narrow)
+                    fprintf(out, "    cvtss2sd xmm0, xmm0\n");
             } else {
                 u32 shift = ctx->hidden_ret_off ? 1 : 0;
                 u32 idx = ctx->next_int_arg + shift;
@@ -590,6 +600,14 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
                 fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
             } else if (rc > 2)
                 fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+            else if (rc == 1 && in->ty && ST_ty_is_float(in->ty) && in->ty->size == 4)
+                // The callee (with the return-side fix above) puts a real
+                // f32 value in the low 32 bits of xmm0 -- widen it back to
+                // this compiler's "everything lives as a double internally"
+                // invariant before the generic result-spill at the bottom
+                // of this function runs and blindly does 'movsd' assuming
+                // that invariant already holds.
+                fprintf(out, "    cvtss2sd xmm0, xmm0\n");
         } break;
         case ST_IR_CALL_INDIRECT: {
             u32 stack_bytes = 0;
@@ -599,6 +617,8 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             fputs("    call r10\n", out);
             if (stack_bytes)
                 fprintf(out, "    add rsp, %u\n", stack_bytes);
+            if (in->ty && ST_ty_is_float(in->ty) && in->ty->size == 4)
+                fprintf(out, "    cvtss2sd xmm0, xmm0\n");
         } break;
         case ST_IR_PHI:
             return;
@@ -739,15 +759,19 @@ static void ST_generate_term(FILE *out, ST_gen_ctx_t *ctx, ST_ir_block_t *b) {
                 fprintf(out, "    mov rax, r10\n");
             } else {
                 if (t->rets.count >= 1) {
-                    if (t->rets.items[0]->ty && ST_ty_is_float(t->rets.items[0]->ty))
+                    if (t->rets.items[0]->ty && ST_ty_is_float(t->rets.items[0]->ty)) {
                         ST_fload(out, "xmm0", t->rets.items[0]);
-                    else
+                        if (t->rets.items[0]->ty->size == 4)
+                            fprintf(out, "    cvtsd2ss xmm0, xmm0\n");
+                    } else
                         ST_load(out, "rax", t->rets.items[0]);
                 }
                 if (t->rets.count >= 2) {
-                    if (t->rets.items[1]->ty && ST_ty_is_float(t->rets.items[1]->ty))
+                    if (t->rets.items[1]->ty && ST_ty_is_float(t->rets.items[1]->ty)) {
                         ST_fload(out, "xmm1", t->rets.items[1]);
-                    else
+                        if (t->rets.items[1]->ty->size == 4)
+                            fprintf(out, "    cvtsd2ss xmm1, xmm1\n");
+                    } else
                         ST_load(out, "rdx", t->rets.items[1]);
                 }
             }

@@ -80,6 +80,7 @@ typedef enum {
     ST_EX_COMP_ERROR,
     ST_EX_ASM,
     ST_EX_STR_FROM_RAW,
+    ST_EX_PACK_FOLD,
     ST_EX_COUNT,
 } ST_expr_kind_t;
 
@@ -141,6 +142,13 @@ struct ST_expr_t {
             ST_string_t type_name;
             ST_tyexprs_t generic_args;
             ST_field_inits_t inits;
+            b8 is_bracket_lit; // '[a, b, c]' or '[]' - always means "slice
+                               // with these element values", distinct from
+                               // '{a, b, c}' which still means "sized/fixed
+                               // array" (or, on a bare '[]T' local
+                               // declaration specifically, may still get
+                               // read as the pre-existing array-size-
+                               // inference feature - see ST_check_decl_stmt)
         } struct_lit;
         struct {
             ST_tyexpr_t *te;
@@ -151,7 +159,7 @@ struct ST_expr_t {
             b8 is_align;
         } tyop;
         struct {
-            ST_exprs_t args; // '#comp_error(a, b, c)' -- concatenated into one diagnostic when reached
+            ST_exprs_t args; // '#comp_error(a, b, c)'
         } comp_error;
         struct {
             ST_token_t *tokens;
@@ -160,7 +168,11 @@ struct ST_expr_t {
         struct {
             ST_expr_t *ptr;
             ST_expr_t *len;
-        } str_from_raw; // 'str_from_raw(ptr, len)' -- builds a 'string' from a raw '*char' + length
+        } str_from_raw; // 'str_from_raw(ptr, len)'
+        struct {
+            ST_string_t pack_name;
+            ST_string_t op;
+        } pack_fold; // '(args OP ...)'
     };
 };
 
@@ -182,6 +194,7 @@ typedef enum {
     ST_ST_LABEL,
     ST_ST_GODOWN,
     ST_ST_ASM,
+    ST_ST_PACK_EXPAND,
     ST_ST_COUNT,
 } ST_stmt_kind_t;
 
@@ -239,14 +252,14 @@ struct ST_stmt_t {
             ST_expr_t *lo, *hi;
             ST_tyexpr_t *iter_te;
             b8 inclusive;
-            b8 is_comptime; // '#for' -- unrolled at compile time, not a real loop
+            b8 is_comptime; // '#for'
             ST_stmts_t body;
         } for_range;
         struct {
             ST_string_t iter;
             ST_string_t spec_iter; // optional second binding, len==0 if unused (see '#for' parsing)
             ST_expr_t *target;
-            b8 is_comptime; // '#for ch[, spec]: string_expr' -- unrolled at compile time
+            b8 is_comptime; // '#for ch[, spec]: string_expr'
             ST_stmts_t body;
         } for_array;
         struct {
@@ -312,7 +325,7 @@ typedef struct {
     ST_tyexpr_t *te;
     ST_expr_t *def;
     u32 line, col;
-    b8 is_pack; // 'name: any...' -- collects all trailing call args into a real array
+    b8 is_pack; // 'name: any...'
 } ST_param_t;
 
 typedef struct {
@@ -327,6 +340,7 @@ typedef struct {
     b8 is_variadic;   // raw C-ABI '...' (extern only)
     b8 has_any_pack;  // trailing 'name: any...' (non-extern; collected into an array)
     b8 has_generic_pack; // trailing 'name: $T...' (comptime; one synthetic param per call-site arg)
+    b8 is_comptime;   // trailing '#comptime'
     ST_strings_t generics;
 } ST_fn_sig_t;
 
@@ -354,6 +368,7 @@ struct ST_decl_t {
         struct {
             ST_tyexpr_t *te; // optional explicit type: 'NAME : type : expr;' (NULL if 'NAME :: expr;')
             ST_expr_t *value;
+            b8 is_comptime; // 'NAME :: #comptime expr;'
         } const_;
         struct {
             ST_fn_sig_t sig;

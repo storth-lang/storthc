@@ -244,12 +244,6 @@ static void ST_lower_scan_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_forrange(0, s->block.count) ST_lower_scan_stmt(c, s->block.items[i]);
             break;
         case ST_ST_ASM:
-            // @note: we don't know which identifiers inside the asm block
-            // are real locals vs. mnemonics/register names at this point
-            // (that's resolved later against the scope), so conservatively
-            // mark every bare identifier as address-taken. Marking a name
-            // that never gets declared is harmless (the hashtable entry
-            // just goes unused).
             ST_forrange(0, s->asm_.n_tokens) {
                 ST_token_t *t = &s->asm_.tokens[i];
                 if (t->kind == ST_TIDENT)
@@ -337,8 +331,10 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te) {
             return ST_ty_ptr(&c->sema->tys, ST_lower_tyexpr(c, te->inner));
         case ST_TE_ARRAY: {
             ST_ty_t *inner = ST_lower_tyexpr(c, te->inner);
-            if (!te->count_expr)
+            if (te->is_dynamic)
                 return ST_ty_dyn_array(&c->sema->tys, inner);
+            if (!te->count_expr)
+                return ST_ty_slice(&c->sema->tys, inner);
             u64 count = te->count_expr->kind == ST_EX_INT ? (u64)te->count_expr->ival : 0;
             return ST_ty_array(&c->sema->tys, inner, count);
         }
@@ -439,9 +435,6 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
     }
 }
 
-// Allocates a fresh temp slot, constructs into it, and returns its address
-// -- the generic fallback for a union-construct literal used as a plain
-// expression value (matches ST_lower_struct_addr's role for struct literals).
 static ST_ir_inst_t *ST_lower_union_construct_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, e->line, e->col);
     ST_lower_union_construct_into(c, slot, 0, e->ty, e);
@@ -455,12 +448,6 @@ static ST_ir_inst_t *ST_lower_string_lit_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
 }
 
 static ST_ir_inst_t *ST_lower_str_from_raw_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
-    // 'str_from_raw(ptr, len)' -- assembles a real 'string' value (a fresh
-    // local, ptr@0 / len@8, same layout ST_lower_string_copy already
-    // assumes) from a raw '*char' and an integer length. This is the one
-    // place a string's normally-read-only fields get written directly at
-    // the IR level -- the source-level restriction against 'x.ptr = ..'
-    // is a user-code invariant (see ST_check_assign), not a lowering one.
     ST_ir_inst_t *slot =
         ST_ir_alloca(c->fn, &c->sema->tys, c->sema->tys.prim[ST_tstring], e->line, e->col);
 
@@ -553,6 +540,17 @@ static void ST_lower_dyn_array_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 o
     }
 }
 
+static void ST_lower_fields_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST_ir_inst_t *src,
+                                 i32 soff, ST_ty_t *sty, u32 line, u32 col) {
+    ST_forrange(0, sty->fields.count) {
+        ST_ty_field_t *f = &sty->fields.items[i];
+        ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)f->offset, f->ty, line, col);
+        ST_ir_inst_t *v = ST_ir_load(c->cur, f->ty, sp, line, col);
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)f->offset, f->ty, line, col);
+        ST_ir_store(c->cur, f->ty, dp, v, line, col);
+    }
+}
+
 static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *st,
                                  u32 line, u32 col) {
     ST_forrange(0, st->fields.count) {
@@ -562,7 +560,7 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
             ST_lower_struct_zero(c, base, foff, f->ty, line, col);
         } else if (f->ty->kind == ST_TY_ARRAY) {
             ST_lower_array_zero(c, base, foff, f->ty, line, col);
-        } else if (f->ty->kind == ST_TY_DYN_ARRAY) {
+        } else if (f->ty->kind == ST_TY_DYN_ARRAY || f->ty->kind == ST_TY_SLICE) {
             ST_lower_dyn_array_zero(c, base, foff, f->ty, line, col);
         } else if (f->ty->kind == ST_TY_STRING) {
             ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
@@ -589,11 +587,6 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
     }
 }
 
-// Copies 'size' bytes as-is between two addresses, 8 bytes at a time (size
-// is always a multiple of 8 for anything this gets called on: tag_unions
-// are laid out {tag: i64, payload}, both 8-aligned). Used for tag_union
-// values, which -- unlike structs -- have no per-field layout to walk field
-// by field; the payload is opaque bytes as far as the copy is concerned.
 static void ST_lower_raw_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST_ir_inst_t *src,
                               i32 soff, u32 size, u32 line, u32 col) {
     ST_ty_t *chunk_ty = c->sema->tys.prim[ST_ti64];
@@ -604,6 +597,33 @@ static void ST_lower_raw_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST
         ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)off, chunk_ty, line, col);
         ST_ir_store(c->cur, chunk_ty, dp, v, line, col);
         off += 8;
+    }
+
+    u32 remaining = size - off;
+    if (remaining >= 4) {
+        ST_ty_t *t32 = c->sema->tys.prim[ST_ti32];
+        ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)off, t32, line, col);
+        ST_ir_inst_t *v = ST_ir_load(c->cur, t32, sp, line, col);
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)off, t32, line, col);
+        ST_ir_store(c->cur, t32, dp, v, line, col);
+        off += 4;
+        remaining -= 4;
+    }
+    if (remaining >= 2) {
+        ST_ty_t *t16 = c->sema->tys.prim[ST_ti16];
+        ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)off, t16, line, col);
+        ST_ir_inst_t *v = ST_ir_load(c->cur, t16, sp, line, col);
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)off, t16, line, col);
+        ST_ir_store(c->cur, t16, dp, v, line, col);
+        off += 2;
+        remaining -= 2;
+    }
+    if (remaining >= 1) {
+        ST_ty_t *t8 = c->sema->tys.prim[ST_ti8];
+        ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)off, t8, line, col);
+        ST_ir_inst_t *v = ST_ir_load(c->cur, t8, sp, line, col);
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)off, t8, line, col);
+        ST_ir_store(c->cur, t8, dp, v, line, col);
     }
 }
 
@@ -663,6 +683,29 @@ static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
                           ST_sv_args(f->name));
         }
     }
+}
+
+static void ST_lower_bracket_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *slot, ST_ty_t *slice_ty,
+                                      ST_expr_t *lit) {
+    u32 count = lit->struct_lit.inits.count;
+    ST_ty_t *ety = slice_ty->inner;
+
+    ST_ir_inst_t *arr_addr = NULL;
+    if (count > 0) {
+        ST_ty_t *arr_ty = ST_ty_array(&c->sema->tys, ety, count);
+        arr_addr = ST_ir_alloca(c->fn, &c->sema->tys, arr_ty, lit->line, lit->col);
+        ST_lower_array_lit_into(c, arr_addr, 0, arr_ty, lit);
+    }
+
+    ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ety);
+    ST_ir_inst_t *ptr_field = ST_lower_field_ptr(c, slot, 0, ptr_ty, lit->line, lit->col);
+    ST_ir_store(c->cur, ptr_ty, ptr_field,
+               arr_addr ? arr_addr : ST_ir_const_int(c->cur, ptr_ty, 0), lit->line, lit->col);
+
+    ST_ty_t *len_ty = c->sema->tys.prim[ST_ti64];
+    ST_ir_inst_t *len_field = ST_lower_field_ptr(c, slot, 8, len_ty, lit->line, lit->col);
+    ST_ir_store(c->cur, len_ty, len_field, ST_ir_const_int(c->cur, len_ty, (i64)count), lit->line,
+               lit->col);
 }
 
 static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *st,
@@ -869,13 +912,6 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
             break;
 
         case ST_EX_CALL:
-            // A call whose return type is an aggregate (struct/tag_union) or
-            // a string already yields a real address from ST_lower_call (it
-            // materializes the callee's returned eightbyte(s) into a fresh
-            // local -- see ST_lower_call). For a scalar-returning call
-            // there's no address to take; ST_lower_call returns a plain
-            // SSA value there and we fall through to the "can't take the
-            // address" error below, same as before.
             if (e->ty && (e->ty->kind == ST_TY_STRUCT || e->ty->kind == ST_TY_TAG_UNION ||
                          e->ty->kind == ST_TY_STRING))
                 return ST_lower_call(c, e);
@@ -903,7 +939,7 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
                                               e->col);
             }
 
-            if (bt->kind == ST_TY_DYN_ARRAY) {
+            if (bt->kind == ST_TY_DYN_ARRAY || bt->kind == ST_TY_SLICE) {
                 ST_ty_t *fty = NULL;
                 u32 foff = 0;
                 if (!ST_lower_field_find(bt, e->field.name, &fty, &foff)) {
@@ -1079,11 +1115,6 @@ static void ST_lower_const_struct_fields(ST_lower_ctx_t *c, ST_ir_global_var_t *
     }
 }
 
-// Named '::' constants aren't stored anywhere (they're folded into their use
-// sites), but '&N' needs a real address to hand back. The first time a
-// constant's address is taken, this materializes a same-named, initialized
-// global for it (reusing the exact same .data emission path as 'x := expr;'
-// globals) so every subsequent '&N' in the module reuses the same storage.
 static ST_ir_global_var_t *ST_lower_ensure_const_global(ST_lower_ctx_t *c, ST_sym_t *sym) {
     ST_ir_global_var_t *g = ST_ir_module_find_global(c->module, sym->name);
     if (g)
@@ -1173,6 +1204,38 @@ static ST_fn_sig_t *ST_lower_find_sig(ST_lower_ctx_t *c, ST_string_t name) {
     return NULL;
 }
 
+static b8 ST_lower_push_array_as_slice_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out, u32 *count,
+                                           ST_expr_t *re, ST_ty_t *pty) {
+    if (!re->ty || !pty)
+        return 0;
+    if (re->ty->kind != ST_TY_ARRAY || pty->kind != ST_TY_SLICE)
+        return 0;
+    if (re->ty->inner != pty->inner)
+        return 0;
+
+    ST_ir_inst_t *arr_addr = ST_lower_lvalue_addr(c, re);
+    if (!arr_addr)
+        return 0;
+
+    ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, pty, re->line, re->col);
+    ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, re->ty->inner);
+    ST_ir_inst_t *ptr_field = ST_lower_field_ptr(c, slot, 0, ptr_ty, re->line, re->col);
+    ST_ir_store(c->cur, ptr_ty, ptr_field, arr_addr, re->line, re->col);
+
+    ST_ty_t *len_ty = c->sema->tys.prim[ST_ti64];
+    ST_ir_inst_t *len_field = ST_lower_field_ptr(c, slot, 8, len_ty, re->line, re->col);
+    ST_ir_store(c->cur, len_ty, len_field, ST_ir_const_int(c->cur, len_ty, (i64)re->ty->count),
+               re->line, re->col);
+
+    u32 n_eb = ST_lower_eight_bytes_count(pty);
+    for (u32 k = 0; k < n_eb && k < 2; k++) {
+        ST_ty_t *ebty = ST_lower_eight_byte_ty(c, pty, k);
+        ST_ir_inst_t *fp = ST_lower_field_ptr(c, slot, (i32)(k * 8), ebty, re->line, re->col);
+        out[(*count)++] = ST_ir_load(c->cur, ebty, fp, re->line, re->col);
+    }
+    return 1;
+}
+
 static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_fn_sig_t *sig = NULL;
     b8 direct =
@@ -1180,14 +1243,6 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     if (direct)
         sig = ST_lower_find_sig(c, e->call.callee->name);
 
-    // @note: aggregate returns no longer need a hidden-pointer argument
-    // threaded through here -- ST_lower_register_fn already expands a
-    // single struct/tag_union return type into its real eightbyte-
-    // classified slots in fn_ty->rets, so the existing rc==1/rc==2/rc>2
-    // machinery in the CALL/RET codegen (untouched) handles placement,
-    // including the hidden-pointer convention for rc>2, on its own. All
-    // that's left for the caller to do is reassemble those register(s)
-    // back into a real local after the call -- see below.
     ST_ir_inst_t **args;
     u32 n_args;
 
@@ -1241,9 +1296,12 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
                 args[n_args++] = ST_ir_const_int(c->cur, c->sema->tys.prim[ST_ti32], 0);
                 continue;
             }
+            ST_ty_t *pty = ST_lower_tyexpr(c, sig->params.items[i].te);
+            if (ST_lower_push_array_as_slice_arg(c, args, &n_args, re, pty))
+                continue;
             if (re->ty && (re->ty->kind == ST_TY_STRUCT || re->ty->kind == ST_TY_STRING ||
                           re->ty->kind == ST_TY_TAG_UNION || re->ty->kind == ST_TY_ARRAY ||
-                          re->ty->kind == ST_TY_DYN_ARRAY))
+                          re->ty->kind == ST_TY_DYN_ARRAY || re->ty->kind == ST_TY_SLICE))
                 ST_lower_push_struct_arg(c, args, &n_args, re, re->ty);
             else
                 args[n_args++] = ST_lower_expr(c, re);
@@ -1257,7 +1315,7 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
             ST_expr_t *ae = e->call.args.items[i].value;
             if (ae->ty && (ae->ty->kind == ST_TY_STRUCT || ae->ty->kind == ST_TY_STRING ||
                           ae->ty->kind == ST_TY_TAG_UNION || ae->ty->kind == ST_TY_ARRAY ||
-                          ae->ty->kind == ST_TY_DYN_ARRAY))
+                          ae->ty->kind == ST_TY_DYN_ARRAY || ae->ty->kind == ST_TY_SLICE))
                 ST_lower_push_struct_arg(c, args, &idx, ae, ae->ty);
             else
                 args[idx++] = ST_lower_expr(c, ae);
@@ -1278,14 +1336,6 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
         result = ST_ir_call_indirect(c->cur, e->ty, ptr, args, n_args, e->line, e->col);
     }
 
-    // Aggregate result: 'result' is only the call's own generic SSA slot
-    // (eightbyte 0), same as any other multi-value return -- see
-    // ST_ST_MULTI_BIND's identical call_val/ST_ir_extract pattern. Copy
-    // every eightbyte the callee actually sent back (1, 2, or however many
-    // the hidden-pointer buffer holds for a large aggregate) into a real
-    // local and hand back its address, so this is usable anywhere an
-    // aggregate value/address is expected (decl init, struct copy,
-    // ST_lower_lvalue_addr, ...).
     if (e->ty && (e->ty->kind == ST_TY_STRUCT || e->ty->kind == ST_TY_TAG_UNION) &&
         e->ty->size > 0) {
         ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, e->line, e->col);
@@ -1674,6 +1724,12 @@ static void ST_lower_start_dead_block(ST_lower_ctx_t *c, u32 line, u32 col) {
 
 static void ST_lower_array_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *sty,
                                     ST_expr_t *lit) {
+    if (sty->kind != ST_TY_ARRAY) {
+        ST_diag_error(&c->diag, lit->line, lit->col,
+                      "internal: positional literal construction isn't lowered "
+                      "yet for this type");
+        return;
+    }
     ST_ty_t *ety = sty->inner;
     u32 esz = ety->size;
     ST_forrange(0, lit->struct_lit.inits.count) {
@@ -1727,12 +1783,7 @@ static void ST_lower_asm_emit_placeholder(ST_sb_t *sb, b8 is_addr, u32 idx) {
 }
 
 // @note: shared by the statement form (ST_lower_asm_stmt) and the
-// expression form (ST_lower_expr's ST_EX_ASM case) -- builds the
-// placeholder-substituted template text and ref list from a raw '#asm { .. }'
-// token blob, then emits the ST_IR_INLINE_ASM instruction. 'ty' is NULL for
-// the statement form (no result value, matches the previous behavior) or the
-// expression's type when used as a value -- see the backend's generic
-// "spill result to my slot" tail, which only fires when ty is non-void.
+// expression form (ST_lower_expr's ST_EX_ASM case)
 static ST_ir_inst_t *ST_lower_asm_tokens(ST_lower_ctx_t *c, ST_token_t *tokens, u32 n_tokens,
                                          ST_ty_t *ty, u32 line, u32 col) {
     ST_sb_t sb = {0};
@@ -1828,8 +1879,12 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 break;
             }
 
-            if (ty->kind == ST_TY_DYN_ARRAY && s->decl.init &&
-                s->decl.init->kind == ST_EX_STRUCT_LIT && !s->decl.init->struct_lit.type_name.len) {
+            b8 looks_like_infer_count_placeholder =
+                s->decl.te && s->decl.te->kind == ST_TE_ARRAY && !s->decl.te->is_dynamic &&
+                !s->decl.te->count_expr;
+            if (looks_like_infer_count_placeholder && s->decl.init &&
+                s->decl.init->kind == ST_EX_STRUCT_LIT && !s->decl.init->struct_lit.type_name.len &&
+                !s->decl.init->struct_lit.is_bracket_lit) {
                 u32 count = s->decl.init->struct_lit.inits.count;
                 ty = ST_ty_array(&c->sema->tys, ty->inner, count);
             }
@@ -1882,15 +1937,45 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 ST_lower_bind_addr(c, s->decl.name, slots, ty);
                 break;
             }
-            if (ty->kind == ST_TY_ARRAY || ty->kind == ST_TY_DYN_ARRAY) {
+            if (ty->kind == ST_TY_ARRAY || ty->kind == ST_TY_DYN_ARRAY ||
+                ty->kind == ST_TY_SLICE) {
                 ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->line, s->col);
-                if (ty->kind == ST_TY_DYN_ARRAY)
+                if (ty->kind == ST_TY_DYN_ARRAY || ty->kind == ST_TY_SLICE)
                     ST_lower_dyn_array_zero(c, slot, 0, ty, s->line, s->col);
                 else
                     ST_lower_array_zero(c, slot, 0, ty, s->line, s->col);
 
                 if (s->decl.init) {
-                    if (s->decl.init->kind == ST_EX_STRUCT_LIT)
+                    if (ty->kind == ST_TY_SLICE || ty->kind == ST_TY_DYN_ARRAY) {
+                        if (s->decl.init->kind == ST_EX_STRUCT_LIT &&
+                            s->decl.init->struct_lit.is_bracket_lit)
+                            ST_lower_bracket_lit_into(c, slot, ty, s->decl.init);
+                        else if (s->decl.init->kind == ST_EX_STRUCT_LIT)
+                            ST_lower_struct_lit_into(c, slot, 0, ty, s->decl.init);
+                        else if (ty->kind == ST_TY_SLICE && s->decl.init->ty &&
+                                s->decl.init->ty->kind == ST_TY_ARRAY &&
+                                s->decl.init->ty->inner == ty->inner) {
+                            ST_ir_inst_t *arr_addr = ST_lower_lvalue_addr(c, s->decl.init);
+                            if (arr_addr) {
+                                ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ty->inner);
+                                ST_ir_inst_t *ptr_field =
+                                    ST_lower_field_ptr(c, slot, 0, ptr_ty, s->line, s->col);
+                                ST_ir_store(c->cur, ptr_ty, ptr_field, arr_addr, s->line, s->col);
+
+                                ST_ty_t *len_ty = c->sema->tys.prim[ST_ti64];
+                                ST_ir_inst_t *len_field =
+                                    ST_lower_field_ptr(c, slot, 8, len_ty, s->line, s->col);
+                                ST_ir_store(c->cur, len_ty, len_field,
+                                           ST_ir_const_int(c->cur, len_ty,
+                                                          (i64)s->decl.init->ty->count),
+                                           s->line, s->col);
+                            }
+                        } else {
+                            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->decl.init);
+                            if (src)
+                                ST_lower_fields_copy(c, slot, 0, src, 0, ty, s->line, s->col);
+                        }
+                    } else if (s->decl.init->kind == ST_EX_STRUCT_LIT)
                         ST_lower_array_lit_into(c, slot, 0, ty, s->decl.init);
                     else {
                         ST_ir_inst_t *src = ST_lower_lvalue_addr(c, s->decl.init);
@@ -2063,14 +2148,6 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             u32 n_vals;
 
             if (agg_ret) {
-                // Split the single aggregate return value into its real
-                // eightbyte-classified register slots -- same technique as
-                // ST_lower_push_struct_arg for arguments -- so 'vals' lines
-                // up 1:1 with the synthetic entries ST_lower_register_fn
-                // already put in this function's fn_ty->rets, and the
-                // existing rax/xmm0 (+rdx/xmm1, +hidden-pointer-buffer)
-                // RET terminator codegen places them correctly with no
-                // further changes needed there.
                 ST_ty_t *st = s->ret.values.items[0]->ty;
                 ST_ir_inst_t *addr = ST_lower_struct_addr(c, s->ret.values.items[0], st);
                 u32 n_eb = ST_lower_eight_bytes_count(st);
@@ -2404,7 +2481,8 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 elem_ty = tt->inner;
                 data_ptr = ST_lower_lvalue_addr(c, target);
                 len_v = ST_ir_const_int(c->cur, ity, (i64)tt->count);
-            } else if (tt->kind == ST_TY_DYN_ARRAY || tt->kind == ST_TY_STRING) {
+            } else if (tt->kind == ST_TY_DYN_ARRAY || tt->kind == ST_TY_SLICE ||
+                      tt->kind == ST_TY_STRING) {
                 elem_ty = tt->kind == ST_TY_STRING ? c->sema->tys.prim[ST_tchar] : tt->inner;
                 ST_ir_inst_t *base = tt->kind == ST_TY_STRING ? ST_lower_string_addr(c, target)
                                                                : ST_lower_lvalue_addr(c, target);
@@ -2619,17 +2697,6 @@ static ST_ir_fn_t *ST_lower_register_fn(ST_lower_ctx_t *c, ST_string_t name, ST_
         ST_da_append_arena(c->arena, &fn_ty->params, pt);
     }
 
-    // @note: a single 'struct'/'tag_union' return value is expanded into its
-    // real eightbyte-classified register slots here (same classification
-    // ST_lower_push_struct_arg already uses for struct arguments), rather
-    // than being kept as one raw aggregate type. This lets every existing
-    // 'rets.count'-driven mechanism downstream -- the 1/2/>2 register
-    // placement in the RET terminator, the rc==2 rax:rdx reassembly and
-    // rc>2 hidden-pointer convention in the CALL codegen, and ST_ir_extract
-    // consumption at call sites -- handle aggregate returns for free,
-    // without ever needing to distinguish "one struct" from "N declared
-    // return values". Not extern: the C ABI's own struct-return rules are
-    // out of scope here and extern_fn keeps the plain 1:1 mapping.
     if (!is_extern && sig->rets.count == 1) {
         ST_ty_t *rt = ST_lower_tyexpr(c, sig->rets.items[0]);
         if (rt && (rt->kind == ST_TY_STRUCT || rt->kind == ST_TY_TAG_UNION ||
@@ -2726,22 +2793,14 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
     c->cur = entry;
     u32 param_index = 0;
 
-    // Pass 1: determine each param's slot count/types and read every one of
-    // them via ST_ir_param immediately, contiguously -- no alloca, no zero-
-    // init, no store, nothing else emitted until every incoming argument
-    // register has been read into an SSA value. The backend materializes
-    // ST_IR_PARAM lazily (reads its ABI register only when the codegen loop
-    // reaches that instruction) and freely reuses registers like rcx as
-    // scratch in between -- interleaving bookkeeping with these reads left
-    // a window where a later param's own address-computation scratch could
-    // clobber an earlier param's still-unread argument register.
     u32 total_slots = 0;
     ST_forrange(0, d->fn.sig.params.count) {
         ST_ty_t *pty = fn_ty->params.items[i];
         if (pty && pty->kind == ST_TY_STRING)
             total_slots += 2;
         else if (pty && (pty->kind == ST_TY_STRUCT || pty->kind == ST_TY_TAG_UNION ||
-                        pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY)) {
+                        pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
+                        pty->kind == ST_TY_SLICE)) {
             if (pty->size > 16 || pty->size <= 8)
                 total_slots += 1;
             else
@@ -2761,7 +2820,8 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
             raw[raw_n++] = ST_ir_param(entry, c->sema->tys.prim[ST_ti64], param_index + 1, p->name);
             param_index += 2;
         } else if (pty && (pty->kind == ST_TY_STRUCT || pty->kind == ST_TY_TAG_UNION ||
-                          pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY)) {
+                          pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
+                          pty->kind == ST_TY_SLICE)) {
             if (pty->size > 16) {
                 raw[raw_n++] = ST_ir_param(entry, ST_ty_ptr(&c->sema->tys, pty), param_index, p->name);
                 param_index++;
@@ -2788,10 +2848,6 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
         }
     }
 
-    // Pass 2: now do all the alloca/zero-init/field-store/bind bookkeeping,
-    // consuming the values already captured in 'raw' -- freely using
-    // rax/rcx/etc as scratch here is safe, since no argument register still
-    // holds an unread value by this point.
     raw_n = 0;
     ST_forrange(0, d->fn.sig.params.count) {
         ST_param_t *p = &d->fn.sig.params.items[i];
@@ -2814,7 +2870,8 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
             ST_lower_bind_addr(c, p->name, slot, pty);
             continue;
         }
-        if (pty && (pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY)) {
+        if (pty && (pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
+                   pty->kind == ST_TY_SLICE)) {
             ST_ir_inst_t *slot = ST_ir_alloca(fn, &c->sema->tys, pty, d->line, d->col);
             if (pty->size > 16) {
                 ST_ir_inst_t *ptr = raw[raw_n++];

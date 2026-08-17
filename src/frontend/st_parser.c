@@ -26,6 +26,8 @@ static b8 ST_tok_is_ident(ST_token_t *t) {
     return t && t->kind == ST_TIDENT;
 }
 
+static b8 ST_is_fold_op(ST_string_t s); // defined below ST_prec, used earlier by ST_parse_primary
+
 static b8 ST_at_symbol(ST_parser_t *p, const char *s) {
     return ST_tok_is_symbol(ST_peek(p), s);
 }
@@ -622,14 +624,51 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
     }
 
     if (ST_tok_is_symbol(t, "[")) {
-        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_ARRAY_NEW, t->line, t->col);
-        e->array_new.te = ST_parse_type(p);
-        if (!e->array_new.te)
-            return NULL;
-        if (e->array_new.te->kind != ST_TE_ARRAY) {
-            ST_perr_tok(p, t, "expected an array type like [4]i64 or [..]i64");
-            return NULL;
+        // Disambiguate '[' in expression position between the existing
+        // "type used as a value" form ('[5]i32', '[..]i32', '[]i32' - a
+        // fresh zero-valued instance of that type) and the new bracket
+        // literal form ('[a, b, c]' or empty '[]', building a slice
+        // with explicit element values - always a slice, distinct from
+        // '{a, b, c}' which still means "sized/fixed array"). Both
+        // start identically and only diverge at what follows the
+        // closing ']': a type name (the existing form) or anything
+        // else (a bracket literal). ST_try_type already exists
+        // specifically for this kind of speculative, roll-back-on-
+        // failure parse - a non-NULL ST_TE_ARRAY result from it already
+        // guarantees the whole '[...]TYPE' shape parsed, trailing type
+        // included (ST_parse_type's own array case requires its inner
+        // type to resolve or the whole thing fails) - so success here
+        // is a safe, unambiguous signal to keep the existing behavior.
+        ST_tyexpr_t *te = ST_try_type(p);
+        if (te && te->kind == ST_TE_ARRAY) {
+            ST_expr_t *e = ST_expr_new(p->arena, ST_EX_ARRAY_NEW, t->line, t->col);
+            e->array_new.te = te;
+            return e;
         }
+
+        // Bracket literal: '[' (expr (',' expr)*)? ']'. Reuses the same
+        // AST shape '{...}' already uses (ST_field_inits_t, a
+        // positional list), tagged via is_bracket_lit so semantic
+        // analysis/lowering can tell the two forms apart.
+        p->pos++; // consume '['
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_STRUCT_LIT, t->line, t->col);
+        e->struct_lit.is_bracket_lit = 1;
+        if (!ST_at_symbol(p, "]")) {
+            while (1) {
+                ST_expr_t *v = ST_parse_expr(p);
+                if (!v)
+                    return NULL;
+                ST_field_init_t fi = {.value = v, .line = v->line, .col = v->col};
+                ST_da_append_arena(p->arena, &e->struct_lit.inits, fi);
+                if (ST_at_symbol(p, ",")) {
+                    p->pos++;
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!ST_expect_sym(p, "]"))
+            return NULL;
         return e;
     }
 
@@ -678,6 +717,20 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
     }
 
     if (ST_tok_is_symbol(t, "(")) {
+        ST_token_t *t1 = ST_tok_at(p, p->pos + 1);
+        ST_token_t *t2 = ST_tok_at(p, p->pos + 2);
+        ST_token_t *t3 = ST_tok_at(p, p->pos + 3);
+        ST_token_t *t4 = ST_tok_at(p, p->pos + 4);
+        if (t1 && t1->kind == ST_TIDENT && t2 && t2->kind == ST_TSYMBOL &&
+            ST_is_fold_op(t2->text) && t3 && ST_tok_is_symbol(t3, "...") && t4 &&
+            ST_tok_is_symbol(t4, ")")) {
+            ST_expr_t *e = ST_expr_new(p->arena, ST_EX_PACK_FOLD, t->line, t->col);
+            e->pack_fold.pack_name = t1->text;
+            e->pack_fold.op = t2->text;
+            p->pos += 5; // consume '(' IDENT OP '...' ')'
+            return e;
+        }
+
         p->pos++;
         u32 save = p->no_struct_lit;
         p->no_struct_lit = 0;
@@ -773,6 +826,19 @@ static const ST_prec_level_t ST_prec[] = {
 
 #define ST_N_PREC ST_array_len(ST_prec)
 
+static b8 ST_is_fold_op(ST_string_t s) {
+    for (u32 lvl = 0; lvl < ST_N_PREC; lvl++) {
+        for (u32 k = 0; ST_prec[lvl].ops[k]; k++) {
+            const char *op = ST_prec[lvl].ops[k];
+            if (op[0] >= 'a' && op[0] <= 'z')
+                continue;
+            if (ST_string_eq_cstr(s, op))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static const char *ST_match_binop(ST_parser_t *p, u32 level) {
     ST_token_t *t = ST_peek(p);
     if (!t)
@@ -866,6 +932,7 @@ static b8 ST_is_lvalue(ST_expr_t *e) {
         case ST_EX_COMP_ERROR:
         case ST_EX_ASM:
         case ST_EX_STR_FROM_RAW:
+        case ST_EX_PACK_FOLD:
         case ST_EX_COUNT:
             return 0;
     }
@@ -874,9 +941,6 @@ static b8 ST_is_lvalue(ST_expr_t *e) {
 
 static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime);
 
-// Handles whatever follows an if/switch's own body (brace or 'then' form):
-// an optional 'else'/'#else', itself either another if ('else if ...'),
-// a braced block, or -- new -- a single inline 'else then STMT;' statement.
 static ST_stmt_t *ST_parse_if_else(ST_parser_t *p, ST_stmt_t *s, b8 is_comptime) {
     if (ST_at_keyword(p, "else") || ST_at_symbol(p, "#else")) {
         ST_token_t *et = ST_peek(p);
@@ -956,10 +1020,6 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime) {
                 continue;
             }
             ST_token_t *ct = ST_peek(p);
-            // '#case'/'#default' are accepted as plain synonyms for
-            // 'case'/'default' -- purely for readability inside a '#if'
-            // body (so the whole construct visually reads as comptime),
-            // they don't carry any meaning of their own.
             b8 is_case = ST_tok_is_keyword(ct, "case") || ST_tok_is_symbol(ct, "#case");
             b8 is_default = ST_tok_is_keyword(ct, "default") || ST_tok_is_symbol(ct, "#default");
             if (!is_case && !is_default) {
@@ -978,8 +1038,6 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime) {
                 ST_da_append_arena(p->arena, &c.values, v);
             }
             if (ST_at_symbol(p, ":") || ST_at_then(p)) {
-                // 'case Label: stmt;' / 'case Label then stmt;' -- a single
-                // statement, no block braces either way.
                 p->pos++;
                 ST_stmt_t *one = ST_parse_stmt(p);
                 if (!one)
@@ -1483,6 +1541,15 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
+    if (ST_at_symbol(p, "...")) {
+        p->pos++;
+        ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_PACK_EXPAND, e->line, e->col);
+        s->expr = e;
+        if (!ST_expect_semi(p))
+            return NULL;
+        return s;
+    }
+
     ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_EXPR, e->line, e->col);
     s->expr = e;
     if (!ST_expect_semi(p))
@@ -1818,6 +1885,14 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             ST_da_append_arena(p->arena, &sig->rets, te);
         }
     }
+    if (ST_at_symbol(p, "#comptime")) {
+        if (is_extern) {
+            ST_perr_here(p, "'#comptime' cannot be used on an 'extern fn' (it has no body to interpret)");
+            return 0;
+        }
+        p->pos++;
+        sig->is_comptime = 1;
+    }
     return 1;
 }
 
@@ -1871,6 +1946,10 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         if (!ST_expect_sym(p, "::"))
             return NULL;
+        if (ST_at_symbol(p, "#comptime")) {
+            p->pos++;
+            d->const_.is_comptime = 1;
+        }
         d->const_.value = ST_parse_expr(p);
         if (!d->const_.value)
             return NULL;
@@ -1884,6 +1963,10 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         d->is_pub = is_pub;
         d->name = t->text;
         p->pos += 2;
+        if (ST_at_symbol(p, "#comptime")) {
+            p->pos++;
+            d->const_.is_comptime = 1;
+        }
         d->const_.value = ST_parse_expr(p);
         if (!d->const_.value)
             return NULL;
@@ -1910,12 +1993,16 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         if (!te)
             return NULL;
         if (ST_at_symbol(p, ":")) {
-            // 'x : T : expr;' -- typed constant.
+            // 'x : T : expr;'
             p->pos++;
             ST_decl_t *d = ST_decl_new(p->arena, ST_DE_CONST, nt->line, nt->col);
             d->is_pub = is_pub;
             d->name = nt->text;
             d->const_.te = te;
+            if (ST_at_symbol(p, "#comptime")) {
+                p->pos++;
+                d->const_.is_comptime = 1;
+            }
             d->const_.value = ST_parse_expr(p);
             if (!d->const_.value)
                 return NULL;
@@ -1923,7 +2010,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
                 return NULL;
             return d;
         }
-        // 'x : T = expr;' or 'x : T;' -- typed (optionally zero-init) global.
+        // 'x : T = expr;' or 'x : T;'
         ST_decl_t *d = ST_decl_new(p->arena, ST_DE_GLOBAL, nt->line, nt->col);
         d->is_pub = is_pub;
         d->name = nt->text;

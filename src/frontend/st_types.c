@@ -127,6 +127,17 @@ ST_ty_t *ST_ty_dyn_array(ST_ty_ctx_t *ctx, ST_ty_t *inner) {
     return t;
 }
 
+ST_ty_t *ST_ty_slice(ST_ty_ctx_t *ctx, ST_ty_t *inner) {
+    ST_ty_t *t = ST_ty_intern(ctx, ST_TY_SLICE, inner, 0, 16, 8);
+    if (!t->fields.count) {
+        ST_ty_field_t ptr = {ST_cstr_to_str("ptr"), ST_ty_ptr(ctx, inner), 0};
+        ST_ty_field_t len = {ST_cstr_to_str("len"), ctx->prim[ST_ti64], 8};
+        ST_da_append_arena(ctx->arena, &t->fields, ptr);
+        ST_da_append_arena(ctx->arena, &t->fields, len);
+    }
+    return t;
+}
+
 ST_ty_t *ST_ty_fn_new(ST_ty_ctx_t *ctx) {
     return ST_ty_alloc(ctx, ST_TY_FN, 8, 8);
 }
@@ -251,6 +262,10 @@ static void ST_ty_dump(ST_sb_t *sb, ST_ty_t *t) {
             ST_append_to_builder(sb, "[..]");
             ST_ty_dump(sb, t->inner);
             break;
+        case ST_TY_SLICE:
+            ST_append_to_builder(sb, "[]");
+            ST_ty_dump(sb, t->inner);
+            break;
         case ST_TY_STRUCT:
         case ST_TY_ENUM:
         case ST_TY_TAG_UNION: {
@@ -364,6 +379,11 @@ static void ST_ty_mangle_sb(ST_sb_t *sb, ST_ty_t *t) {
 
         case ST_TY_DYN_ARRAY:
             ST_append_to_builder(sb, "da_");
+            ST_ty_mangle_sb(sb, t->inner);
+            break;
+
+        case ST_TY_SLICE:
+            ST_append_to_builder(sb, "sl_");
             ST_ty_mangle_sb(sb, t->inner);
             break;
 

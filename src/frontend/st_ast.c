@@ -245,6 +245,10 @@ void ST_dump_expr(FILE *out, ST_expr_t *e, u32 depth) {
             fprintf(out, "comp_error\n");
             ST_forrange(0, e->comp_error.args.count) ST_dump_expr(out, e->comp_error.args.items[i], depth + 1);
             break;
+        case ST_EX_PACK_FOLD:
+            fprintf(out, "pack_fold (" ST_sv_fmt " " ST_sv_fmt " ...)\n",
+                    ST_sv_args(e->pack_fold.pack_name), ST_sv_args(e->pack_fold.op));
+            break;
         case ST_EX_COUNT:
             ST_assert(0);
             break;
@@ -264,6 +268,10 @@ void ST_dump_stmt(FILE *out, ST_stmt_t *s, u32 depth) {
     switch (s->kind) {
         case ST_ST_EXPR:
             fprintf(out, "expr_stmt\n");
+            ST_dump_expr(out, s->expr, depth + 1);
+            break;
+        case ST_ST_PACK_EXPAND:
+            fprintf(out, "pack_expand_stmt\n");
             ST_dump_expr(out, s->expr, depth + 1);
             break;
         case ST_ST_DECL:
