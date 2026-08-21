@@ -427,8 +427,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                 name = "dyn_array"; // [..]T for any T; distinct from "array" since it has
                                     // items/count/capacity fields, not #fields() elements
             else if (t->kind == ST_TY_SLICE)
-                name = "slice"; // []T for any T; distinct from "dyn_array" since it has
-                                // ptr/len fields (no capacity), not items/count/capacity
+                name = "slice";
             else if (t->kind == ST_TY_PTR)
                 name = "ptr"; // *T for any T, including *void (what 'null' resolves to
                               // with no other context) and *fn(...)->... function pointers

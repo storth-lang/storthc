@@ -341,6 +341,40 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
     }
     if (t->kind == ST_TTYPE || ST_tok_is_ident(t)) {
         p->pos++;
+        if (ST_tok_is_ident(t) && ST_at_symbol(p, ".") && ST_tok_is_ident(ST_peek2(p))) {
+            ST_string_t alias = t->text;
+            p->pos++; // consume '.'
+            ST_token_t *nt = ST_peek(p);
+            p->pos++; // consume the qualified name
+            if (ST_at_symbol(p, "(")) {
+                ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_GENERIC_INST, nt->line, nt->col);
+                te->name = nt->text;
+                te->module_alias = alias;
+                p->pos++;
+                while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
+                    if (ST_at_symbol(p, ",")) {
+                        p->pos++;
+                        continue;
+                    }
+                    ST_tyexpr_t *arg = ST_parse_type(p);
+                    if (!arg)
+                        return NULL;
+                    ST_da_append_arena(p->arena, &te->generic_args, arg);
+                }
+                if (!ST_expect_sym(p, ")"))
+                    return NULL;
+                if (te->generic_args.count == 0) {
+                    ST_perr_tok(p, nt, "'" ST_sv_fmt " ()' needs at least one type argument",
+                                ST_sv_args(nt->text));
+                    return NULL;
+                }
+                return te;
+            }
+            ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_NAME, t->line, t->col);
+            te->name = nt->text;
+            te->module_alias = alias;
+            return te;
+        }
         if (ST_at_symbol(p, "(")) {
             ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_GENERIC_INST, t->line, t->col);
             te->name = t->text;
@@ -624,21 +658,6 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
     }
 
     if (ST_tok_is_symbol(t, "[")) {
-        // Disambiguate '[' in expression position between the existing
-        // "type used as a value" form ('[5]i32', '[..]i32', '[]i32' - a
-        // fresh zero-valued instance of that type) and the new bracket
-        // literal form ('[a, b, c]' or empty '[]', building a slice
-        // with explicit element values - always a slice, distinct from
-        // '{a, b, c}' which still means "sized/fixed array"). Both
-        // start identically and only diverge at what follows the
-        // closing ']': a type name (the existing form) or anything
-        // else (a bracket literal). ST_try_type already exists
-        // specifically for this kind of speculative, roll-back-on-
-        // failure parse - a non-NULL ST_TE_ARRAY result from it already
-        // guarantees the whole '[...]TYPE' shape parsed, trailing type
-        // included (ST_parse_type's own array case requires its inner
-        // type to resolve or the whole thing fails) - so success here
-        // is a safe, unambiguous signal to keep the existing behavior.
         ST_tyexpr_t *te = ST_try_type(p);
         if (te && te->kind == ST_TE_ARRAY) {
             ST_expr_t *e = ST_expr_new(p->arena, ST_EX_ARRAY_NEW, t->line, t->col);
@@ -646,11 +665,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             return e;
         }
 
-        // Bracket literal: '[' (expr (',' expr)*)? ']'. Reuses the same
-        // AST shape '{...}' already uses (ST_field_inits_t, a
-        // positional list), tagged via is_bracket_lit so semantic
-        // analysis/lowering can tell the two forms apart.
-        p->pos++; // consume '['
+        p->pos++;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_STRUCT_LIT, t->line, t->col);
         e->struct_lit.is_bracket_lit = 1;
         if (!ST_at_symbol(p, "]")) {
@@ -1936,6 +1951,24 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             d->is_pub = is_pub;
         return d;
     }
+    if (ST_tok_is_keyword(t, "using") && ST_tok_is_ident(ST_peek2(p))) {
+        p->pos++;
+        ST_string_t name = ST_expect_ident(p, "a type alias name after 'using'");
+        if (!name.len)
+            return NULL;
+        if (!ST_expect_sym(p, "="))
+            return NULL;
+        ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TYPE_ALIAS, t->line, t->col);
+        d->is_pub = is_pub;
+        d->name = name;
+        d->type_alias.te = ST_parse_type(p);
+        if (!d->type_alias.te)
+            return NULL;
+        if (!ST_expect_semi(p))
+            return NULL;
+        return d;
+    }
+
     if (ST_tok_is_keyword(t, "const")) {
         p->pos++;
         t = ST_peek(p);

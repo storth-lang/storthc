@@ -10,11 +10,6 @@
 #include "st_load.h"
 #include "st_parser.h"
 
-// ---------------------------------------------------------------------
-// Small path helpers (mirrors the equivalents used by '#load' in
-// st_load.c, which are file-local there and not worth exposing).
-// ---------------------------------------------------------------------
-
 static char *ST_mod_cstr(ST_arena_t *a, ST_string_t s) {
     char *buf = ST_arena_push(a, s.len + 1);
     memcpy(buf, s.data, s.len);
@@ -42,9 +37,6 @@ static ST_string_t ST_mod_join(ST_arena_t *a, const char *dir, ST_string_t rel) 
     return (ST_string_t){.data = buf, .len = total};
 }
 
-// Tries '<dir>/modules/<name>/module.st', then '$STORTHC_MODULE_PATH/<name>/module.st',
-// then '/usr/local/storthc/modules/<name>/module.st'. Returns an absolute,
-// NUL-terminated-backed path on success.
 static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_t name,
                          ST_string_t *out_path) {
     ST_string_t rel = {0};
@@ -104,10 +96,6 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     return 0;
 }
 
-// ---------------------------------------------------------------------
-// Per-module bookkeeping.
-// ---------------------------------------------------------------------
-
 typedef struct {
     ST_string_t canon_path;
     ST_string_t prefix;
@@ -148,19 +136,8 @@ static ST_string_t ST_mangle(ST_arena_t *a, ST_string_t prefix, ST_string_t name
     return (ST_string_t){.data = buf, .len = total};
 }
 
-// Sentinel value for an auto-exposed name that turned out ambiguous (two or
-// more imported modules export the same bare name). It stays present in the
-// map -- rather than being removed -- specifically so the lookup in
-// ST_modrw_expr can tell "not exposed by anything" apart from "exposed by
-// more than one thing, must be qualified", without a second table.
 #define ST_MOD_AMBIGUOUS ((ST_string_t *)1)
 
-// Merges one freshly-resolved import's public exports into the importing
-// file's shared 'auto_exposed' map, so a name unique across all of that
-// file's imports can be used bare (no 'alias.' prefix needed), while a name
-// exported by more than one import falls back to requiring qualification
-// rather than silently picking whichever import happened to be processed
-// first.
 static void ST_mod_merge_exports(ST_arena_t *arena, ST_ht_t *auto_exposed,
                                  ST_module_entry_t *dep) {
     ST_forrange(0, dep->exports.capacity) {
@@ -174,9 +151,6 @@ static void ST_mod_merge_exports(ST_arena_t *arena, ST_ht_t *auto_exposed,
         if (existing.tag == (void *)ST_MOD_AMBIGUOUS)
             continue; // already known-ambiguous, stays that way
         if (existing.tag && existing.tag != (void *)mangled) {
-            // Second (or later) module exporting this same bare name --
-            // mark ambiguous instead of overwriting with whichever export
-            // happens to be seen now.
             ST_ht_generic_t *hk = ST_arena_push(arena, sizeof(*hk));
             hk->tag = bare.data;
             hk->size = bare.len;
@@ -192,13 +166,6 @@ static void ST_mod_merge_exports(ST_arena_t *arena, ST_ht_t *auto_exposed,
     }
 }
 
-// ---------------------------------------------------------------------
-// Rewrite pass: applies a module's self-renames (bare top-level name ->
-// mangled name) and cross-module rewrites ('alias.member' -> mangled
-// ident) to every expression/statement/type-expr it contains. Mirrors the
-// shape of the clone_* walkers in st_semantic.c, but mutates in place.
-// ---------------------------------------------------------------------
-
 typedef struct {
     ST_module_ctx_t *ctx;
     ST_ht_t *self_renames;   // bare name -> ST_string_t* (this file's own decls)
@@ -212,10 +179,42 @@ static void ST_modrw_stmt(ST_module_rw_t *rw, ST_stmt_t *s);
 static void ST_modrw_tyexpr(ST_module_rw_t *rw, ST_tyexpr_t *te) {
     if (!te)
         return;
-    if (te->kind == ST_TE_NAME) {
-        ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(te->name));
-        if (r.tag)
-            te->name = *(ST_string_t *)r.tag;
+    if (te->kind == ST_TE_NAME || te->kind == ST_TE_GENERIC_INST) {
+        if (te->module_alias.len) {
+            ST_ht_generic_t mr = ST_ht_get(rw->import_aliases, ST_mod_key(te->module_alias));
+            if (!mr.tag) {
+                ST_diag_error(rw->ctx->diag, te->line, te->col,
+                              "unknown module '" ST_sv_fmt "'", ST_sv_args(te->module_alias));
+                te->module_alias = (ST_string_t){0};
+            } else {
+                ST_module_entry_t *dep = mr.tag;
+                ST_ht_generic_t exp = ST_ht_get(&dep->exports, ST_mod_key(te->name));
+                if (!exp.tag) {
+                    ST_ht_generic_t any = ST_ht_get(&dep->all_decls, ST_mod_key(te->name));
+                    if (any.tag)
+                        ST_diag_error(rw->ctx->diag, te->line, te->col,
+                                      "'" ST_sv_fmt "' is private in module '" ST_sv_fmt
+                                      "' (missing 'pub')",
+                                      ST_sv_args(te->name), ST_sv_args(te->module_alias));
+                    else
+                        ST_diag_error(rw->ctx->diag, te->line, te->col,
+                                      "module '" ST_sv_fmt "' has no member '" ST_sv_fmt "'",
+                                      ST_sv_args(te->module_alias), ST_sv_args(te->name));
+                } else {
+                    te->name = *(ST_string_t *)exp.tag;
+                }
+                te->module_alias = (ST_string_t){0};
+            }
+        } else if (te->kind == ST_TE_NAME) {
+            ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(te->name));
+            if (r.tag) {
+                te->name = *(ST_string_t *)r.tag;
+            } else if (rw->auto_exposed) {
+                ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(te->name));
+                if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                    te->name = *(ST_string_t *)a.tag;
+            }
+        }
     }
     ST_modrw_tyexpr(rw, te->inner);
     ST_modrw_expr(rw, te->count_expr);
@@ -234,6 +233,7 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
         return;
     switch (e->kind) {
         case ST_EX_INT:
+        case ST_EX_PACK_FOLD:
         case ST_EX_FLOAT:
         case ST_EX_STR:
         case ST_EX_CHAR:
@@ -338,6 +338,21 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
             break;
 
         case ST_EX_ASM:
+            ST_forrange(0, e->asm_.n_tokens) {
+                ST_token_t *tok = &e->asm_.tokens[i];
+                if (tok->kind != ST_TIDENT)
+                    continue;
+                ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(tok->text));
+                if (r.tag) {
+                    tok->text = *(ST_string_t *)r.tag;
+                    continue;
+                }
+                if (rw->auto_exposed) {
+                    ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(tok->text));
+                    if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                        tok->text = *(ST_string_t *)a.tag;
+                }
+            }
             break;
 
         case ST_EX_STR_FROM_RAW:
@@ -354,6 +369,8 @@ static void ST_modrw_stmt(ST_module_rw_t *rw, ST_stmt_t *s) {
     if (!s)
         return;
     switch (s->kind) {
+        case ST_ST_PACK_EXPAND:
+            break;
         case ST_ST_EXPR:
             ST_modrw_expr(rw, s->expr);
             break;
@@ -408,7 +425,23 @@ static void ST_modrw_stmt(ST_module_rw_t *rw, ST_stmt_t *s) {
         case ST_ST_CONTINUE:
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
+            break;
         case ST_ST_ASM:
+            ST_forrange(0, s->asm_.n_tokens) {
+                ST_token_t *tok = &s->asm_.tokens[i];
+                if (tok->kind != ST_TIDENT)
+                    continue;
+                ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(tok->text));
+                if (r.tag) {
+                    tok->text = *(ST_string_t *)r.tag;
+                    continue;
+                }
+                if (rw->auto_exposed) {
+                    ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(tok->text));
+                    if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                        tok->text = *(ST_string_t *)a.tag;
+                }
+            }
             break;
         case ST_ST_COUNT:
             break;
@@ -447,6 +480,9 @@ static void ST_modrw_decl(ST_module_rw_t *rw, ST_decl_t *d) {
         case ST_DE_EXTERN_VAR:
             ST_modrw_tyexpr(rw, d->extern_var.te);
             break;
+        case ST_DE_TYPE_ALIAS:
+            ST_modrw_tyexpr(rw, d->type_alias.te);
+            break;
         case ST_DE_GLOBAL:
             ST_modrw_tyexpr(rw, d->global_.te);
             ST_modrw_expr(rw, d->global_.init);
@@ -466,31 +502,14 @@ static void ST_modrw_decl(ST_module_rw_t *rw, ST_decl_t *d) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Load + recursively process one file (root or imported module).
-// ---------------------------------------------------------------------
-
 static b8 ST_module_load_file(ST_module_ctx_t *ctx, ST_string_t path, ST_program_t *out) {
     ctx->diag->file = path;
-
-    // ST_load_file both reads 'path' and recursively expands any '#load
-    // "sibling.st";' directives reachable from it into one flat token
-    // stream, the same way the root file is loaded -- calling ST_lex
-    // directly here (as this used to) skips that expansion entirely, so a
-    // module.st using '#load' would have the raw '#load' token reach the
-    // parser unexpanded and get rejected as an unsupported directive.
     ST_tokens_t toks;
     if (!ST_load_file(ctx->arena, path, ctx->srcs, &toks)) {
         ST_diag_error(ctx->diag, 0, 0, "could not load module file '" ST_sv_fmt "'",
                       ST_sv_args(path));
         return 0;
     }
-
-    // ST_load_file doesn't hand back 'path's own source text (only the
-    // expanded tokens, registering every file it touched into ctx->srcs
-    // along the way) -- read it separately here just for diag/parse
-    // bookkeeping; per-token diagnostics resolve their own source via each
-    // token's own .file against ctx->srcs regardless of what's passed here.
     ST_string_t src;
     if (!ST_read_entire_file(ctx->arena, &src, ST_mod_cstr(ctx->arena, path))) {
         ST_diag_error(ctx->diag, 0, 0, "could not read module file '" ST_sv_fmt "'",
@@ -543,14 +562,6 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
         entry->ok = 0;
         return 0;
     }
-
-    // Pass 1: register this file's own top-level names (self-renames), and
-    // resolve+recursively process every '#import' it makes (dependencies
-    // are fully loaded and renamed before we rewrite our own references).
-    // Note: resolution always searches from the *project root*
-    // (ctx->project_root), not this module's own directory -- otherwise a
-    // module importing another module would look under
-    // '<its own dir>/modules/<name>/', nesting modules inside modules.
     ST_ht_t self_renames;
     ST_ht_init(ctx->arena, &self_renames, 16);
     ST_ht_t import_aliases;
@@ -592,11 +603,6 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
         }
         if (!is_root) {
             b8 is_extern = d->kind == ST_DE_EXTERN_FN || d->kind == ST_DE_EXTERN_VAR;
-            // extern fn/var names are real external linkage symbols (e.g.
-            // libc's 'printf'), not ours to rename -- mangling them would
-            // break the link. Map them to themselves instead: internal
-            // references stay literal, and 'alias.printf' from an importer
-            // resolves straight to the real symbol too.
             ST_string_t mangled = is_extern ? d->name : ST_mangle(ctx->arena, prefix, d->name);
             ST_mod_map_put(ctx->arena, &self_renames, d->name, mangled);
             ST_mod_map_put(ctx->arena, &entry->all_decls, d->name, mangled);
@@ -605,8 +611,6 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
         }
     }
 
-    // Pass 2: rewrite every decl's internals (self-renames + alias.member),
-    // then rename the decl itself and append it to the merged program.
     ST_module_rw_t rw = {.ctx = ctx, .self_renames = &self_renames, .import_aliases = &import_aliases, .auto_exposed = &auto_exposed};
     ctx->diag->src = ST_srcmap_get(ctx->srcs, path);
     ctx->diag->file = path;
@@ -643,10 +647,6 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
     ST_module_ctx_t ctx = {.arena = arena, .diag = diag, .srcs = srcs, .project_root = root_dir};
     ST_ht_init(arena, &ctx.modules, 8);
 
-    // The root file is already loaded/parsed by the caller; process it
-    // in-place through the same machinery (prefix "" and is_root=1 mean no
-    // self-renaming), reusing 'root_prog->decls' as the source and building
-    // a fresh merged list that replaces it.
     ST_decls_t merged = {0};
     ST_ht_t self_renames, import_aliases, auto_exposed;
     ST_ht_init(arena, &self_renames, 1);

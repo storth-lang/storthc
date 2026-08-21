@@ -118,14 +118,21 @@ static ST_string_t ST_sym_display_name(ST_sym_t *sym) {
     return sym->template_name.len ? sym->template_name : sym->name;
 }
 
+static b8 ST_name_is_ignored(ST_string_t name) {
+    return name.len && name.data[0] == '_';
+}
+
 static void ST_declare_local_ex(ST_sema_t *se, ST_string_t name, ST_ty_t *t, u32 line, u32 col,
                                 b8 is_const) {
-    ST_sym_t *prev = ST_sym_find_in(&se->scope->table, name);
-    if (prev) {
-        ST_diag_error(&se->diag, line, col, "redeclaration of '" ST_sv_fmt "' in the same scope",
-                      ST_sv_args(name));
-        ST_diag_note(&se->diag, prev->line, prev->col, "previous declaration is here");
-        return;
+    b8 ignored = ST_name_is_ignored(name);
+    if (!ignored) {
+        ST_sym_t *prev = ST_sym_find_in(&se->scope->table, name);
+        if (prev) {
+            ST_diag_error(&se->diag, line, col,
+                          "redeclaration of '" ST_sv_fmt "' in the same scope", ST_sv_args(name));
+            ST_diag_note(&se->diag, prev->line, prev->col, "previous declaration is here");
+            return;
+        }
     }
     ST_sym_t *sym = ST_sym_new(se, ST_SYM_VAR, name, NULL, t, line, col);
     sym->is_const = is_const;
@@ -515,6 +522,20 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                 ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
                                      "'" ST_sv_fmt "' is declared here", ST_sv_args(te->name));
                 return NULL;
+            }
+            if (sym->decl->kind == ST_DE_TYPE_ALIAS) {
+                static u32 ST_alias_resolve_depth = 0;
+                if (ST_alias_resolve_depth > 64) {
+                    ST_diag_error(&se->diag, te->line, te->col,
+                                  "type alias '" ST_sv_fmt "' is nested too deeply (possible "
+                                  "alias cycle)",
+                                  ST_sv_args(te->name));
+                    return NULL;
+                }
+                ST_alias_resolve_depth++;
+                ST_ty_t *at = ST_resolve_tyexpr(se, sym->decl->type_alias.te);
+                ST_alias_resolve_depth--;
+                return at;
             }
             if (se->generic_bindings && sym->decl->kind == ST_DE_STRUCT &&
                 sym->decl->struct_.generics.count) {
@@ -1281,6 +1302,39 @@ static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+static const char *ST_expr_kind_desc(ST_expr_t *e) {
+    switch (e->kind) {
+        case ST_EX_INT:
+        case ST_EX_FLOAT:
+        case ST_EX_STR:
+        case ST_EX_CHAR:
+        case ST_EX_BOOL:
+        case ST_EX_NULL:
+            return "a literal";
+        case ST_EX_CALL:
+            return "a call result";
+        case ST_EX_BINARY:
+            return "a binary expression";
+        case ST_EX_UNARY:
+            return "a unary expression";
+        case ST_EX_CAST:
+            return "a cast";
+        case ST_EX_STRUCT_LIT:
+            return "a struct literal";
+        case ST_EX_ARRAY_NEW:
+            return "an array literal";
+        case ST_EX_SIZEOF:
+        case ST_EX_TYPEOF:
+        case ST_EX_TYPEINFO:
+        case ST_EX_KIND:
+            return "a compile-time type query";
+        case ST_EX_PACK_FOLD:
+            return "a pack-fold expression";
+        default:
+            return "a temporary value";
+    }
+}
+
 static b8 ST_expr_is_addressable(ST_sema_t *se, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT: {
@@ -1364,7 +1418,9 @@ static ST_ty_t *ST_type_unary(ST_sema_t *se, ST_expr_t *e) {
                 return NULL;
             }
             ST_diag_error(&se->diag, e->line, e->col,
-                          "cannot take the address of this expression");
+                          "cannot take the address of %s: it has no storage location, so '&' has "
+                          "nothing to point at",
+                          ST_expr_kind_desc(v));
             return NULL;
         }
         return ST_ty_ptr(&se->tys, ST_ty_defaulted(se, t));
@@ -2058,9 +2114,6 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
             }
             ST_ty_t *vt = ST_type_expr(se, fi->value);
             if (!ety) {
-                // First element with no expected type sets it, same
-                // convention untyped int/float literals already follow
-                // when defaulted elsewhere (e.g. ST_check_decl_stmt).
                 ety = vt ? ST_ty_defaulted(se, vt) : NULL;
                 continue;
             }
@@ -2209,8 +2262,6 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                                          "'" ST_sv_fmt "' is declared here",
                                          ST_sv_args(ST_decl_display_name(t->decl)));
                 } else {
-                    // Built-in aggregate (slice, dyn array, ...) - no decl to
-                    // point a note at.
                     ST_diag_error(&se->diag, fi->line, fi->col,
                                   "'%s' has no field '" ST_sv_fmt "'", ST_tstr(se, t),
                                   ST_sv_args(fi->name));
@@ -2519,6 +2570,7 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
                 bin->bin.r = acc;
                 acc = bin;
             }
+
             u32 sl = e->line, sc = e->col;
             *e = *acc;
             e->line = sl;
@@ -3200,9 +3252,6 @@ static void ST_check_comptime_for_pack(ST_sema_t *se, ST_stmt_t *s) {
         if (s->for_array.spec_iter.len)
             ST_forrange(0, copy.count)
                 ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
-        // Second pass: 'args[<literal>]' (just substituted in above) is now
-        // resolvable to the real per-argument parameter the same way any
-        // other compile-time-constant pack index already is.
         ST_string_t no_target = {0};
         ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
         ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
@@ -3211,9 +3260,6 @@ static void ST_check_comptime_for_pack(ST_sema_t *se, ST_stmt_t *s) {
     ST_check_stmt(se, s);
 }
 
-// Read-only walk mirroring ST_ast_substitute_expr's own traversal shape,
-// just to answer "does this expression reference 'name' anywhere" without
-// mutating anything
 static b8 ST_expr_contains_ident(ST_expr_t *e, ST_string_t name) {
     if (!e)
         return 0;
@@ -3742,6 +3788,7 @@ static ST_sym_kind_t ST_decl_sym_kind(ST_decl_t *d) {
         case ST_DE_STRUCT:
         case ST_DE_ENUM:
         case ST_DE_TAG_UNION:
+        case ST_DE_TYPE_ALIAS:
             return ST_SYM_TYPE;
         case ST_DE_FN:
         case ST_DE_EXTERN_FN:
@@ -3952,6 +3999,7 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                 sym->t = ST_ty_for_decls(&se->tys, d);
                 break;
             case ST_DE_CONST:
+            case ST_DE_TYPE_ALIAS:
             case ST_DE_EXTERN_FN:
             case ST_DE_EXTERN_VAR:
             case ST_DE_GLOBAL:
@@ -3986,20 +4034,9 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
             case ST_DE_ENUM:
                 ST_sema_enum_values(se, d);
                 break;
-            case ST_DE_CONST: {
-                b8 became_alias = 0;
-                if (!d->const_.te && d->const_.value && d->const_.value->kind == ST_EX_IDENT) {
-                    ST_sym_t *tsym = ST_sym_find_in(&se->globals, d->const_.value->name);
-                    if (tsym && tsym->kind == ST_SYM_TYPE) {
-                        sym->kind = ST_SYM_TYPE;
-                        sym->decl = tsym->decl;
-                        became_alias = 1;
-                    }
-                }
-                if (!became_alias)
-                    ST_ty_of_const(se, sym);
+            case ST_DE_CONST:
+                ST_ty_of_const(se, sym);
                 break;
-            }
             case ST_DE_EXTERN_VAR:
                 sym->t = ST_resolve_tyexpr(se, d->extern_var.te);
                 break;
@@ -4008,6 +4045,11 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                 break;
             case ST_DE_FN:
                 ST_build_fn_ty(se, sym, &d->fn.sig);
+                if (ST_string_eq_cstr(d->name, "main") && !d->is_pub)
+                    ST_diag_error(&se->diag, d->line, d->col,
+                                  "'main' must be declared 'pub': the backend only emits a "
+                                  "'global' symbol for pub functions, and a non-pub main has no "
+                                  "entry point to link against");
                 break;
             case ST_DE_GLOBAL: {
                 ST_ty_t *dt = d->global_.te ? ST_resolve_tyexpr(se, d->global_.te) : NULL;
@@ -4044,6 +4086,7 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                 break;
             }
             case ST_DE_IMPORT:
+            case ST_DE_TYPE_ALIAS:
                 break;
             case ST_DE_COUNT:
                 ST_assert(0);
@@ -4322,6 +4365,7 @@ static void ST_sema_default_types(ST_sema_t *se, ST_program_t *prog) {
             case ST_DE_TAG_UNION:
             case ST_DE_EXTERN_VAR:
             case ST_DE_IMPORT:
+            case ST_DE_TYPE_ALIAS:
             case ST_DE_COUNT:
                 break;
             case ST_DE_GLOBAL:

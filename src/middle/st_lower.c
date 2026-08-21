@@ -29,6 +29,11 @@ typedef struct {
     ST_lower_loop_t *loop;
     ST_lower_defers_t defers;
     ST_ir_blocks_t label_blocks;
+
+    ST_ty_t *ret_ty;
+    ST_stmts_t *cur_fn_body;
+
+    ST_ht_t safe_array_roots;
 } ST_lower_ctx_t;
 
 typedef enum {
@@ -244,6 +249,12 @@ static void ST_lower_scan_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_forrange(0, s->block.count) ST_lower_scan_stmt(c, s->block.items[i]);
             break;
         case ST_ST_ASM:
+            // @note: we don't know which identifiers inside the asm block
+            // are real locals vs. mnemonics/register names at this point
+            // (that's resolved later against the scope), so conservatively
+            // mark every bare identifier as address-taken. Marking a name
+            // that never gets declared is harmless (the hashtable entry
+            // just goes unused).
             ST_forrange(0, s->asm_.n_tokens) {
                 ST_token_t *t = &s->asm_.tokens[i];
                 if (t->kind == ST_TIDENT)
@@ -266,7 +277,8 @@ static void *ST_lower_prim_by_name(ST_ty_ctx_t *c, ST_string_t name) {
 static void *ST_lower_find_named_decl(ST_program_t *prog_name, ST_string_t name) {
     ST_forrange(0, prog_name->decls.count) {
         ST_decl_t *d = prog_name->decls.items[i];
-        if ((d->kind == ST_DE_STRUCT || d->kind == ST_DE_ENUM || d->kind == ST_DE_TAG_UNION) &&
+        if ((d->kind == ST_DE_STRUCT || d->kind == ST_DE_ENUM || d->kind == ST_DE_TAG_UNION ||
+            d->kind == ST_DE_TYPE_ALIAS) &&
             ST_string_eq(d->name, name))
             return d;
     }
@@ -321,6 +333,20 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te) {
             if (prim)
                 return prim;
             ST_decl_t *d = ST_lower_find_named_decl(c->prog, te->name);
+            if (d && d->kind == ST_DE_TYPE_ALIAS) {
+                static u32 ST_lower_alias_depth = 0;
+                if (ST_lower_alias_depth > 64) {
+                    ST_diag_error(&c->diag, te->line, te->col,
+                                  "internal: type alias '" ST_sv_fmt "' is nested too deeply "
+                                  "(possible alias cycle)",
+                                  ST_sv_args(te->name));
+                    return ST_ty_prim(&c->sema->tys, ST_ti32);
+                }
+                ST_lower_alias_depth++;
+                ST_ty_t *at = ST_lower_tyexpr(c, d->type_alias.te);
+                ST_lower_alias_depth--;
+                return at;
+            }
             if (d)
                 return ST_ty_for_decls(&c->sema->tys, d);
             ST_diag_error(&c->diag, te->line, te->col,
@@ -435,6 +461,7 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
     }
 }
 
+// Allocates a fresh temp slot, constructs into it, and returns its address
 static ST_ir_inst_t *ST_lower_union_construct_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, e->line, e->col);
     ST_lower_union_construct_into(c, slot, 0, e->ty, e);
@@ -448,6 +475,7 @@ static ST_ir_inst_t *ST_lower_string_lit_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
 }
 
 static ST_ir_inst_t *ST_lower_str_from_raw_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
+    // 'str_from_raw(ptr, len)'
     ST_ir_inst_t *slot =
         ST_ir_alloca(c->fn, &c->sema->tys, c->sema->tys.prim[ST_tstring], e->line, e->col);
 
@@ -598,7 +626,6 @@ static void ST_lower_raw_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST
         ST_ir_store(c->cur, chunk_ty, dp, v, line, col);
         off += 8;
     }
-
     u32 remaining = size - off;
     if (remaining >= 4) {
         ST_ty_t *t32 = c->sema->tys.prim[ST_ti32];
@@ -1242,7 +1269,6 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
         e->call.callee->kind == ST_EX_IDENT && !ST_lower_scope_find(c, e->call.callee->name);
     if (direct)
         sig = ST_lower_find_sig(c, e->call.callee->name);
-
     ST_ir_inst_t **args;
     u32 n_args;
 
@@ -1783,7 +1809,7 @@ static void ST_lower_asm_emit_placeholder(ST_sb_t *sb, b8 is_addr, u32 idx) {
 }
 
 // @note: shared by the statement form (ST_lower_asm_stmt) and the
-// expression form (ST_lower_expr's ST_EX_ASM case)
+// expression form (ST_lower_expr's ST_EX_ASM case).
 static ST_ir_inst_t *ST_lower_asm_tokens(ST_lower_ctx_t *c, ST_token_t *tokens, u32 n_tokens,
                                          ST_ty_t *ty, u32 line, u32 col) {
     ST_sb_t sb = {0};
@@ -1861,6 +1887,190 @@ static void ST_lower_asm_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
     ST_lower_asm_tokens(c, s->asm_.tokens, s->asm_.n_tokens, NULL, s->line, s->col);
 }
 
+static b8 ST_expr_root_is(ST_expr_t *e, ST_string_t name) {
+    if (!e)
+        return 0;
+    switch (e->kind) {
+        case ST_EX_IDENT:
+            return ST_string_eq(e->name, name);
+        case ST_EX_FIELD:
+            return ST_expr_root_is(e->field.base, name);
+        case ST_EX_INDEX:
+            return ST_expr_root_is(e->index.base, name);
+        default:
+            return 0;
+    }
+}
+
+// Conservative: returns 1 the moment it can't prove 'name' is left alone.
+// Anything opaque (raw '#asm' text, pack/fold expansion) counts as unsafe
+// rather than being traced through, since we can't see what it does.
+static b8 ST_expr_unsafe_for_promote(ST_expr_t *e, ST_string_t name) {
+    if (!e)
+        return 0;
+    switch (e->kind) {
+        case ST_EX_UNARY:
+            if (ST_string_eq_cstr(e->unary.op, "&") && ST_expr_root_is(e->unary.operand, name))
+                return 1;
+            return ST_expr_unsafe_for_promote(e->unary.operand, name);
+        case ST_EX_BINARY:
+            return ST_expr_unsafe_for_promote(e->bin.l, name) ||
+                  ST_expr_unsafe_for_promote(e->bin.r, name);
+        case ST_EX_CALL: {
+            if (ST_expr_unsafe_for_promote(e->call.callee, name))
+                return 1;
+            for (u32 k = 0; k < e->call.args.count; k++)
+                if (ST_expr_unsafe_for_promote(e->call.args.items[k].value, name))
+                    return 1;
+            return 0;
+        }
+        case ST_EX_FIELD:
+            return ST_expr_unsafe_for_promote(e->field.base, name);
+        case ST_EX_INDEX:
+            return ST_expr_unsafe_for_promote(e->index.base, name) ||
+                  ST_expr_unsafe_for_promote(e->index.index, name);
+        case ST_EX_CAST:
+            return ST_expr_unsafe_for_promote(e->cast.operand, name);
+        case ST_EX_STRUCT_LIT:
+            for (u32 k = 0; k < e->struct_lit.inits.count; k++)
+                if (ST_expr_unsafe_for_promote(e->struct_lit.inits.items[k].value, name))
+                    return 1;
+            return 0;
+        case ST_EX_STR_FROM_RAW:
+            return ST_expr_unsafe_for_promote(e->str_from_raw.ptr, name) ||
+                  ST_expr_unsafe_for_promote(e->str_from_raw.len, name);
+        case ST_EX_ASM:
+        case ST_EX_PACK_FOLD:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static b8 ST_stmt_unsafe_for_promote(ST_stmt_t *s, ST_string_t name) {
+    if (!s)
+        return 0;
+    switch (s->kind) {
+        case ST_ST_EXPR:
+            return ST_expr_unsafe_for_promote(s->expr, name);
+        case ST_ST_DECL:
+            return ST_expr_unsafe_for_promote(s->decl.init, name);
+        case ST_ST_ASSIGN:
+            if (ST_expr_root_is(s->assign.lhs, name))
+                return 1;
+            return ST_expr_unsafe_for_promote(s->assign.lhs, name) ||
+                  ST_expr_unsafe_for_promote(s->assign.rhs, name);
+        case ST_ST_MULTI_BIND: {
+            if (!s->multi.declare)
+                for (u32 k = 0; k < s->multi.n_names; k++)
+                    if (ST_string_eq(s->multi.names[k], name))
+                        return 1;
+            for (u32 k = 0; k < s->multi.values.count; k++)
+                if (ST_expr_unsafe_for_promote(s->multi.values.items[k], name))
+                    return 1;
+            return 0;
+        }
+        case ST_ST_IF:
+            if (ST_expr_unsafe_for_promote(s->if_.cond, name))
+                return 1;
+            for (u32 k = 0; k < s->if_.then_body.count; k++)
+                if (ST_stmt_unsafe_for_promote(s->if_.then_body.items[k], name))
+                    return 1;
+            return ST_stmt_unsafe_for_promote(s->if_.else_stmt, name);
+        case ST_ST_SWITCH:
+            if (ST_expr_unsafe_for_promote(s->switch_.cond, name))
+                return 1;
+            for (u32 k = 0; k < s->switch_.cases.count; k++) {
+                ST_case_t *cs = &s->switch_.cases.items[k];
+                for (u32 j = 0; j < cs->values.count; j++)
+                    if (ST_expr_unsafe_for_promote(cs->values.items[j], name))
+                        return 1;
+                for (u32 j = 0; j < cs->body.count; j++)
+                    if (ST_stmt_unsafe_for_promote(cs->body.items[j], name))
+                        return 1;
+            }
+            return 0;
+        case ST_ST_WHILE:
+            if (ST_expr_unsafe_for_promote(s->while_.cond, name))
+                return 1;
+            for (u32 k = 0; k < s->while_.body.count; k++)
+                if (ST_stmt_unsafe_for_promote(s->while_.body.items[k], name))
+                    return 1;
+            return 0;
+        case ST_ST_FOR_RANGE:
+            if (ST_expr_unsafe_for_promote(s->for_range.lo, name) ||
+                ST_expr_unsafe_for_promote(s->for_range.hi, name))
+                return 1;
+            for (u32 k = 0; k < s->for_range.body.count; k++)
+                if (ST_stmt_unsafe_for_promote(s->for_range.body.items[k], name))
+                    return 1;
+            return 0;
+        case ST_ST_FOR_ARRAY:
+            if (ST_expr_unsafe_for_promote(s->for_array.target, name))
+                return 1;
+            for (u32 k = 0; k < s->for_array.body.count; k++)
+                if (ST_stmt_unsafe_for_promote(s->for_array.body.items[k], name))
+                    return 1;
+            return 0;
+        case ST_ST_RETURN:
+            for (u32 k = 0; k < s->ret.values.count; k++)
+                if (ST_expr_unsafe_for_promote(s->ret.values.items[k], name))
+                    return 1;
+            return 0;
+        case ST_ST_BLOCK:
+            for (u32 k = 0; k < s->block.count; k++)
+                if (ST_stmt_unsafe_for_promote(s->block.items[k], name))
+                    return 1;
+            return 0;
+        case ST_ST_DEFER:
+            return ST_stmt_unsafe_for_promote(s->defer_stmt, name);
+        case ST_ST_ASM:
+        case ST_ST_PACK_EXPAND:
+            return 1;
+        default:
+            return 0; // BREAK/CONTINUE/LABEL/GODOWN carry no expressions
+    }
+}
+
+static b8 ST_local_array_is_const_promotable(ST_lower_ctx_t *c, ST_stmt_t *decl_stmt) {
+    ST_ty_t *ty = decl_stmt->decl.te ? ST_lower_tyexpr(c, decl_stmt->decl.te) : NULL;
+    ST_expr_t *init = decl_stmt->decl.init;
+    if (!init || init->kind != ST_EX_STRUCT_LIT || !init->struct_lit.is_bracket_lit)
+        return 0;
+    ST_ty_t *ety = init->ty && init->ty->inner ? init->ty->inner : (ty ? ty->inner : NULL);
+    if (!ety || !(ST_ty_is_int(ety) || ety->kind == ST_TY_CHAR || ety->kind == ST_TY_BOOL))
+        return 0;
+    for (u32 k = 0; k < init->struct_lit.inits.count; k++) {
+        i64 dummy;
+        if (!ST_const_eval(c->sema, init->struct_lit.inits.items[k].value, &dummy))
+            return 0;
+    }
+    if (!c->cur_fn_body)
+        return 0;
+    for (u32 k = 0; k < c->cur_fn_body->count; k++)
+        if (ST_stmt_unsafe_for_promote(c->cur_fn_body->items[k], decl_stmt->decl.name))
+            return 0;
+    return 1;
+}
+
+static ST_string_t ST_lower_const_arr_name(ST_lower_ctx_t *c, ST_stmt_t *s) {
+    char tmp[192];
+    int n = snprintf(tmp, sizeof(tmp), "__st_const_arr_" ST_sv_fmt "_L%uC%u",
+                     ST_sv_args(c->fn->name), s->line, s->col);
+    u8 *buf = ST_arena_push(c->arena, (u32)n);
+    memcpy(buf, tmp, (u32)n);
+    return (ST_string_t){.data = buf, .len = (u32)n};
+}
+
+static b8 ST_lower_arr_root_is_safe(ST_lower_ctx_t *c, ST_string_t name) {
+    ST_ht_generic_t key = {.tag = name.data, .size = name.len};
+    if (ST_ht_get(&c->safe_array_roots, key).tag)
+        return 1;
+    if (ST_ir_module_find_global(c->module, name))
+        return 1;
+    return ST_lower_scope_find(c, name) == NULL;
+}
+
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
     switch (s->kind) {
         case ST_ST_EXPR:
@@ -1935,6 +2145,25 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                     ST_ir_store(c->cur, lty, p, ST_ir_const_int(c->cur, lty, 0), s->line, s->col);
                 }
                 ST_lower_bind_addr(c, s->decl.name, slots, ty);
+                break;
+            }
+            if (ty->kind == ST_TY_ARRAY && ST_local_array_is_const_promotable(c, s)) {
+                ST_string_t gname = ST_lower_const_arr_name(c, s);
+                ST_ir_module_add_global(c->module, gname, ty, 0, 0, 0, 0, 0);
+                ST_ir_global_var_t *g = ST_ir_module_find_global(c->module, gname);
+                u32 elem_size = ty->inner->size;
+                for (u32 k = 0; k < s->decl.init->struct_lit.inits.count; k++) {
+                    i64 v = 0;
+                    ST_const_eval(c->sema, s->decl.init->struct_lit.inits.items[k].value, &v);
+                    ST_ir_global_add_field_init(c->arena, g, k * elem_size, elem_size, 0, v, 0);
+                }
+                ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ty);
+                ST_ir_inst_t *addr = ST_ir_global_addr(c->cur, ptr_ty, gname, s->line, s->col);
+                ST_lower_bind_addr(c, s->decl.name, addr, ty);
+                ST_ht_generic_t *hk = ST_arena_push(c->arena, sizeof(*hk));
+                hk->tag = s->decl.name.data;
+                hk->size = s->decl.name.len;
+                ST_ht_set(&c->safe_array_roots, hk, (ST_ht_generic_t){.tag = (void *)1, .size = 0});
                 break;
             }
             if (ty->kind == ST_TY_ARRAY || ty->kind == ST_TY_DYN_ARRAY ||
@@ -2138,16 +2367,43 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
         }
 
         case ST_ST_RETURN: {
-            b8 agg_ret = s->ret.values.count == 1 && s->ret.values.items[0]->ty &&
+            b8 arr_to_slice_ret = s->ret.values.count == 1 && s->ret.values.items[0]->ty &&
+                                  s->ret.values.items[0]->ty->kind == ST_TY_ARRAY && c->ret_ty &&
+                                  c->ret_ty->kind == ST_TY_SLICE;
+            b8 agg_ret = !arr_to_slice_ret && s->ret.values.count == 1 &&
+                        s->ret.values.items[0]->ty &&
                         (s->ret.values.items[0]->ty->kind == ST_TY_STRUCT ||
-                         s->ret.values.items[0]->ty->kind == ST_TY_TAG_UNION);
+                         s->ret.values.items[0]->ty->kind == ST_TY_TAG_UNION ||
+                         s->ret.values.items[0]->ty->kind == ST_TY_SLICE ||
+                         s->ret.values.items[0]->ty->kind == ST_TY_DYN_ARRAY);
             b8 str_ret = s->ret.values.count == 1 && s->ret.values.items[0]->ty &&
                         s->ret.values.items[0]->ty->kind == ST_TY_STRING;
 
             ST_ir_inst_t **vals;
             u32 n_vals;
 
-            if (agg_ret) {
+            if (arr_to_slice_ret) {
+                ST_expr_t *re = s->ret.values.items[0];
+                b8 safe = re->kind == ST_EX_IDENT && ST_lower_arr_root_is_safe(c, re->name);
+                if (!safe) {
+                    ST_diag_error(&c->diag, re->line, re->col,
+                                  "cannot return a slice into this array: its storage is this "
+                                  "function's stack and mutated/dynamic content can't be moved "
+                                  "to a static address automatically -- return a dynamic array "
+                                  "('[..]T', heap-owned) and copy into it instead, or write "
+                                  "into a caller-supplied buffer parameter");
+                    vals = ST_arena_push(c->arena, sizeof(*vals) * 2);
+                    n_vals = 2;
+                    ST_ty_t *ptr_ty0 = ST_ty_ptr(&c->sema->tys, c->ret_ty->inner);
+                    vals[0] = ST_ir_const_int(c->cur, ptr_ty0, 0);
+                    vals[1] = ST_ir_const_int(c->cur, c->sema->tys.prim[ST_ti64], 0);
+                } else {
+                    vals = ST_arena_push(c->arena, sizeof(*vals) * 2);
+                    n_vals = 0;
+                    if (!ST_lower_push_array_as_slice_arg(c, vals, &n_vals, re, c->ret_ty))
+                        n_vals = 0;
+                }
+            } else if (agg_ret) {
                 ST_ty_t *st = s->ret.values.items[0]->ty;
                 ST_ir_inst_t *addr = ST_lower_struct_addr(c, s->ret.values.items[0], st);
                 u32 n_eb = ST_lower_eight_bytes_count(st);
@@ -2700,7 +2956,8 @@ static ST_ir_fn_t *ST_lower_register_fn(ST_lower_ctx_t *c, ST_string_t name, ST_
     if (!is_extern && sig->rets.count == 1) {
         ST_ty_t *rt = ST_lower_tyexpr(c, sig->rets.items[0]);
         if (rt && (rt->kind == ST_TY_STRUCT || rt->kind == ST_TY_TAG_UNION ||
-                  rt->kind == ST_TY_STRING) && rt->size > 0) {
+                  rt->kind == ST_TY_STRING || rt->kind == ST_TY_SLICE ||
+                  rt->kind == ST_TY_DYN_ARRAY) && rt->size > 0) {
             u32 n_eb = ST_lower_eight_bytes_count(rt);
             ST_forrange(0, n_eb)
                 ST_da_append_arena(c->arena, &fn_ty->rets, ST_lower_eight_byte_ty(c, rt, i));
@@ -2780,10 +3037,13 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
     }
 
     c->fn = fn;
+    c->ret_ty = d->fn.sig.rets.count == 1 ? ST_lower_tyexpr(c, d->fn.sig.rets.items[0]) : NULL;
+    c->cur_fn_body = &d->fn.body;
     c->defers = (ST_lower_defers_t){0};
     ST_ht_init(c->arena, &c->scope, 16);
     ST_ht_init(c->arena, &c->addr_taken, 16);
     ST_ht_init(c->arena, &c->labels, 8);
+    ST_ht_init(c->arena, &c->safe_array_roots, 8);
     c->label_blocks = (ST_ir_blocks_t){0};
 
     ST_forrange(0, d->fn.body.count) ST_lower_scan_stmt(c, d->fn.body.items[i]);

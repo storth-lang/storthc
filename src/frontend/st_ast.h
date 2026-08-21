@@ -43,6 +43,7 @@ struct ST_tyexpr_t {
     ST_tyexpr_kind_t kind;
     u32 line, col;
     ST_string_t name;
+    ST_string_t module_alias;
     ST_tyexpr_t *inner;
     ST_expr_t *count_expr;
     b8 is_dynamic;
@@ -142,13 +143,7 @@ struct ST_expr_t {
             ST_string_t type_name;
             ST_tyexprs_t generic_args;
             ST_field_inits_t inits;
-            b8 is_bracket_lit; // '[a, b, c]' or '[]' - always means "slice
-                               // with these element values", distinct from
-                               // '{a, b, c}' which still means "sized/fixed
-                               // array" (or, on a bare '[]T' local
-                               // declaration specifically, may still get
-                               // read as the pre-existing array-size-
-                               // inference feature - see ST_check_decl_stmt)
+            b8 is_bracket_lit;
         } struct_lit;
         struct {
             ST_tyexpr_t *te;
@@ -280,6 +275,7 @@ typedef enum {
     ST_DE_ENUM,
     ST_DE_TAG_UNION,
     ST_DE_CONST,
+    ST_DE_TYPE_ALIAS,
     ST_DE_EXTERN_FN,
     ST_DE_EXTERN_VAR,
     ST_DE_GLOBAL,
@@ -370,6 +366,9 @@ struct ST_decl_t {
             ST_expr_t *value;
             b8 is_comptime; // 'NAME :: #comptime expr;'
         } const_;
+        struct {
+            ST_tyexpr_t *te; // 'using NAME = <type expr>;'
+        } type_alias;
         struct {
             ST_fn_sig_t sig;
         } extern_fn;

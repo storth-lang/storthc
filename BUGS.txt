@@ -108,3 +108,17 @@ src/middle/st_ir.c:386:1: Assertion failed: b->term.kind == ST_IR_TERM_NONE
 
 Compilation aborted (core dumped) at Wed Jul 29 22:25:14, duration 0.19 s
 ```
+
+Aliasing issue of function pointer. Functions are not yet a type hence why such trick is not possible.
+Secondly returing a slice should be possible.
+
+x :: *fn add(x: i32, y:i32) -> i32;
+
+fn foo() -> []i32 {
+    x := [22, 23, 44];
+    return x;
+} does not work.
+
+Comptime is not yet complete has rough edges when I return some stuff plus also modules being compiled to so so that the comptime can load them should be a thing. And then also working on meta programming lets work on it more and more right we need a full fleged compiler module so that the compiler module that is going to be exposed should be enough to build a whole ton of thing on top of the language.
+
+It is sad that we still need a couple of rough edges as the language is becoming good but we need to get rid of those edges so I can work on the standard library more plus doing comptime unroll for template #for is a bit stupid to so we will need a better variadic mechanmism.

@@ -125,7 +125,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 
 # Naming
 
-- [ ] Come up with a better name for tag_union.
+- [x] Come up with a better name for tag_union.
 - [x] Defer is not scope based ***cry***.
 - [ ] I do not know how to approach the documentation.
 - [ ] Compiler intrinsics are not even lowered yet. This should be fixed.
@@ -137,9 +137,13 @@ Test framework: Refer the NOTES in the 'tests/' directory
 
 # Configuration
 
-- [ ] Make a config.mk which will then be used by our parser to give it information that the user provides from the config 
+- [x] Make a config.mk which will then be used by our parser to give it information that the user provides from the config 
 
 # Templates
 
-- [ ] Make templates auto infered meaning no syntax crap.
+- [x] Make templates auto infered meaning no syntax crap.
 - [ ] A template instance should not mess up;
+
+# Feature Request
+
+- [ ] Make function pointers callable from global namespace
