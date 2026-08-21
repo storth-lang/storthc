@@ -161,3 +161,58 @@
   Such as the names, the alignment the ordinal offset as well.
 
 - We still lack the concept of comptime.
+
+2026:08:21
+
+- Underscore is now a real "ignore this" convention instead of just erroring on reuse. '_'
+  and anything starting with '_' skips the same-scope redeclaration check, so this works now:
+  ```
+  buf, _, _ := some_call_returning_three_things();
+  fn parse(_ctx: *void, data: string) -> i32 { ... }
+  ```
+  Previously 'buf, _, _' errored as a redeclaration of '_' the second time.
+
+- 'main' must be declared 'pub' now, or it's a hard compile error. The NASM backend only ever
+  emitted a 'global' directive for pub functions, so a non-pub main quietly had no linkable
+  entry point. Rather than silently forcing it pub behind your back, we just tell you.
+
+- Fixed 'cannot take the address of this expression' being the same unhelpful line for every
+  case. It now says what it actually saw, e.g. 'cannot take the address of a binary expression:
+  it has no storage location, so '&' has nothing to point at'.
+
+- Returning a slice of a local array finally works, with an actual safety story behind it
+  instead of just making it compile:
+  ```
+  fn foo() -> []i32 {
+      x := [22, 23, 44];
+      return x;   // legal: x has no mutations anywhere in foo, so it's promoted
+                  // to a static .data global instead of a stack slot.
+  }
+  ```
+  If the array gets mutated anywhere in the function (or is built from runtime values), it
+  can't be promoted, and returning a slice of it is now a hard compile error telling you to
+  either return a dynamic array ('[..]T') or take a caller-supplied output buffer instead of
+  silently handing back a dangling pointer into a stack frame that's already gone.
+
+- Real type aliasing, finally, via a new 'using' declaration:
+  ```
+  using StringBuilder = [..]char;
+  x : StringBuilder;
+  ```
+  This replaces the old trick of writing 'Name :: OtherType;' and hoping the const-decl code
+  noticed the right-hand side was itself a type name that only ever worked when aliasing one
+  bare existing type to another, never for an actual type expression like a pointer, slice, or
+  fn-type. 'using' takes any type expression. The old '::' special case has been removed
+  entirely now that there's one real mechanism instead of two overlapping ones.
+
+- Cross-module type references work now, both bare and qualified:
+  ```
+  #import "error";
+  fn openFileDescriptor(path: string) -> (i32, ioError) { ... } // bare: ioError from the
+                                                                // 'error' module, works
+                                                                // because this file imports it
+  x : error.ioError; // qualified, from anywhere, same syntax expressions already use
+                     // for alias.member
+  ```
+  Both directions of this were previously unimplemented for types specifically (functions/
+  consts/globals already worked bare and qualified; types didn't do either).
