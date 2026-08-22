@@ -154,9 +154,31 @@ fn print_value(fd: i32, v: $V) {
     }
 }
 
-pub fn print(fmt: string, args: $T...) {
-    #for ch, spec: fmt {
-        #if ch == '%' then print_value(STDOUT, args[spec]);
-        #else then io_write_byte(STDOUT, ch #as i8);
+fn write_until_percent(fd: i32, fmt: string, pos: i64) -> i64 {
+    i := pos;
+    while i < fmt.len #as i64 {
+        ch := fmt.ptr[i] #as char;
+        i = i + 1;
+        if ch == '%' then return i;
+        io_write_byte(fd, ch #as i8);
     }
+    return i;
+}
+
+pub fn print(fmt: string, args: $T...) {
+    pos : i64 = 0;
+    for a: args {
+        pos = write_until_percent(STDOUT, fmt, pos);
+        print_value(STDOUT, a);
+    }
+    write_until_percent(STDOUT, fmt, pos);
+}
+
+pub fn eprint(fmt: string, args: $T...) {
+    pos : i64 = 0;
+    for a: args {
+        pos = write_until_percent(STDERR, fmt, pos);
+        print_value(STDERR, a);
+    }
+    write_until_percent(STDERR, fmt, pos);
 }

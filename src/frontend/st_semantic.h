@@ -27,7 +27,8 @@ typedef struct {
     u32 line, col;
     ST_ht_t *generic_bindings;
     ST_string_t template_name;
-    b8 is_const; // for ST_SYM_VAR: declared with '::' -- cannot be reassigned
+    b8 is_const; // for ST_SYM_VAR: declared with '::'
+    ST_tyexprs_t *generic_constraints;
 } ST_sym_t;
 
 typedef struct ST_scope_t ST_scope_t;

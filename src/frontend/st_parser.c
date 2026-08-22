@@ -337,6 +337,22 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_NAME, t->line, t->col);
         te->name = pname;
         te->is_generic_param = 1;
+        if (ST_at_symbol(p, "(")) {
+            p->pos++; // consume '('
+            for (;;) {
+                ST_tyexpr_t *ct = ST_parse_type(p);
+                if (!ct)
+                    return NULL;
+                ST_da_append_arena(p->arena, &te->generic_constraints, ct);
+                if (ST_at_symbol(p, "|")) {
+                    p->pos++;
+                    continue;
+                }
+                break;
+            }
+            if (!ST_expect_sym(p, ")"))
+                return NULL;
+        }
         return te;
     }
     if (t->kind == ST_TTYPE || ST_tok_is_ident(t)) {

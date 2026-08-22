@@ -668,6 +668,11 @@ static ST_tyexpr_t *ST_clone_tyexpr(ST_arena_t *a, ST_tyexpr_t *te) {
     ST_forrange(0, te->generic_args.count)
         ST_da_append_arena(a, &n->generic_args, ST_clone_tyexpr(a, te->generic_args.items[i]));
 
+    n->generic_constraints = (ST_tyexprs_t){0};
+    ST_forrange(0, te->generic_constraints.count)
+        ST_da_append_arena(a, &n->generic_constraints,
+                          ST_clone_tyexpr(a, te->generic_constraints.items[i]));
+
     return n;
 }
 
@@ -920,6 +925,25 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
         if (!pt->is_generic_param)
             return 1;
         ST_ty_t *want = ST_ty_defaulted(se, at);
+
+        if (pt->generic_constraints.count) {
+            b8 satisfied = 0;
+            ST_forrange(0, pt->generic_constraints.count) {
+                ST_ty_t *ct = ST_resolve_tyexpr(se, pt->generic_constraints.items[i]);
+                if (ct && ST_ty_equal(ct, want)) {
+                    satisfied = 1;
+                    break;
+                }
+            }
+            if (!satisfied) {
+                ST_diag_error(&se->diag, arg_line, arg_col,
+                              "'%s' does not satisfy the constraint on generic parameter '$"
+                              ST_sv_fmt "'",
+                              ST_tstr(se, want), ST_sv_args(pt->name));
+                return 0;
+            }
+        }
+
         ST_ht_generic_t k = { .tag = pt->name.data, .size = pt->name.len };
         ST_ht_generic_t found = ST_ht_get(bindings, k);
         ST_ty_t *bound = (ST_ty_t *)found.tag;
@@ -1908,7 +1932,7 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
 
     if (t->kind == ST_TY_ARRAY || t->kind == ST_TY_STRING) {
         if (ST_string_eq_cstr(e->field.name, "len"))
-            return se->tys.prim[ST_ti32];
+            return se->tys.prim[ST_ti64];
         if (ST_string_eq_cstr(e->field.name, "ptr"))
             return ST_ty_ptr(&se->tys, t->kind == ST_TY_STRING ? se->tys.prim[ST_tchar] : t->inner);
     }
@@ -3515,15 +3539,35 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 }
                 break;
             }
+            ST_sym_t *cond_sym = s->switch_.cond->kind == ST_EX_IDENT
+                                     ? ST_sym_find(se, s->switch_.cond->name)
+                                     : NULL;
+            ST_tyexprs_t *constraints = cond_sym ? cond_sym->generic_constraints : NULL;
+
             ST_forrange(0, s->switch_.cases.count) {
                 ST_case_t *c = &s->switch_.cases.items[i];
                 for (u32 k = 0; k < c->values.count; k++) {
                     ST_ty_t *vt = ST_type_expr(se, c->values.items[k]);
-                    if (ct && vt && !ST_ty_coerces(se, vt, ct) && !ST_ty_coerces(se, ct, vt) &&
-                        !ST_ty_num_unify(se, ct, vt))
-                        ST_diag_error(&se->diag, c->values.items[k]->line, c->values.items[k]->col,
-                                      "case of type '%s' cannot match a '%s' switch",
-                                      ST_tstr(se, vt), ST_tstr(se, ct));
+                    if (!ct || !vt)
+                        continue;
+                    if (ST_ty_coerces(se, vt, ct) || ST_ty_coerces(se, ct, vt) ||
+                        ST_ty_num_unify(se, ct, vt))
+                        continue;
+                    if (constraints) {
+                        b8 matches_some_constraint = 0;
+                        ST_forrange(0, constraints->count) {
+                            ST_ty_t *cnt = ST_resolve_tyexpr(se, constraints->items[i]);
+                            if (cnt && ST_ty_equal(cnt, vt)) {
+                                matches_some_constraint = 1;
+                                break;
+                            }
+                        }
+                        if (matches_some_constraint)
+                            continue;
+                    }
+                    ST_diag_error(&se->diag, c->values.items[k]->line, c->values.items[k]->col,
+                                  "case of type '%s' cannot match a '%s' switch",
+                                  ST_tstr(se, vt), ST_tstr(se, ct));
                 }
                 ST_check_body(se, &c->body);
             }
@@ -3575,11 +3619,13 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         }
         case ST_ST_FOR_ARRAY: {
-            if (s->for_array.is_comptime) {
-                if (s->for_array.target->kind == ST_EX_FIELDS)
+            b8 targets_pack = se->has_pack && s->for_array.target->kind == ST_EX_IDENT &&
+                              ST_string_eq(s->for_array.target->name, se->cur_pack_name);
+            b8 targets_fields = s->for_array.target->kind == ST_EX_FIELDS;
+            if (s->for_array.is_comptime || targets_pack || targets_fields) {
+                if (targets_fields)
                     ST_check_comptime_for_fields(se, s);
-                else if (se->has_pack && s->for_array.target->kind == ST_EX_IDENT &&
-                        ST_string_eq(s->for_array.target->name, se->cur_pack_name))
+                else if (targets_pack)
                     ST_check_comptime_for_pack(se, s);
                 else
                     ST_check_comptime_for_array(se, s);
@@ -4153,6 +4199,11 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
         ST_param_t *p = &sig->params.items[i];
         ST_ty_t *pt = fnty && i < fnty->params.count ? fnty->params.items[i] : NULL;
         ST_declare_local(se, p->name, pt, p->line, p->col);
+        if (p->te && p->te->is_generic_param && p->te->generic_constraints.count) {
+            ST_sym_t *psym = ST_sym_find_in(&se->scope->table, p->name);
+            if (psym)
+                psym->generic_constraints = &p->te->generic_constraints;
+        }
     }
 
     se->cur_rets = fnty ? &fnty->rets : NULL;

@@ -1211,9 +1211,13 @@ static ST_ir_inst_t *ST_lower_addr_of(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *
         return a ? a : ST_ir_const_int(c->cur, ptr_ty, 0);
     }
 
+    if (v->kind == ST_EX_INDEX) {
+        ST_ir_inst_t *a = ST_lower_lvalue_addr(c, v);
+        return a ? a : ST_ir_const_int(c->cur, ptr_ty, 0);
+    }
+
     ST_diag_error(&c->diag, e->line, e->col,
-                  "internal: address-of this expression form isn't lowered yet "
-                  "(array indexing comes with array lowering)");
+                  "internal: address-of this expression form isn't lowered yet");
     return ST_ir_const_int(c->cur, ptr_ty, 0);
 }
 

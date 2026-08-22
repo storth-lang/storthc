@@ -15,3 +15,10 @@ As long as you have a c compiler building it is self explanatory. You just run m
 ```sh
 make -j$(nproc)
 ```
+
+
+Papers and Ideas:
+
+- stdlib design: https://codeberg.org/memfd/libsmh
+- Hash Table: https://arxiv.org/pdf/2501.02305
+- SSA IR paper: https://c9x.me/compile/bib/braun13cc.pdf

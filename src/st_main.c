@@ -307,6 +307,8 @@ int main(int argc, char **argv) {
         ok = st_compile(arena, src_exe, ST_STAGE_EXE, out_exe, &exe_ldflags, NULL);
     else if (active == run)
         ok = st_compile(arena, src_run, ST_STAGE_RUN, out_run, &run_ldflags, &run_exit_code);
+    else if (active)
+        cli_command_usage(active);
     else
         cli_usage(cli);
 
