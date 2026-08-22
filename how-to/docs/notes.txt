@@ -1,0 +1,36 @@
+Programming languages are the hell of CS nerds.
+My journey of language development
+
+Every programmer has their own languages they are willing to die on however all of then have one goal in mind. Be better than C. No one can be better than C. If that is why you came for go on and do not watch the video.
+
+I am trying just like all the other languages to replace it with my own opinionation does that mean I am valid or not idk time will tell. But today I just want to show case my language design process and thought process that went through it so that maybe you want want to use it or even take inspiration from it.
+
+This language right now calling it storth name will be changed in the future is a programming language inspired by moscow-ml and C plus jai. The idea is to not have a language that is cluttered up however be powerful to the point the tooling is the language itself.
+
+Fundamentally the language is simple like C. No oop, No functional language shenanegans. Just a few nice things on top of C. Not syntax wise but more so feature wise. The syntax looks go + rust hybrid. It is also meant for my own enjoyment so I do not use llvm or any compiler backend.
+
+## Image
+fn main() -> i32 {
+    print("Hello world\n");
+    return 0;
+}
+
+#import "io";
+
+As you can see we just outputted hello world. 
+The design is so that I do not want macros. Meaning token-replacing stuff. Do they have use cases yes but again that mostly due to how C is built.
+
+It is strongly type programming language. functions, arrays, basic types are first class types. When I say functions to be more precise function pointers. So lets start some of the demo right again the language is to basic to have features how-ever the plan is to write an OS, daw and a game with it.
+
+fn foo() -> u32 {
+    x: u32 = 20;
+    y := 44; // This is non type specified integer meaning.
+    return x + y;
+}
+
+Because y is just i32 by default. No the compiler does not do auto casting so that you can return stuff.
+In hind sight though if we just returned y it still would not work. Meaning you are forced to do casting however literals can be directly casted so just returning a number is totally valid.
+
+I do not care if you come from some programming language asking for but this language allows it or not the type system is strict and it is so that users know when a cast operation is happening so that if by any means a cast caused a problem it is readable rather than guessing if the compiler did it.
+
+Okay so the thing is with out a project written in it to show case the language it is totally useless.
