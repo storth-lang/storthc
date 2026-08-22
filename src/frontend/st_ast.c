@@ -474,7 +474,7 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
             ST_dump_expr(out, d->const_.value, depth + 1);
             break;
         case ST_DE_TYPE_ALIAS:
-            fprintf(out, "using " ST_sv_fmt "%s = ", ST_sv_args(d->name), d->is_pub ? " pub" : "");
+            fprintf(out, "using " ST_sv_fmt "%s ", ST_sv_args(d->name), d->is_pub ? " pub" : "");
             ST_dump_tyexpr(out, d->type_alias.te);
             fprintf(out, "\n");
             break;

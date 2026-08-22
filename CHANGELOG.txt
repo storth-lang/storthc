@@ -216,3 +216,12 @@
   ```
   Both directions of this were previously unimplemented for types specifically (functions/
   consts/globals already worked bare and qualified; types didn't do either).
+
+- Using now does not require an '=' sign after the name.
+
+- Type parametrization will now have type constraint in a generic template function.
+  ```
+  fn foo(x: $T(*u8 | string)) {
+  }
+  ```
+  This will limit the type of x to be of a u8 pointer or a string.

@@ -1972,8 +1972,6 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         ST_string_t name = ST_expect_ident(p, "a type alias name after 'using'");
         if (!name.len)
             return NULL;
-        if (!ST_expect_sym(p, "="))
-            return NULL;
         ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TYPE_ALIAS, t->line, t->col);
         d->is_pub = is_pub;
         d->name = name;
