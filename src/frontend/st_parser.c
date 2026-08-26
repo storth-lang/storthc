@@ -1776,6 +1776,7 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
     if (!ST_expect_sym(p, "("))
         return 0;
+    b8 seen_default = 0;
     while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
         if (ST_at_symbol(p, ",")) {
             p->pos++;
@@ -1841,7 +1842,6 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                     sig->has_any_pack = 1; // runtime: collected into a real array, see ST_lower.c
                 else
                     sig->has_generic_pack = 1; // comptime: one synthetic param per call-site arg,
-                                                // see ST_instantiate_fn's pack-expansion below
                 ST_da_append_arena(p->arena, &sig->params, param);
                 if (!ST_at_symbol(p, ")")) {
                     ST_perr_here(p, "'" ST_sv_fmt "...' must be the last parameter",
@@ -1878,6 +1878,17 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                     ST_sv_args(param.name));
             return 0;
         }
+
+        if (param.def)
+            seen_default = 1;
+        else if (seen_default) {
+            ST_perr(p, param.line, param.col,
+                    "parameter '" ST_sv_fmt "' has no default, but comes after a parameter "
+                    "that does -- move defaulted parameters to the end",
+                    ST_sv_args(param.name));
+            return 0;
+        }
+
         ST_token_t *nx = ST_peek(p);
         if (nx && !ST_tok_is_symbol(nx, ",") && !ST_tok_is_symbol(nx, ")")) {
             ST_perr(p, nx->line, nx->col,

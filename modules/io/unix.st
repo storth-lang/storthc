@@ -1,7 +1,7 @@
 fn open(path: string, flags: i32, mode: i32) -> i32 {
     buf : [4096]char;
     for i : 0..path.len {
-        buf[i] = path.ptr[i];
+        buf[i] = path[i];
     }
     buf[path.len] = 0 #as char;
     p := &buf[0];
@@ -108,5 +108,30 @@ pub fn readFromFileDescriptor(fd: i32) -> (string, ioError) {
     return str_from_raw(buf #as *char, total), ioError.None;
 }
 
+pub fn readEntireFile(path: string) -> (StringBuilder, ioError) {
+    empty : StringBuilder;
+
+    fd, ferr := openFileDescriptor(path, openMode.readOnly);
+    if ferr != ioError.None {
+        print("open failed: path=% ferr=% fd=%\n", path, ferr, fd);
+        return empty, ferr;
+    }
+
+    content, rerr := readFromFileDescriptor(fd);
+    closeFileDescriptor(fd);
+    if rerr != ioError.None {
+        print("read failed: path=% rerr=%\n", path, rerr);
+        return empty, rerr;
+    }
+
+    sb : StringBuilder;
+    sb.items = content.ptr;
+    sb.count = content.len;
+    sb.capacity = content.len;
+    return sb, ioError.None;
+}
+
+
 #import "error";
 #import "mem";
+#import "string";
