@@ -205,6 +205,7 @@ struct ST_ir_fn_t {
 
     u32 next_value_id;
     u32 next_block_id;
+    u32 decl_line;
 
     b8 is_extern;
     b8 is_pub;
@@ -264,6 +265,8 @@ struct ST_ir_module_t {
     ST_ir_fns_t fns;
     ST_ir_strs_t strs;
     ST_ir_global_vars_t globals;
+    ST_ht_t fn_index;
+    ST_ht_t global_index;
 };
 
 // @note: ST_ir_module_init is module initalization for the SSA IR it takes an arena and

@@ -6,6 +6,8 @@ void ST_ir_module_init(ST_arena_t *arena, ST_string_t name, ST_ir_module_t *out)
     out->fns = (ST_ir_fns_t){0};
     out->strs = (ST_ir_strs_t){0};
     out->globals = (ST_ir_global_vars_t){0};
+    ST_ht_init(arena, &out->fn_index, 64);
+    ST_ht_init(arena, &out->global_index, 32);
 }
 
 ST_ir_fn_t *ST_ir_fn_new(ST_ir_module_t *m, ST_string_t name, ST_ty_t *fn_ty) {
@@ -14,15 +16,20 @@ ST_ir_fn_t *ST_ir_fn_new(ST_ir_module_t *m, ST_string_t name, ST_ty_t *fn_ty) {
     fn->name = name;
     fn->ty = fn_ty;
     ST_da_append_arena(m->arena, &m->fns, fn);
+
+    // 'fn' itself is individually arena-allocated above (a fixed address
+    // for its whole lifetime), so caching the pointer directly here is
+    // safe regardless of how 'm->fns' itself grows/relocates later.
+    ST_ht_generic_t *hk = ST_arena_push(m->arena, sizeof(*hk));
+    hk->tag = name.data;
+    hk->size = name.len;
+    ST_ht_set(&m->fn_index, hk, (ST_ht_generic_t){.tag = fn, .size = 0});
     return fn;
 }
 
 ST_ir_fn_t *ST_ir_module_find_fn(ST_ir_module_t *m, ST_string_t name) {
-    ST_forrange(0, m->fns.count) {
-        if (ST_string_eq(m->fns.items[i]->name, name))
-            return m->fns.items[i];
-    }
-    return NULL;
+    ST_ht_generic_t key = {.tag = name.data, .size = name.len};
+    return (ST_ir_fn_t *)ST_ht_get(&m->fn_index, key).tag;
 }
 
 void ST_ir_module_add_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty, b8 is_pub,
@@ -36,14 +43,24 @@ void ST_ir_module_add_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty, b
     g.init_int = init_int;
     g.init_float = init_float;
     ST_da_append_arena(m->arena, &m->globals, g);
+
+    // Unlike 'fns' (an array of pointers to individually-allocated
+    // structs), 'globals' stores ST_ir_global_var_t by value, so its
+    // backing buffer can relocate on a later append. Caching a raw
+    // pointer into it here would go stale the next time the array grows
+    ST_ht_generic_t *hk = ST_arena_push(m->arena, sizeof(*hk));
+    hk->tag = name.data;
+    hk->size = name.len;
+    ST_ht_set(&m->global_index, hk,
+             (ST_ht_generic_t){.tag = (void *)(uintptr_t)(m->globals.count), .size = 0});
 }
 
 ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name) {
-    ST_forrange(0, m->globals.count) {
-        if (ST_string_eq(m->globals.items[i].name, name))
-            return &m->globals.items[i];
-    }
-    return NULL;
+    ST_ht_generic_t key = {.tag = name.data, .size = name.len};
+    uintptr_t slot = (uintptr_t)ST_ht_get(&m->global_index, key).tag;
+    if (!slot)
+        return NULL;
+    return &m->globals.items[slot - 1];
 }
 
 void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
@@ -371,8 +388,9 @@ ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, u32 lin
     ST_assert(fn->entry != NULL);
     ST_ir_inst_t *inst = ST_ir_emit(fn->entry, ST_IR_ALLOCA, ST_ty_ptr(ctx, p), line, col);
     u32 size = p->size;
-    if ((p->kind == ST_TY_STRUCT || p->kind == ST_TY_ARRAY || p->kind == ST_TY_TAG_UNION) &&
-        size > 8)
+    if (size < 8)
+        size = 8;
+    else if (size > 8)
         size = (size + 7u) & ~7u;
     inst->alloca_.size = size;
     inst->alloca_.align = p->align;

@@ -195,4 +195,5 @@ Operator /= : is used for for decrementation and only post decrementation is val
 Default parameter is support for both storthc functions or C extern functions as we have memory classes.
 
 fn foo(x : u32 = 20) {
+   x = 20;
 }

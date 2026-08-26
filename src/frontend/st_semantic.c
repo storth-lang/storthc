@@ -2418,6 +2418,16 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
                     ST_complete_ty(se, st);
                     e->tyop.operand->ty = st;
                 }
+            } else if (e->tyop.operand->kind == ST_EX_UNARY &&
+                      ST_string_eq_cstr(e->tyop.operand->unary.op, "*")) {
+                ST_ty_t *pt = ST_type_expr(se, e->tyop.operand->unary.operand);
+                if (pt && ST_ty_is_ptr(pt)) {
+                    ST_ty_t *ot = pt->inner;
+                    if (ot) {
+                        ST_complete_ty(se, ot);
+                        e->tyop.operand->ty = ot;
+                    }
+                }
             } else {
                 ST_ty_t *ot = ST_type_expr(se, e->tyop.operand);
                 if (ot)
@@ -4450,6 +4460,59 @@ static void ST_sema_synth_type_info(ST_sema_t *se) {
     ST_complete_ty(se, se->type_info_ty);
 }
 
+static void ST_sema_check_main(ST_sema_t *se, ST_program_t *prog) {
+    ST_decl_t *main_decl = NULL;
+    ST_forrange(0, prog->decls.count) {
+        ST_decl_t *d = prog->decls.items[i];
+        if (d && d->kind == ST_DE_FN && ST_string_eq_cstr(d->name, "main")) {
+            main_decl = d;
+            break;
+        }
+    }
+
+    if (!main_decl) {
+        ST_diag_error(&se->diag, 1, 1,
+                      "program has no 'main' function; add this:\n\n"
+                      "    pub fn main() -> i32 {\n"
+                      "        return 0;\n"
+                      "    }\n");
+        return;
+    }
+
+    if (!main_decl->is_pub) {
+        ST_diag_error(&se->diag, main_decl->line, main_decl->col,
+                      "'main' must be declared 'pub'");
+        return;
+    }
+
+    if (main_decl->fn.sig.params.count > 1) {
+        ST_diag_error(&se->diag, main_decl->line, main_decl->col,
+                      "'main' must take no parameters, or a single '[]string' parameter");
+        return;
+    }
+
+    if (main_decl->fn.sig.params.count == 1) {
+        ST_param_t *p = &main_decl->fn.sig.params.items[0];
+        ST_ty_t *pty = p->te ? ST_resolve_tyexpr(se, p->te) : NULL;
+        if (!pty || pty->kind != ST_TY_SLICE || !pty->inner || pty->inner->kind != ST_TY_STRING) {
+            ST_diag_error(&se->diag, main_decl->line, main_decl->col,
+                          "'main' must take no parameters, or a single '[]string' parameter");
+            return;
+        }
+    }
+
+    if (main_decl->fn.sig.rets.count != 1) {
+        ST_diag_error(&se->diag, main_decl->line, main_decl->col,
+                      "'main' must return a single integer type");
+        return;
+    }
+
+    ST_ty_t *ret_ty = ST_resolve_tyexpr(se, main_decl->fn.sig.rets.items[0]);
+    if (!ret_ty || !ST_ty_is_int(ret_ty))
+        ST_diag_error(&se->diag, main_decl->line, main_decl->col,
+                      "'main' must return a single integer type");
+}
+
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string_t file,
                ST_srcmap_t *srcs, ST_sema_t *out) {
     ST_sema_t *se = out;
@@ -4475,5 +4538,6 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
     ST_sema_types(se, prog);
     ST_sema_check(se, prog);
     ST_sema_default_types(se, prog);
+    ST_sema_check_main(se, prog);
     return se->diag.n_errors == 0;
 }
