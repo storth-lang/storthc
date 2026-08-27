@@ -10,7 +10,7 @@ pub fn slice(str: *string, end: i64, begin: i64 = 0) {
     }
 }
 
-pub fn stringBuilderToString(sb: StringBuilder) -> string {
+pub fn builderToString(sb: StringBuilder) -> string {
     return str_from_raw(sb.items, sb.count);
 }
 
@@ -27,3 +27,11 @@ pub fn trim(str: string, delim: char) -> (string, string) {
     old_str := str_from_raw(str.ptr + str.len, 0);
     return new_str, old_str;
 }
+
+pub fn free_builder(sb: *StringBuilder) -> void {
+    free(sb.items);
+    sb.count = 0;
+    sb.capacity = 0;
+}
+
+#import "mem";

@@ -1,4 +1,4 @@
-pub fn array_reserve(arr: *[..]$T, capacity :=  :: 256) {
+pub fn array_reserve(arr: *[..]$T, capacity : i64 = 256) {
     if arr.capacity == 0 then arr.capacity = capacity;
     else { arr.capacity *= 2; }
 }
@@ -6,7 +6,7 @@ pub fn array_reserve(arr: *[..]$T, capacity :=  :: 256) {
 pub fn array_push(arr: *[..]$T, item: $T) {
     if arr.count >= arr.capacity {
         array_reserve(arr);
-        new_bytes, _ := reallocate(arr.items, arr.capacity);
+        new_bytes, _ := realloc(arr.items, arr.capacity);
         arr.items = new_bytes;
     }
 
