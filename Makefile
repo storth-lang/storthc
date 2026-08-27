@@ -33,7 +33,7 @@ else
 QUIET :=
 endif
 
-.PHONY: all test clean
+.PHONY: all test clean install
 
 all: $(TARGET)
 
@@ -68,9 +68,21 @@ $(OBJROOT)/%.o: $(SRCROOT)/%.c | $(OBJROOT)
 install: $(TARGET)
 	install -d $(INSTALL_DIR)
 	install -m 755 $(TARGET) $(INSTALL_DIR)/storthc
-	install -d $(MODULES_DIR)
-	cp -r modules/. $(MODULES_DIR)/
-	@echo 'export STORTHC_MODULE_PATH="$(MODULES_DIR)"' > ~/.bashrc
+	install -d $(MODULES_DIR)/modules
+	cp -r modules/. $(MODULES_DIR)/modules/
+	@REAL_USER=$${SUDO_USER:-$$USER}; \
+	REAL_HOME=$$(getent passwd "$$REAL_USER" | cut -d: -f6); \
+	BASHRC="$$REAL_HOME/.bashrc"; \
+	LINE='export STORTHC_MODULE_PATH="$(MODULES_DIR)/modules"'; \
+	touch "$$BASHRC"; \
+	if grep -q '^export STORTHC_MODULE_PATH=' "$$BASHRC"; then \
+		sed -i "s|^export STORTHC_MODULE_PATH=.*|$$LINE|" "$$BASHRC"; \
+		echo "updated STORTHC_MODULE_PATH in $$BASHRC"; \
+	else \
+		echo "$$LINE" >> "$$BASHRC"; \
+		echo "added STORTHC_MODULE_PATH to $$BASHRC"; \
+	fi; \
+	[ -n "$$SUDO_USER" ] && chown "$$SUDO_USER":"$$(id -gn "$$SUDO_USER")" "$$BASHRC" || true
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)
