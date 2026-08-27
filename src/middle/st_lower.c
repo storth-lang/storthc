@@ -953,14 +953,7 @@ static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e) {
 
 // @note: ST_lower_bounds_check emits a runtime 'if idx >= len: trap' guard at
 // the current insertion point. A single unsigned comparison covers both
-// directions at once -- a negative signed index reinterpreted as unsigned
-// wraps to a huge value, so it's caught by the same 'idx >= len' check as an
-// index that's simply too large, without a separate negative-index branch.
-// The failure path calls the always-linked-in '__st_bounds_fail' runtime
-// (see st_address_sanitizer.c -- present unconditionally, the same as the
-// ASan runtime it lives alongside) with the exact file/line/col of this
-// index expression, since that's known statically here and doesn't need any
-// of the crash-time RIP-resolution machinery a real SIGSEGV would.
+// directions at once
 static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_inst_t *len,
                                   u32 line, u32 col) {
     ST_ty_t *i64ty = c->sema->tys.prim[ST_ti64];
@@ -1114,8 +1107,7 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
                 ety = bt->inner;
                 // A compile-time-constant index that's out of range is
                 // already caught with a proper diagnostic back in
-                // ST_type_index (semantic analysis) -- only a genuinely
-                // runtime-variable index needs a runtime guard here.
+                // ST_type_index (semantic analysis)
                 i64 const_idx;
                 if (!ST_const_eval(c->sema, e->index.index, &const_idx))
                     len_bound = ST_ir_const_int(c->cur, c->sema->tys.prim[ST_ti64],
@@ -1142,11 +1134,7 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
             } else if (bt && bt->kind == ST_TY_STRING) {
                 // 'string' isn't backed by a general struct-field table the
                 // way SLICE/DYN_ARRAY are (see ST_ty_alloc(..., ST_TY_STRING,
-                // ...) in st_types.c -- no '.fields' populated), so its
-                // {ptr@0, len@8} layout is hardcoded here, matching every
-                // other place this file already assumes it (ST_lower_string_zero,
-                // the ST_TY_STRING branch of ST_lower_fn_body's parameter
-                // lowering, etc.) rather than going through ST_lower_field_find.
+                // ...) in st_types.c
                 ST_ir_inst_t *str_addr = ST_lower_lvalue_addr(c, b);
                 if (!str_addr)
                     return NULL;
@@ -1512,13 +1500,7 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
 
 // The ordinary, ST_lower_expr-facing entry point: emits the raw call
 // (via ST_lower_call_raw above), then reconstructs a single value out of
-// it if e->ty says this is a string/struct/tag_union return -- correct
-// for an ordinary single-value call context ('s := returns_a_string();'),
-// but NOT correct to run for a multi-return call being used in a
-// multi-bind ('a, b := returns_two_things();'), since e->ty there is
-// just the *first* return type, not the call's only type -- that case
-// calls ST_lower_call_raw directly instead, and does its own, real,
-// per-return-value reconstruction (see ST_ST_MULTI_BIND below).
+// it if e->ty says this is a string/struct/tag_union return
 static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_ir_inst_t *result = ST_lower_call_raw(c, e);
 
@@ -2838,10 +2820,7 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                     break;
 
                 // Eightbyte offset into the call's whole return, not the
-                // logical return-value index -- a non-scalar value (e.g.
-                // a string) spans more than one eightbyte, so it has to
-                // be tracked running across every return value, not
-                // reset per value.
+                // logical return-value index
                 u32 eb_offset = 0;
                 ST_forrange(0, s->multi.n_names) {
                     ST_ty_t *rt = ret_tys->items[i];
@@ -2854,10 +2833,7 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                                   : ST_ir_extract(c->cur, rt, call_val, eb_offset, s->line, s->col);
                     } else {
                         // Same reconstruction ST_lower_expr already does
-                        // for a single string/struct/tag_union return --
-                        // allocate a real slot, pull each of this value's
-                        // own eightbytes out of the call result starting
-                        // at its own eb_offset, store them in place.
+                        // for a single string/struct/tag_union return.
                         ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, rt, s->line, s->col);
                         ST_forrange(0, n_eb) {
                             ST_ty_t *ebty = ST_lower_eight_byte_ty(c, rt, i);
@@ -3323,6 +3299,7 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
 
     ST_ir_fn_t *fn = ST_ir_module_find_fn(c->module, d->name);
     fn->decl_line = d->line;
+    fn->file = d->file;
     ST_ty_t *fn_ty = fn->ty;
 
     if (ST_string_eq_cstr(d->name, "main") &&

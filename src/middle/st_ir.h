@@ -206,7 +206,7 @@ struct ST_ir_fn_t {
     u32 next_value_id;
     u32 next_block_id;
     u32 decl_line;
-
+    ST_string_t file;
     b8 is_extern;
     b8 is_pub;
     b8 is_variadic;

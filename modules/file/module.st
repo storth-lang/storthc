@@ -76,25 +76,19 @@ pub fn readFromFileDescriptor(fd: i32) -> (string, ioError) {
     return str_from_raw(buf #as *char, total), ioError.None;
 }
 
-pub fn readEntireFile(path: string) -> (StringBuilder, bool) {
-    empty : StringBuilder;
-
+pub fn readEntireFile(path: string) -> (string, bool) {
     fd, ferr := openFileDescriptor(path, openMode.readOnly);
     if ferr != ioError.None {
         print("open failed: path=% ferr=% fd=%\n", path, ferr, fd);
-        return empty, false;
+        return "", false;
     }
 
     content, rerr := readFromFileDescriptor(fd);
     closeFileDescriptor(fd);
     if rerr != ioError.None {
         print("read failed: path=% rerr=%\n", path, getErrorString(rerr));
-        return empty, false;
+        return content, false;
     }
 
-    sb : StringBuilder;
-    sb.items = content.ptr;
-    sb.count = content.len;
-    sb.capacity = content.len;
-    return sb, true;
+    return content, true;
 }

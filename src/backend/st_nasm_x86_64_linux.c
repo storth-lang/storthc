@@ -863,7 +863,7 @@ static ST_string_t ST_nasm_qualified_label(ST_arena_t *arena, ST_string_t fn_nam
     return (ST_string_t){.data = data, .len = (u32)total};
 }
 
-static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena, ST_string_t file,
+static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena,
                            ST_dbg_info_t *dbg) {
     ST_gen_ctx_t ctx;
     u32 extra = ST_layout_fn(fn, &ctx);
@@ -880,7 +880,7 @@ static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena, ST_stri
 
     u32 fn_idx = 0;
     if (dbg) {
-        u32 file_idx = ST_dbg_intern_file(arena, dbg, file);
+        u32 file_idx = ST_dbg_intern_file(arena, dbg, fn->file);
         fn_idx = ST_dbg_add_fn(arena, dbg, fn->name, fn->name, file_idx, fn->decl_line);
     }
 
@@ -912,6 +912,7 @@ static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena, ST_stri
 b8 ST_nasm_generate(FILE *out, ST_ir_module_t *m, ST_string_t src, ST_string_t file,
                     b8 emit_entry, ST_dbg_info_t *dbg) {
     ST_unused(src);
+    ST_unused(file);
     if (out == NULL)
         out = stdout;
     fprintf(out, "BITS 64\n");
@@ -927,7 +928,7 @@ b8 ST_nasm_generate(FILE *out, ST_ir_module_t *m, ST_string_t src, ST_string_t f
         if (fn->is_pub) {
             fprintf(out, "global " ST_sv_fmt "\n", ST_sv_args(fn->name));
         }
-        ST_generate_fn(out, fn, m->arena, file, dbg);
+        ST_generate_fn(out, fn, m->arena, dbg);
     }
     if (emit_entry) {
         ST_ir_fn_t *main_fn = ST_ir_module_find_fn(m, ST_cstr_to_str("main"));
