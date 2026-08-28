@@ -1,5 +1,6 @@
 STDOUT :: 1;
 STDERR :: 2;
+
 fn io_write_byte(fd: i32, b: i8) {
     #asm {
         xor rbx, rbx
@@ -14,6 +15,7 @@ fn io_write_byte(fd: i32, b: i8) {
         inc rsp
     }
 }
+
 fn io_write_int(fd: i32, n: i64) {
     if n < 0 {
         io_write_byte(fd, '-' #as i8);
@@ -23,15 +25,18 @@ fn io_write_int(fd: i32, n: i64) {
     if n >= 10 then io_write_int(fd, n / 10);
     io_write_byte(fd, ((n % 10) + ('0' #as i64)) #as i8);
 }
+
 fn io_write_uint(fd: i32, n: u64) {
     if n >= 10 then io_write_uint(fd, n / 10);
     io_write_byte(fd, ((n % 10) + (48 #as u64)) #as i8);
 }
+
 fn io_write_str(fd: i32, s: string) {
     for i: 0..s.len {
         io_write_byte(fd, s.ptr[i] #as i8);
     }
 }
+
 fn io_write_float(fd: i32, f: f32) {
     whole := f #as i64;
     io_write_int(fd, whole);
@@ -44,6 +49,7 @@ fn io_write_float(fd: i32, f: f32) {
     if frac_int < 10 then io_write_byte(fd, '0' #as i8);
     io_write_int(fd, frac_int);
 }
+
 fn io_write_float64(fd: i32, f: f64) {
     whole := f #as i64;
     io_write_int(fd, whole);
@@ -56,13 +62,12 @@ fn io_write_float64(fd: i32, f: f64) {
     if frac_int < 10 then io_write_byte(fd, '0' #as i8);
     io_write_int(fd, frac_int);
 }
+
 fn io_write_bool(fd: i32, b: bool) {
-    if b {
-        io_write_str(fd, "true");
-    } else {
-        io_write_str(fd, "false");
-    }
+    if b then io_write_str(fd, "true");
+    else then io_write_str(fd, "false");
 }
+
 fn io_write_hex_digit(fd: i32, d: i64) {
     if d < 10 {
         io_write_byte(fd, (d + ('0' #as i64)) #as i8);
@@ -70,10 +75,12 @@ fn io_write_hex_digit(fd: i32, d: i64) {
         io_write_byte(fd, (d - 10 + ('a' #as i64)) #as i8);
     }
 }
+
 fn io_write_hex(fd: i32, n: u64) {
     if n >= 16 then io_write_hex(fd, n / 16);
     io_write_hex_digit(fd, (n % 16) #as i64);
 }
+
 fn io_write_ptr(fd: i32, addr: u64) {
     if addr == 0 {
         io_write_str(fd, "null");
@@ -82,6 +89,7 @@ fn io_write_ptr(fd: i32, addr: u64) {
     io_write_str(fd, "0x");
     io_write_hex(fd, addr);
 }
+
 fn print_value(fd: i32, v: $V) {
     #if kind(v) {
         case "i8"  then io_write_int(fd, v #as i64);

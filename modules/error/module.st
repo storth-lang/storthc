@@ -32,14 +32,8 @@ pub fn getErrorString(err: $T(ioError | memoryError)) -> string {
 	}
 }
 
-last_errno : i32 = 0;
-
-pub fn set_last_errno(negated_result: i32) -> void {
-	last_errno = -negated_result;
-}
-
-pub fn get_last_errno() -> i32 {
-	return last_errno;
+pub fn errorReport(err: $T(ioError | memoryError)) -> void {
+    eprint("%\n", getErrorString(err));
 }
 
 pub fn errnoString(e: i64) -> string {
@@ -64,3 +58,5 @@ pub fn errnoString(e: i64) -> string {
 	if e == 36 then return "File name too long";
 	return "unknown errno";
 }
+
+#import "io";

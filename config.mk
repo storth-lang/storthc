@@ -1,6 +1,7 @@
 PREFIX ?= /usr/local
 INSTALL_DIR := $(PREFIX)/bin
 MODULES_DIR := $(PREFIX)/storthc
+
 CC ?= gcc
 
 VERSION_MAJOR := 0

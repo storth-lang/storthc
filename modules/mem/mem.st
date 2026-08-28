@@ -32,7 +32,7 @@ fn arena_init(reserve : i64) -> (*Arena, memoryError) {
 pub fn arenaAllocate(reserve : i64 = DEFAULT_ARENA_SIZE) -> (*Arena, bool) {
     arena, err := arena_init(reserve);
     if err != memoryError.None {
-        // error_report(err);
+        errorReport(err);
         return arena, false;
     }
     return arena, true;
