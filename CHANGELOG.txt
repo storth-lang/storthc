@@ -225,3 +225,12 @@
   }
   ```
   This will limit the type of x to be of a u8 pointer or a string.
+
+
+2026:08:29
+
+- Added CI pipeline and set up discord server. Obviously a whole lot of changes in module.
+
+- We have OS module separate to denote that all the assembly stuff goes there and does not infect the current mechanism. Then we have all the linux.st files moved to into one file called module.st there. In proper organization which will be easy for us to read. Do note that the modules are barely documented so it requires a whole lot of knowledge of the syscall table.
+
+- We have time module added.

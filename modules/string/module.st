@@ -51,14 +51,11 @@ pub fn freeBuilder(sb: *StringBuilder) -> void {
 // stringToBuilder will push string characters into string builder.
 // Do note that since string builder is a dynamic array of characters do not forget to free it.
 // Also for this will not keep pushing into the same buffer but rather into new buffer everytime.
-pub fn stringToBuilder(s: string) -> StringBuilder {
-    sb : StringBuilder;
-    if s.ptr == null then return sb;
+pub fn stringToBuilder(sb: *StringBuilder, s: string) {
+    if s.ptr == null then return;
     for c: s {
-        arrayPush(&sb, c);
+        arrayPush(sb, c);
     }
-
-    return sb;
 }
 
 fn push_int(sb: *StringBuilder, int: i64) {
@@ -78,24 +75,11 @@ fn push_uint(sb: *StringBuilder, int: i64) {
     arrayPush(sb, ((int % 10) + ('0' #as i64)) #as char);
 }
 
-fn push_float(sb: *StringBuilder, f: f32) {
+fn push_float(sb: *StringBuilder, f: $T(f32 | f64)) {
     whole := f #as i64;
     push_int(sb, whole);
     arrayPush(sb, '.');
-    frac := f - (whole #as f32);
-    if frac < 0.0 then frac *= -1;
-    frac = frac * 1000.0;
-    frac_int := frac #as i64;
-    if frac_int < 100 then arrayPush(sb, '0');
-    if frac_int < 10 then arrayPush(sb, '0');
-    push_int(sb, frac_int);
-}
-
-fn push_float64(sb: *StringBuilder, f: f64) {
-    whole := f #as i64;
-    push_int(sb, whole);
-    arrayPush(sb, '.');
-    frac := f - (whole #as f64);
+    frac := f - (whole #as type_of(f));
     if frac < 0.0 then frac *= -1;
     frac = frac * 1000.0;
     frac_int := frac #as i64;
@@ -146,7 +130,7 @@ pub fn append_value(sb: *StringBuilder, v: $V) {
         case "u32" then push_uint(sb, v #as i64);
         case "u64" then push_uint(sb, v);
         case "f32" then push_uint(sb, v);
-        case "f64" then push_float64(sb, v);
+        case "f64" then push_float(sb, v);
         case "bool" then push_bool(sb, v);
         case "string" then push_string(sb, v);
         case "ptr" then push_hex(sb, v #as u64);
@@ -224,6 +208,21 @@ pub fn format(sb: *StringBuilder, fmt: string, args: $T...) -> void {
         append_value(sb, a);
     }
     write_until_percent(sb, fmt, pos);
+}
+
+pub fn concatinate(dst: []char, str1: string, str2: string) -> string {
+    n : i64 = 0;
+    for c : str1 {
+        if n >= dst.len then break;
+        dst[n] = c;
+        n = n + 1;
+    }
+    for c : str2 {
+        if n >= dst.len then break;
+        dst[n] = c;
+        n = n + 1;
+    }
+    return str_from_raw(&dst[0], n);
 }
 
 #import "mem";

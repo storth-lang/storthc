@@ -371,11 +371,18 @@ static void ST_fasm_generate_inst(FILE *out, ST_fasm_ctx_t *ctx, ST_ir_inst_t *i
         case ST_IR_EXTRACT_OP: {
             ST_ir_inst_t *agg = in->extract.agg;
             u32 rc = (agg->kind == ST_IR_CALL) ? ST_fasm_call_ret_count(agg) : 0;
-            if (rc >= 2)
-                fprintf(out, "    mov rax, [rbp%+d]\n", ST_fasm_ret_buf_off(agg, in->extract.index));
-            else if (in->extract.index == 0)
-                ST_fasm_load(out, "rax", agg);
-            else
+            b8 want_float = in->ty && ST_ty_is_float(in->ty);
+            if (rc >= 2) {
+                if (want_float)
+                    fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_fasm_ret_buf_off(agg, in->extract.index));
+                else
+                    fprintf(out, "    mov rax, [rbp%+d]\n", ST_fasm_ret_buf_off(agg, in->extract.index));
+            } else if (in->extract.index == 0) {
+                if (want_float)
+                    ST_fasm_fload(out, "xmm0", agg);
+                else
+                    ST_fasm_load(out, "rax", agg);
+            } else
                 ST_todo("extract index >0 from a non multi-return value");
         } break;
         case ST_IR_UDIV:

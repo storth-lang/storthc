@@ -322,7 +322,8 @@ typedef struct {
     ST_tyexpr_t *te;
     ST_expr_t *def;
     u32 line, col;
-    b8 is_pack; // 'name: any...'
+    b8 is_pack;  // 'name: any...'
+    b8 is_const; // 'name :: T' -- caller's argument must be a compile-time constant
 } ST_param_t;
 
 typedef struct {

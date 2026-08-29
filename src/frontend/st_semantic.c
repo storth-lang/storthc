@@ -226,8 +226,20 @@ static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t targ
                                    ST_expr_t *replacement); // used by ST_type_expr's
                                    // ST_EX_PACK_FOLD case, defined later in this file
 static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig);
+static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 
 b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out);
+
+static void ST_check_const_param(ST_sema_t *se, ST_param_t *param, ST_arg_t *arg) {
+    if (!param->is_const || !arg || !arg->value)
+        return;
+    i64 dummy;
+    if (!ST_const_eval(se, arg->value, &dummy))
+        ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                      "argument '" ST_sv_fmt "' must be a compile-time constant (parameter is declared '"
+                      ST_sv_fmt " :: T')",
+                      ST_sv_args(param->name), ST_sv_args(param->name));
+}
 
 static b8 ST_const_eval_bin(ST_sema_t *se, ST_expr_t *e, i64 *out) {
     i64 l, r;
@@ -1302,6 +1314,8 @@ static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
                       ST_sv_args(e->name));
         return NULL;
     }
+    if (sym->kind == ST_SYM_FN && sym->decl && !ST_string_eq(e->name, sym->decl->name))
+        e->name = sym->decl->name;
     switch (sym->kind) {
         case ST_SYM_VAR:
         case ST_SYM_EXTERN_VAR:
@@ -1585,6 +1599,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
 
     if (callee && callee->kind == ST_EX_IDENT) {
         sym = ST_sym_find(se, callee->name);
+        if (sym && sym->kind == ST_SYM_FN && sym->decl &&
+            !ST_string_eq(callee->name, sym->decl->name))
+            callee->name = sym->decl->name;
         if (!sym) {
             ST_sym_t *tsym = ST_sym_find_in(&se->templates, callee->name);
             if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN)
@@ -1636,7 +1653,14 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 continue;
             }
         }
-        ST_ty_t *at = ST_type_expr(se, av);
+	ST_ty_t *pt = (fnty && i < fnty->params.count) ? fnty->params.items[i] : NULL;
+	ST_ty_t *at;
+	if (av->kind == ST_EX_STRUCT_LIT && av->struct_lit.is_bracket_lit) {
+	    at = ST_type_struct_lit(se, av, pt);
+	    av->ty = at;
+	} else {
+	    at = ST_type_expr(se, av);
+	}
         if (at && at->kind == ST_TY_TYPEID) {
             ST_ty_t *named = av->kind == ST_EX_TYPEOF && av->tyop.operand ? av->tyop.operand->ty
                                                                           : NULL;
@@ -1777,6 +1801,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                               "argument '" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(sig->params.items[idx].name), ST_tstr(se, pt),
                               ST_tstr(se, at));
+            if (idx < sig->params.count)
+                ST_check_const_param(se, &sig->params.items[idx], arg);
         }
         return &fnty->rets;
     }
@@ -1827,6 +1853,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                                      "'" ST_sv_fmt "' is declared here",
                                      ST_sv_args(ST_sym_display_name(sym)));
         }
+        if (sig && i < sig->params.count)
+            ST_check_const_param(se, &sig->params.items[i], arg);
     }
     if (fnty->is_variadic) {
         ST_forrange(max_p, n) {
@@ -2040,8 +2068,6 @@ static ST_ty_t *ST_infer_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) 
     }
     return ST_instantiate_struct(se, td, args, e->line, e->col);
 }
-
-static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v) {
     if (!v->payload)
@@ -3142,6 +3168,10 @@ static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t targ
         case ST_ST_DEFER:
             ST_ast_substitute_stmt(se, s->defer_stmt, target, replacement);
             return;
+        case ST_ST_MULTI_BIND:
+            ST_forrange(0, s->multi.values.count)
+                ST_ast_substitute_expr(se, s->multi.values.items[i], target, replacement);
+            return;
         default:
             return;
     }
@@ -4152,6 +4182,58 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
     }
 }
 
+static ST_string_t ST_decl_parent_prefix(ST_string_t name) {
+    for (u32 i = name.len; i > 0; i--) {
+        if (name.data[i - 1] == '$')
+            return (ST_string_t){.data = name.data, .len = i - 1};
+    }
+    return (ST_string_t){0};
+}
+
+static void ST_apply_nested_fn_renames(ST_sema_t *se, ST_decl_t *d) {
+    ST_string_t parent_prefix = ST_decl_parent_prefix(d->name);
+    ST_forrange(0, se->prog->decls.count) {
+        ST_decl_t *sib = se->prog->decls.items[i];
+        if (!sib || sib->kind != ST_DE_FN)
+            continue;
+        if (!ST_string_eq(ST_decl_parent_prefix(sib->name), parent_prefix))
+            continue;
+        ST_string_t bare = ST_decl_display_name(sib);
+        if (ST_string_eq(bare, sib->name))
+            continue;
+        ST_expr_t repl = {0};
+        repl.kind = ST_EX_IDENT;
+        repl.name = sib->name;
+        ST_forrange(0, d->fn.body.count)
+            ST_ast_substitute_stmt(se, d->fn.body.items[i], bare, &repl);
+    }
+}
+
+static void ST_declare_visible_nested_fns(ST_sema_t *se, ST_decl_t *d) {
+    ST_string_t as_parent = d->name;
+    ST_string_t own_parent = ST_decl_parent_prefix(d->name);
+    ST_forrange(0, se->prog->decls.count) {
+        ST_decl_t *cand = se->prog->decls.items[i];
+        if (!cand || cand->kind != ST_DE_FN)
+            continue;
+        ST_string_t cand_parent = ST_decl_parent_prefix(cand->name);
+        b8 is_child = ST_string_eq(cand_parent, as_parent);
+        b8 is_sibling_or_self = ST_string_eq(cand_parent, own_parent);
+        if (!is_child && !is_sibling_or_self)
+            continue;
+        ST_string_t bare = ST_decl_display_name(cand);
+        if (ST_string_eq(bare, cand->name))
+            continue;
+        if (ST_sym_find_in(&se->scope->table, bare))
+            continue;
+        ST_sym_t *gsym = ST_sym_find_in(&se->globals, cand->name);
+        if (!gsym)
+            continue;
+        ST_sym_insert(se, &se->scope->table,
+                      ST_sym_new(se, ST_SYM_FN, bare, cand, gsym->t, cand->line, cand->col));
+    }
+}
+
 static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     ST_fn_sig_t *sig = &d->fn.sig;
     ST_ty_t *fnty = sym->t;
@@ -4176,6 +4258,7 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     if (!d->fn.is_prototype) {
         ST_collect_labels(se, &labels, &d->fn.body);
         ST_check_infinite_goto_loops(se, &d->fn.body);
+        ST_apply_nested_fn_renames(se, d);
     }
 
     b8 save_has_pack = se->has_pack;
@@ -4205,6 +4288,7 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
         ST_pack_substitute_body(se, &d->fn.body);
 
     ST_scope_push(se);
+    ST_declare_visible_nested_fns(se, d);
     ST_forrange(0, sig->params.count) {
         ST_param_t *p = &sig->params.items[i];
         ST_ty_t *pt = fnty && i < fnty->params.count ? fnty->params.items[i] : NULL;
