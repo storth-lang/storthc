@@ -1,0 +1,45 @@
+name: Storth Compiler Workflow
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Make and GCC
+      run: sudo apt-get install -y make nasm binutils gcc
+    - name: Build (make)
+      run: make
+    # - name: Run tests
+    #   run: make test
+
+  check-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG.txt update
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1
+            base="origin/${{ github.base_ref }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              echo "no previous commit to diff against, skipping"
+              exit 0
+            fi
+            base="$before"
+          fi
+
+          if git diff --name-only "$base"...HEAD | grep -qx CHANGELOG.txt; then
+            echo "CHANGELOG.txt was updated"
+          else
+            echo "::error::CHANGELOG.md was not updated in this change"
+            exit 1
+          fi

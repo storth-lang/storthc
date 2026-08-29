@@ -16,6 +16,16 @@ pub enum_flag ioError {
 	ReadError;
 }
 
+pub enum_flag processError {
+    None;
+	procRun;
+	procRun;
+	procRun;
+	procRun;
+	procRun;
+	ReadError;
+}
+
 pub fn getErrorString(err: $T(ioError | memoryError)) -> string {
 	if err {
 		case memoryError.ReserveFailed { return "failed to reserve address space (mmap)"; }

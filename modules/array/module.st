@@ -19,4 +19,10 @@ pub fn arrayRemoveUnordered(arr: *[..]$T, index: i32) {
     arr.items[index] = arr.items[arr.count];
 }
 
+pub fn shift(args: *[]$T) {
+    if args.len <= 0 then return;
+    args.ptr = args.ptr + 1;
+    args.len -= 1;
+}
+
 #import "mem";

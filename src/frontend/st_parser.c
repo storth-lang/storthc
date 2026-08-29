@@ -233,6 +233,10 @@ static ST_expr_t *ST_parse_expr(ST_parser_t *p);
 static ST_stmt_t *ST_parse_stmt(ST_parser_t *p);
 static b8 ST_parse_asm_tokens(ST_parser_t *p, ST_token_t **out_toks, u32 *out_n);
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out);
+static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub);
+static b8 ST_parse_generic_list(ST_parser_t *p, ST_strings_t *out);
+static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern);
+static void ST_collect_generic_te(ST_parser_t *p, ST_tyexpr_t *te, ST_strings_t *out);
 
 static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
     ST_token_t *t = ST_peek(p);
@@ -1193,6 +1197,17 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
     s->decl.te = ST_parse_type(p);
     if (!s->decl.te)
         return NULL;
+    if (ST_at_symbol(p, ":")) {
+        // 'x : T : expr;' -- typed local constant
+        p->pos++;
+        s->decl.is_const = 1;
+        s->decl.init = ST_parse_expr(p);
+        if (!s->decl.init)
+            return NULL;
+        if (!ST_expect_semi(p))
+            return NULL;
+        return s;
+    }
     if (ST_at_symbol(p, ":=")) {
         ST_perr_here(p, "variable '" ST_sv_fmt "' has an explict type; use = instead of :=",
                      ST_sv_args(s->decl.name));
@@ -1591,7 +1606,20 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
     while (p->pos < p->n_tokens && !ST_at_symbol(p, "}")) {
         if (p->n_errors >= ST_PARSE_MAX_ERRORS)
-            return 0;
+             return 0;
+        if (ST_tok_is_keyword(ST_peek(p), "fn")) {
+	    ST_token_t *start_tok = ST_peek(p);
+	    ST_decl_t *nd = ST_parse_fn_decl(p, 0);
+	    if (!nd) {
+		ST_sync_stmt(p);
+		continue;
+	    }
+
+	    nd->file = start_tok && start_tok->file.len ? start_tok->file : p->file;
+	    ST_da_append_arena(p->arena, &p->nested_fns, nd);
+	    continue;
+	}
+
         ST_stmt_t *s = ST_parse_stmt(p);
         if (!s) {
             ST_sync_stmt(p);
@@ -1600,6 +1628,54 @@ static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
         ST_da_append_arena(p->arena, out, s);
     }
     return 1;
+}
+
+static ST_string_t ST_mangle_nested_fn(ST_arena_t *a, ST_string_t parent, ST_string_t name) {
+    u32 total = parent.len + 1 + name.len;
+    u8 *buf = ST_arena_push(a, total);
+    memcpy(buf, parent.data, parent.len);
+    buf[parent.len] = '$';
+    memcpy(buf + parent.len + 1, name.data, name.len);
+    return (ST_string_t){.data = buf, .len = total};
+}
+
+static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
+    ST_token_t *t = ST_peek(p);
+    p->pos++;
+    ST_token_t *nt = ST_peek(p);
+    ST_decl_t *d = ST_decl_new(p->arena, ST_DE_FN, nt ? nt->line : t->line, nt ? nt->col : t->col);
+    d->is_pub = is_pub;
+    d->name = ST_expect_ident(p, "a function name");
+    if (!ST_parse_generic_list(p, &d->fn.sig.generics))
+        return NULL;
+    if (!d->name.len)
+        return NULL;
+    if (p->fn_name_stack.count) {
+        ST_string_t parent = p->fn_name_stack.items[p->fn_name_stack.count - 1];
+        d->display_name = d->name;
+        d->name = ST_mangle_nested_fn(p->arena, parent, d->display_name);
+    }
+    if (!ST_parse_fn_sig(p, &d->fn.sig, 0))
+        return NULL;
+    ST_forrange(0, d->fn.sig.params.count)
+        ST_collect_generic_te(p, d->fn.sig.params.items[i].te, &d->fn.sig.generics);
+    ST_forrange(0, d->fn.sig.rets.count)
+        ST_collect_generic_te(p, d->fn.sig.rets.items[i], &d->fn.sig.generics);
+    if (ST_at_symbol(p, ";")) {
+        p->pos++;
+        d->fn.is_prototype = 1;
+        return d;
+    }
+    if (!ST_expect_sym(p, "{"))
+        return NULL;
+    ST_da_append_arena(p->arena, &p->fn_name_stack, d->name);
+    b8 body_ok = ST_parse_body(p, &d->fn.body);
+    p->fn_name_stack.count--;
+    if (!body_ok)
+        return NULL;
+    if (!ST_expect_sym(p, "}"))
+        return NULL;
+    return d;
 }
 
 static ST_decl_t *ST_parse_struct_decl(ST_parser_t *p, ST_string_t name, u32 line, u32 col);
@@ -1802,7 +1878,13 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
         param.name = ST_expect_ident(p, "a parameter name");
         if (!param.name.len)
             return 0;
-        if (ST_at_symbol(p, ":")) {
+        if (ST_at_symbol(p, "::")) {
+            p->pos++;
+            param.is_const = 1;
+            param.te = ST_parse_type(p);
+            if (!param.te)
+                return 0;
+        } else if (ST_at_symbol(p, ":")) {
             p->pos++;
             param.te = ST_parse_type(p);
             if (!param.te)
@@ -2123,36 +2205,8 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         return d;
     }
-    if (ST_tok_is_keyword(t, "fn")) {
-        p->pos++;
-        ST_token_t *nt = ST_peek(p);
-        ST_decl_t *d =
-            ST_decl_new(p->arena, ST_DE_FN, nt ? nt->line : t->line, nt ? nt->col : t->col);
-        d->is_pub = is_pub;
-        d->name = ST_expect_ident(p, "a function name");
-        if (!ST_parse_generic_list(p, &d->fn.sig.generics))
-            return NULL;
-        if (!d->name.len)
-            return NULL;
-        if (!ST_parse_fn_sig(p, &d->fn.sig, 0))
-            return NULL;
-        ST_forrange(0, d->fn.sig.params.count)
-            ST_collect_generic_te(p, d->fn.sig.params.items[i].te, &d->fn.sig.generics);
-        ST_forrange(0, d->fn.sig.rets.count)
-            ST_collect_generic_te(p, d->fn.sig.rets.items[i], &d->fn.sig.generics);
-        if (ST_at_symbol(p, ";")) {
-            p->pos++;
-            d->fn.is_prototype = 1;
-            return d;
-        }
-        if (!ST_expect_sym(p, "{"))
-            return NULL;
-        if (!ST_parse_body(p, &d->fn.body))
-            return NULL;
-        if (!ST_expect_sym(p, "}"))
-            return NULL;
-        return d;
-    }
+    if (ST_tok_is_keyword(t, "fn"))
+        return ST_parse_fn_decl(p, is_pub);
 
     if (ST_tok_is_symbol(t, "#import")) {
         p->pos++;
@@ -2221,5 +2275,7 @@ b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t 
         d->file = start_tok && start_tok->file.len ? start_tok->file : file;
         ST_da_append_arena(arena, &out->decls, d);
     }
+    ST_forrange(0, p->nested_fns.count)
+        ST_da_append_arena(arena, &out->decls, p->nested_fns.items[i]);
     return p->n_errors == 0;
 }

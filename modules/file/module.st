@@ -1,8 +1,8 @@
-#load "linux.st";
 #import "error";
 #import "mem";
 #import "string";
 #import "io";
+#import "os";
 
 pub enum_flag openMode {
     readOnly;
@@ -20,7 +20,6 @@ pub fn openFileDescriptor(path: string, mode := openMode.readAndWrite) -> (i32, 
     flags := flags_for_mode(mode);
     fd := open(path, flags, 420);
     if fd < 0 {
-        set_last_errno(fd);
         if mode == openMode.readOnly then return 0, ioError.OpenErrorR;
         if mode == openMode.writeOnly then return 0, ioError.OpenErrorW;
         return 0, ioError.OpenErrorRW;
@@ -37,7 +36,6 @@ pub fn writeToFileDescriptor(fd: i32, data: string) -> (i64, ioError) {
     n := data.len;
     written := write(fd, p, n #as i32);
     if written < 0 {
-        set_last_errno(written);
         return 0, ioError.WriteError;
     }
     return written #as i64, ioError.None;
@@ -55,7 +53,6 @@ pub fn readFromFileDescriptor(fd: i32) -> (string, ioError) {
         remaining := cap #as i32 - total;
         n := read(fd, p #as *char, remaining);
         if n < 0 {
-            set_last_errno(n);
             free(buf);
             return "", ioError.ReadError;
         }

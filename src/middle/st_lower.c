@@ -359,14 +359,16 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te) {
         case ST_TE_PTR:
             return ST_ty_ptr(&c->sema->tys, ST_lower_tyexpr(c, te->inner));
         case ST_TE_ARRAY: {
-            ST_ty_t *inner = ST_lower_tyexpr(c, te->inner);
-            if (te->is_dynamic)
-                return ST_ty_dyn_array(&c->sema->tys, inner);
-            if (!te->count_expr)
-                return ST_ty_slice(&c->sema->tys, inner);
-            u64 count = te->count_expr->kind == ST_EX_INT ? (u64)te->count_expr->ival : 0;
-            return ST_ty_array(&c->sema->tys, inner, count);
-        }
+	    ST_ty_t *inner = ST_lower_tyexpr(c, te->inner);
+	    if (te->is_dynamic)
+	        return ST_ty_dyn_array(&c->sema->tys, inner);
+	    if (!te->count_expr)
+	        return ST_ty_slice(&c->sema->tys, inner);
+	    i64 n = 0;
+	    if (!ST_const_eval(c->sema, te->count_expr, &n) || n < 0)
+	    n = 0;
+	    return ST_ty_array(&c->sema->tys, inner, (u64)n);
+	}
     }
     return NULL;
 }
@@ -844,7 +846,10 @@ static ST_ir_inst_t *ST_lower_struct_addr(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty
         return ST_lower_union_construct_addr(c, e);
     if (e->kind == ST_EX_STRUCT_LIT) {
         ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, st, e->line, e->col);
-        ST_lower_struct_lit_into(c, slot, 0, st, e);
+        if (e->struct_lit.is_bracket_lit)
+            ST_lower_bracket_lit_into(c, slot, st, e);
+        else
+            ST_lower_struct_lit_into(c, slot, 0, st, e);
         return slot;
     }
     return ST_lower_lvalue_addr(c, e);
