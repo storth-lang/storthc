@@ -1,6 +1,6 @@
-fn main() -> i32 {
-    printf("%s\n", "Urmom");
+pub fn main() -> i32 {
+    print("Hello world\n");
     return 0;
 }
 
-extern fn printf(fmt: *char, ...) -> i32;
+#import "io";

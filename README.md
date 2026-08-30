@@ -19,6 +19,14 @@ make -j$(nproc)
 
 Papers and Ideas:
 
+The implementation of the standard library is done via inline assembly of linux syscalls.
+Right now for majority of the implementation of it I barely care less about platform as getting the language to utmost
+usability is much more important.
+
+The linux syscall reference I used comes from (@qy9)[https://codeberg.org/memfd/libsmh]
+Do not we do not have any libc in the standard library making the language very portable as all linux OS do have.
+Linux syscall.
+
 - stdlib design: https://codeberg.org/memfd/libsmh
 - Hash Table: https://arxiv.org/pdf/2501.02305
 - SSA IR paper: https://c9x.me/compile/bib/braun13cc.pdf
