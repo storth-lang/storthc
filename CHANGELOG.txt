@@ -238,3 +238,5 @@
 - We have examples and test cases even though not integrated with the CI they are test cases non the less so we should not forget that these test cases will be integrated for later down the line for now I just wanted to have some sort of mechanism I will visualize and try and test and find bugs.
 
 - This commit for today is more so bug finding with in the compiler not actual like programming.
+
+- Found more error in regards to passing arrays and problem with process module.
