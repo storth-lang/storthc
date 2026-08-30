@@ -8,6 +8,23 @@ pub MAP_ANON      :: 32;
 pub MADV_DONTNEED :: 4;
 pub PAGE          :: 4096;
 
+pub struct timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+pub fn sys_time(n: u64, a1: u64, a2: *timespec) -> i64 {
+    ret: i64 = 0;
+    #asm {
+        mov rax, n
+        mov rdi, a1
+        mov rsi, a2
+        syscall
+        mov [&ret], rax
+    };
+    return ret;
+}
+
 pub fn sys_mmap(addr: *void, length: i64, prot: i32, flags: i32, fd: i32, offset: i64) -> *void {
     MMAP :: 9;
 
