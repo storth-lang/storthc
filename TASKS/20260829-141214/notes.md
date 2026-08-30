@@ -6,7 +6,7 @@
 
 ## STATUS: OPEN
 
-## TAGS: .semantic
+## TAGS: semantic
 
 ## NOTES:
 

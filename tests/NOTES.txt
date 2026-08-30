@@ -1,7 +1,7 @@
 # Spec: Sat Jul 11 2026 - sth snapshot test framework
 
 A snapshot test framework. Single self contained program, no dependencies
-beyond a shell and sha256sum
+beyond a shell and sha256sum.
 
 The record data is a binary blob of its own so people can not modify it
 as they please. Any casual edit breaks the padding markers and the file

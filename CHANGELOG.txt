@@ -234,3 +234,7 @@
 - We have OS module separate to denote that all the assembly stuff goes there and does not infect the current mechanism. Then we have all the linux.st files moved to into one file called module.st there. In proper organization which will be easy for us to read. Do note that the modules are barely documented so it requires a whole lot of knowledge of the syscall table.
 
 - We have time module added.
+
+- We have examples and test cases even though not integrated with the CI they are test cases non the less so we should not forget that these test cases will be integrated for later down the line for now I just wanted to have some sort of mechanism I will visualize and try and test and find bugs.
+
+- This commit for today is more so bug finding with in the compiler not actual like programming.
