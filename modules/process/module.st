@@ -18,6 +18,7 @@ pub fn runCommandProcess(command: []string, capture_stdout := true, capture_stde
         return builderToString(sb);
     }
 
+  // what is the fuck is this 
     fn redirect_to_dev_null_and_close_file_descriptor(dup2_number := 1) -> void {
         O_WRONLY :: 1;
         out := sys_open("/dev/null", O_WRONLY, 0);
