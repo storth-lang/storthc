@@ -319,3 +319,5 @@ above and it's easy to lose track of:
 
 - No CI coverage of examples/test cases yet as of 2026:08:29. They exist and are useful for
   manual bug-hunting, but aren't wired into the pipeline added that same day.
+
+- 'file' now uses the sys_ naming correctly.

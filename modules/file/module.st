@@ -21,7 +21,7 @@ fn flags_for_mode(mode: openMode) -> i32 {
 // libc error message and till we need all the error messages just keep things minimal.
 pub fn openFileDescriptor(path: string, mode := openMode.readAndWrite) -> (i32, ioError) {
     flags := flags_for_mode(mode);
-    fd := open(path, flags, 420);
+    fd := sys_open(path, flags, 420);
     if fd < 0 {
         if mode == openMode.readOnly then return 0, ioError.OpenErrorR;
         if mode == openMode.writeOnly then return 0, ioError.OpenErrorW;
@@ -34,7 +34,7 @@ pub fn openFileDescriptor(path: string, mode := openMode.readAndWrite) -> (i32, 
 // Wrapper around 'sys_close'(os module) just for consistency and also we check if the fd > 0.
 // So it will not run unless the fd exists getting rid of us handleing error message.
 pub fn closeFileDescriptor(fd: i32) -> void {
-    if fd > 0 then close(fd);
+    if fd > 0 then sys_close(fd);
 }
 
 // pub fn writeToFileDescriptor(fd: i32, data: string) -> (i64, ioError);
@@ -46,7 +46,7 @@ pub fn closeFileDescriptor(fd: i32) -> void {
 pub fn writeToFileDescriptor(fd: i32, data: string) -> (i64, ioError) {
     p := data.ptr;
     n := data.len;
-    written := write(fd, p, n #as i32);
+    written := sys_write(fd, p, n #as i32);
     if written < 0 {
         return 0, ioError.WriteError;
     }
@@ -68,7 +68,7 @@ pub fn readFromFileDescriptor(fd: i32) -> (string, ioError) {
         base := buf #as *u8;
         p := base + total;
         remaining := cap #as i32 - total;
-        n := read(fd, p #as *char, remaining);
+        n := sys_read(fd, p #as *char, remaining);
         if n < 0 {
             free(buf);
             return "", ioError.ReadError;
@@ -118,7 +118,6 @@ pub fn readEntireFile(path: string) -> (string, bool) {
 pub fn renameFile(file1: string, file2: string) -> bool {
     err := sys_rename(file1, file2);
     if err != 0 then {
-        eprint("rename failed: path=% rerr=%\n", file1, getErrorString(err));
         return false;
     }
 
