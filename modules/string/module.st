@@ -27,10 +27,10 @@ pub fn builderToString(sb: StringBuilder) -> string {
 pub fn trim(str: string, delim: char) -> (string, string) {
     i: i64 = 0;
     while i < str.len && str[i] != delim {
-        i++;
+        i = i + 1;
     }
     new_str := str_from_raw(str.ptr, i);
-    if (i < str.len) {
+    if i < str.len {
         old_str := str_from_raw(str.ptr + i + 1, str.len - i - 1);
         return new_str, old_str;
     }
@@ -38,12 +38,30 @@ pub fn trim(str: string, delim: char) -> (string, string) {
     return new_str, old_str;
 }
 
+// pub fn trimRight(str: string, count : i64 = 1) -> string;
+pub fn trimRight(str: string, count : i64 = 1) -> string {
+    if str.len < count then return str;
+    count = str.len - count;
+    return str_from_raw(str.ptr, count);
+}
+
+// pub fn trimLeft(str: string, count : i64 = 1) -> string;
+// This is a pure function that will trim our string and returns us a new string based on the count
+// we want to trim it. If you have a string str := "Hello" and you do trimLeft(str, 3);
+// This function will get rid of the first 3 chars. Hence why it will return you "lo".
+pub fn trimLeft(str: string, count : i64 = 1) -> string {
+    if str.len < count then return str;
+    new_ptr := str.ptr + count;
+    count = str.len - count;
+    return str_from_raw(new_ptr, count);
+}
 
 // pub fn freeBuilder(sb: *StringBuilder);
-// Since string builder is a dynamic array of characters. We must not forget to not free such array.
-// freeBuilder does not just free the dynamic array it also actually resets the count and capacity to 0.
-pub fn freeBuilder(sb: *StringBuilder) -> void {
-    free(sb.items);
+// Since string builder is a dynamic array of characters. We must not forget to not free
+// such array. resetBuilder does not just free the dynamic array it also actually
+// resets the count and capacity to 0.
+pub fn resetBuilder(sb: *StringBuilder) -> void {
+    sb.items = null;
     sb.count = 0;
     sb.capacity = 0;
 }
@@ -118,7 +136,12 @@ fn push_bool(sb: *StringBuilder, b: bool) {
     else then push_string(sb, "false");
 }
 
-pub fn append_value(sb: *StringBuilder, v: $V) {
+// pub fn appendValue(sb: *StringBuilder, v: $V);
+// This function behaves as sprintf except it working on literals it works on the
+// resizable array.
+// Example: appendValue(sb, 22);
+//          appendValue(sb, "Hello");
+pub fn appendValue(sb: *StringBuilder, v: $V) {
     #if kind(v) {
         case "i8"  then push_int(sb, v #as i64);
         case "i16" then push_int(sb, v #as i64);
@@ -201,11 +224,14 @@ fn write_until_percent(sb: *StringBuilder, fmt: string, pos: i64) -> i64 {
     return i;
 }
 
+// pub fn format(sb: *StringBuilder, fmt: string, args: $T...) -> void;
+// This is basically 'snprintf' implemented. The way we are supposed to use it is that
+// format(&sb, "% % %\n", 22, "Hello", "Foo");
 pub fn format(sb: *StringBuilder, fmt: string, args: $T...) -> void {
     pos : i64 = 0;
     for a: args {
         pos = write_until_percent(sb, fmt, pos);
-        append_value(sb, a);
+        appendValue(sb, a);
     }
     write_until_percent(sb, fmt, pos);
 }
@@ -223,6 +249,15 @@ pub fn concatinate(dst: []char, str1: string, str2: string) -> string {
         n = n + 1;
     }
     return str_from_raw(&dst[0], n);
+}
+
+// pub fn contains(str: string, c: char) -> bool;
+// Check if a character 'c' is with in the string literal.
+pub fn contains(str: string, c: char) -> bool {
+    for ch: str {
+        if ch == c then return true;
+    }
+    return false;
 }
 
 #import "mem";

@@ -190,6 +190,10 @@ typedef enum {
     ST_ST_LABEL,
     ST_ST_GODOWN,
     ST_ST_ASM,
+    ST_ST_COMPTIME_BLOCK, // '#comptime { ... }' as a statement: executed once, entirely at
+                         // compile time (own fresh scope, no access to the enclosing
+                         // function's locals), then discarded -- see ST_check_comptime_block
+                         // in st_semantic.c
     ST_ST_PACK_EXPAND,
     ST_ST_COUNT,
 } ST_stmt_kind_t;

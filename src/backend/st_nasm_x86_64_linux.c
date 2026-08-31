@@ -299,6 +299,18 @@ static u32 ST_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_int_re
     return float_idx;
 }
 
+static void ST_truncate_int(FILE *out, ST_ty_t *ty) {
+    if (!ty || ty->kind != ST_TY_INT || ty->width >= 64)
+        return;
+    if (ty->width == 32) {
+        fprintf(out, ty->is_signed ? "    movsxd rax, eax\n" : "    mov eax, eax\n");
+    } else if (ty->width == 16) {
+        fprintf(out, ty->is_signed ? "    movsx rax, ax\n" : "    movzx rax, ax\n");
+    } else if (ty->width == 8) {
+        fprintf(out, ty->is_signed ? "    movsx rax, al\n" : "    movzx rax, al\n");
+    }
+}
+
 static void ST_icmp(FILE *out, ST_ir_inst_t *in, const char *setcc) {
     ST_load(out, "rax", in->bin.l);
     ST_load(out, "rcx", in->bin.r);
@@ -356,22 +368,26 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             ST_load(out, "rax", in->bin.l);
             ST_load(out, "rcx", in->bin.r);
             fprintf(out, "    add rax, rcx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_SUB: {
             ST_load(out, "rax", in->bin.l);
             ST_load(out, "rcx", in->bin.r);
             fprintf(out, "    sub rax, rcx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_MUL: {
             ST_load(out, "rax", in->bin.l);
             ST_load(out, "rcx", in->bin.r);
             fprintf(out, "    imul rax, rcx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_SDIV: {
             ST_load(out, "rax", in->bin.l);
             ST_load(out, "rcx", in->bin.r);
             fprintf(out, "    cqo\n");
             fprintf(out, "    idiv rcx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_EXTRACT_OP: {
             ST_ir_inst_t *agg = in->extract.agg;
@@ -395,6 +411,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             ST_load(out, "rcx", in->bin.r);
             fprintf(out, "    xor edx, edx\n");
             fprintf(out, "    div rcx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_SREM: {
             ST_load(out, "rax", in->bin.l);
@@ -402,6 +419,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             fprintf(out, "    cqo\n");
             fprintf(out, "    idiv rcx\n");
             fprintf(out, "    mov rax, rdx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_UREM: {
             ST_load(out, "rax", in->bin.l);
@@ -409,6 +427,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             fprintf(out, "    xor edx, edx\n");
             fprintf(out, "    div rcx\n");
             fprintf(out, "    mov rax, rdx\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_FADD: {
             ST_fload(out, "xmm0", in->bin.l);
@@ -434,6 +453,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
         case ST_IR_NEG: {
             ST_load(out, "rax", in->unary.v);
             fprintf(out, "    neg rax\n");
+            ST_truncate_int(out, in->ty);
         } break;
         case ST_IR_FNEG: {
             ST_fload(out, "xmm0", in->unary.v);
@@ -664,7 +684,13 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             } else {
                 ST_load(out, "rax", in->store.v);
                 ST_load(out, "rcx", in->store.addr);
-                ST_mem_store(out, in->ty);
+                if (in->store.addr->kind == ST_IR_ALLOCA && in->ty && in->ty->size &&
+                    in->ty->size < 8) {
+                    ST_int_narrow(out, in->ty);
+                    fprintf(out, "    mov [rcx], rax\n");
+                } else {
+                    ST_mem_store(out, in->ty);
+                }
             }
         } break;
         case ST_IR_ADDR: {

@@ -982,7 +982,7 @@ static ST_stmt_t *ST_parse_if_else(ST_parser_t *p, ST_stmt_t *s, b8 is_comptime)
         b8 else_is_comptime = ST_tok_is_symbol(et, "#else");
         if (is_comptime && !else_is_comptime) {
             ST_perr_tok(p, et,
-                        "'#if' needs '#else', not plain 'else' -- "
+                        "'#if' needs '#else', not plain 'else' "
                         "otherwise this arm looks comptime-pruned but isn't");
             return NULL;
         }
@@ -1198,7 +1198,7 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
     if (!s->decl.te)
         return NULL;
     if (ST_at_symbol(p, ":")) {
-        // 'x : T : expr;' -- typed local constant
+        // 'x : T : expr;'
         p->pos++;
         s->decl.is_const = 1;
         s->decl.init = ST_parse_expr(p);
@@ -1329,6 +1329,18 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
 
     if (ST_tok_is_symbol(t, "#asm"))
         return ST_parse_asm_stmt(p);
+
+    if (ST_tok_is_symbol(t, "#comptime")) {
+        p->pos++;
+        ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_COMPTIME_BLOCK, t->line, t->col);
+        if (!ST_expect_sym(p, "{"))
+            return NULL;
+        if (!ST_parse_body(p, &s->block))
+            return NULL;
+        if (!ST_expect_sym(p, "}"))
+            return NULL;
+        return s;
+    }
 
     if (t->kind == ST_TSYMBOL && t->text.len > 1 && t->text.data[0] == '#' &&
         !ST_string_eq_cstr(t->text, "#as") && !ST_string_eq_cstr(t->text, "#if") &&
@@ -1966,7 +1978,7 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
         else if (seen_default) {
             ST_perr(p, param.line, param.col,
                     "parameter '" ST_sv_fmt "' has no default, but comes after a parameter "
-                    "that does -- move defaulted parameters to the end",
+                    "that does",
                     ST_sv_args(param.name));
             return 0;
         }

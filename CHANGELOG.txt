@@ -227,6 +227,7 @@
   This will limit the type of x to be of a u8 pointer or a string.
 
 
+
 2026:08:29
 
 - Added CI pipeline and set up discord server. Obviously a whole lot of changes in module.
@@ -240,3 +241,81 @@
 - This commit for today is more so bug finding with in the compiler not actual like programming.
 
 - Found more error in regards to passing arrays and problem with process module.
+
+2026:08:31
+
+- Fixed a real codegen/scope bug in the `#comptime` bytecode compiler (`st_comptime_compile.c`):
+  `&out.capturedStdout`-style address-of on a struct field was being rejected with a generic
+  "can only take the address of a plain local name or an indexed element of a zero-initialized
+  array local" error. This wasn't a misfire; the `#comptime` VM represents struct locals as
+  boxed values with no real byte address to hand out, so there was genuinely nowhere for the
+  address to point.
+
+- First pass: added general pointer dereference support to the `#comptime` compiler, which
+  didn't exist at all before this (`*ptr` as a read, and `*ptr = value;` as an assignment,
+  for int/pointer/string pointee types). Added two new bytecode ops, `ST_OP_PTR_LOAD_STR` /
+  `ST_OP_PTR_STORE_STR`, since `string` is a 16-byte `{data_ptr, len}` fat pointer that the
+  existing int-only `PTR_LOAD`/`PTR_STORE` couldn't move through memory. Made `&structlocal.field`
+  legal as a direct call argument via copy-in/copy-out: allocate a scratch buffer, seed it with
+  the field's current value, pass its address, read it back, and write it into the struct field
+  once the call returns. Known limitation at this point: only worked as a direct call argument,
+  not stored in a variable or returned, and only for `string` and plain-int fields.
+
+- Second pass: removed the copy-in/copy-out hack entirely in favor of making struct locals (and
+  struct-typed parameters) genuinely buffer-backed in the `#comptime` VM, the same way arrays
+  already were, instead of boxed values with no address. A struct's "value" is now just its
+  address. This is what actually fixes the "stored in a var / returned / nested" limitations:
+
+  - `&x.y.z` now works at arbitrary nesting depth, through structs and through fixed-size array
+    fields (`&s.items[i].field`), and produces a real, persistent pointer usable anywhere, not
+    just as an immediate call argument.
+
+  - Added a new op, `ST_OP_MEM_COPY`, and used it to preserve by-value copy semantics everywhere
+    it matters now that structs are addresses under the hood: `d := c;`, passing a struct by
+    value into a function, `x.field = other_struct;`, and `return some_struct;` all do a real
+    byte copy into independent storage now, instead of the two locals silently aliasing the same
+    memory.
+
+  - Struct literals, including nested struct-typed fields inside a literal, compile straight into
+    a buffer instead of the old boxed `MAKE_STRUCT`/`GET_FIELD`/`SET_FIELD` representation. Those
+    ops are left in place in the VM (unused by the compiler now) rather than ripped out, since
+    plain bracket/array literals (`[a, b, c]`) still use the same boxed representation and share
+    the opcodes.
+
+  - Known remaining gaps: a fixed-size array field can't be initialized inline via a bracket
+    literal inside a struct literal yet (declare it plain and fill it with a loop instead, since
+    that path works). Also, `#comptime` scratch memory is a single fixed-size region that's never
+    reclaimed (true before this work too, for zero-init locals), so a `#comptime` loop doing
+    heavy struct work can still exhaust it.
+
+- None of the above touches the real (non-comptime) NASM/WASM backends or the SSA lowering pass;
+  this was scoped entirely to the `st_comptime*` bytecode VM and its compiler, since that's
+  what actually executes `#comptime` blocks and `storthc run`.
+
+## Module API notes
+
+Documenting the current shape of the module system, since it came up while working on the
+above and it's easy to lose track of:
+
+- Modules live as `.st` files and are pulled in with `#import "name"`. Cross-module references
+  (functions, consts, globals, and now types too, see 2026:08:21) work both bare (if the
+  importing file itself imported the defining module) and qualified (`module.Member`, from
+  anywhere).
+
+- OS/syscall-specific code is intentionally kept out of the portable modules and centralized:
+  each supported OS has its own `module.st` (currently just Linux) holding the actual syscall
+  numbers, register-argument wiring, and other platform asm, so the portable modules (`process`,
+  `io`, `mem`, `array`, `time`, `error`, ...) can stay platform-agnostic at the API level and
+  just call into the OS module underneath.
+
+- Practical consequence: every module file is different, not just in what it exposes but in how
+  documented it is. The OS module in particular is barely documented on its own terms, since reading
+  it productively currently requires already knowing the target OS's syscall table, since the
+  file itself doesn't re-explain syscall numbers/semantics inline.
+
+- `mem` (arena/heap alloc, realloc) and `array` module interfaces exist but are still described
+  as basic/helper-level as of 2026:08:16; `static` and `using`-based interface updates for `mem`
+  were called out as not yet implemented at that point.
+
+- No CI coverage of examples/test cases yet as of 2026:08:29. They exist and are useful for
+  manual bug-hunting, but aren't wired into the pipeline added that same day.

@@ -39,6 +39,19 @@ static void ST_diag_note_in_file(ST_sema_t *se, ST_string_t file, u32 line, u32 
     ST_diag_restore_file(se, save_file, save_src);
 }
 
+static void ST_diag_error_in_file(ST_sema_t *se, ST_string_t file, u32 line, u32 col,
+                                  const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ST_string_t save_file, save_src;
+    ST_diag_switch_file(se, file, &save_file, &save_src);
+    ST_diag_error(&se->diag, line, col, "%s", buf);
+    ST_diag_restore_file(se, save_file, save_src);
+}
+
 static ST_string_t ST_sym_file(ST_sym_t *sym) {
     return sym && sym->decl ? sym->decl->file : (ST_string_t){0};
 }
@@ -232,6 +245,8 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out);
 
 static void ST_check_const_param(ST_sema_t *se, ST_param_t *param, ST_arg_t *arg) {
     if (!param->is_const || !arg || !arg->value)
+        return;
+    if (arg->value->kind == ST_EX_STR)
         return;
     i64 dummy;
     if (!ST_const_eval(se, arg->value, &dummy))
@@ -878,6 +893,10 @@ static ST_stmt_t *ST_clone_stmt(ST_arena_t *a, ST_stmt_t *s) {
         break;
 
     case ST_ST_BLOCK:
+        n->block = ST_clone_body(a, &s->block);
+        break;
+
+    case ST_ST_COMPTIME_BLOCK:
         n->block = ST_clone_body(a, &s->block);
         break;
 
@@ -1695,7 +1714,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                     }
                 if (pack_idx >= 0 && (i32)idx >= pack_idx) {
                     ST_diag_error(&se->diag, arg->value->line, arg->value->col,
-                                  "cannot pass a named argument into '" ST_sv_fmt "...' -- pack "
+                                  "cannot pass a named argument into '" ST_sv_fmt "...' pack "
                                   "elements are always positional",
                                   ST_sv_args(tsig->params.items[pack_idx].name));
                     unify_ok = 0;
@@ -2649,6 +2668,8 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
 static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s);
 static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s);
 static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s);
+static void ST_check_comptime_block(ST_sema_t *se, ST_stmt_t *s);
+static void ST_sema_run_comptime_blocks(ST_sema_t *se);
 
 static void ST_check_body(ST_sema_t *se, ST_stmts_t *body) {
     ST_scope_push(se);
@@ -2715,6 +2736,27 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
             ST_diag_note(&se->diag, s->decl.init->line, s->decl.init->col,
                          "whole-number float literals need an explicit '.0', e.g. '%lld.0'",
                          (long long)s->decl.init->ival);
+    }
+
+    if (dt && dt->kind == ST_TY_INT && dt->width > 0 && dt->width < 64 && s->decl.init) {
+        i64 val;
+        if (ST_const_eval(se, s->decl.init, &val)) {
+            i64 lo, hi;
+            if (dt->is_signed) {
+                i64 half = (i64)1 << (dt->width - 1);
+                lo = -half;
+                hi = half - 1;
+            } else {
+                lo = 0;
+                hi = ((i64)1 << dt->width) - 1;
+            }
+            if (val < lo || val > hi)
+                ST_diag_error(&se->diag, s->decl.init->line, s->decl.init->col,
+                              "%lld doesn't fit in a '%s' (valid range is %lld to %lld) "
+                              "use a wider type for '" ST_sv_fmt "'",
+                              (long long)val, ST_tstr(se, dt), (long long)lo, (long long)hi,
+                              ST_sv_args(s->decl.name));
+        }
     }
 
     if (!dt && !s->decl.init)
@@ -2802,7 +2844,7 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
         ST_diag_error(&se->diag, s->line, s->col,
                       "cannot assign to '.kind' directly; construct a new '" ST_sv_fmt
                       "' value instead, e.g. '" ST_sv_fmt "{ SomeVariant, .. }' "
-                      "-- this keeps the active variant and its payload from getting out "
+                      "this keeps the active variant and its payload from getting out "
                       "of sync",
                       ST_sv_args(ST_decl_display_name(lhs->field.base->ty->decl)),
                       ST_sv_args(ST_decl_display_name(lhs->field.base->ty->decl)));
@@ -3036,6 +3078,62 @@ static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s) {
     ST_check_stmt(se, s);
 }
 
+// A bare '#comptime { ... }' statement: type-checked once like any other
+// body (so generics instantiate, casts resolve, etc.
+static void ST_check_comptime_block(ST_sema_t *se, ST_stmt_t *s) {
+    ST_check_body(se, &s->block);
+    ST_da_append_arena(se->arena, &se->pending_comptime_blocks, s);
+}
+
+// Runs once, after ST_sema_check's per-decl pass has fully settled (called
+// at the end of ST_sema_run): compiles and runs each '#comptime { }'
+// statement queued by ST_check_comptime_block, in its own throwaway
+// '#comptime' entry point, then rewrites it into an empty block
+static void ST_sema_run_comptime_blocks(ST_sema_t *se) {
+    ST_forrange(0, se->pending_comptime_blocks.count) {
+        ST_stmt_t *s = se->pending_comptime_blocks.items[i];
+
+        ST_decl_t *entry = ST_decl_new(se->arena, ST_DE_FN, s->line, s->col);
+        entry->name = ST_cstr_to_str("__comptime_block");
+        entry->fn.sig.is_comptime = 1;
+        entry->fn.body = s->block;
+
+        // Rewrite 's' to an empty block *before* compiling/running it: compiling
+        // (or running) this block can itself trigger a native/asm call, which
+        // needs to lower the *whole* program for real (see
+        // ST_ct_ensure_native_module)
+        ST_rewrite_as_block(s, (ST_stmts_t){0});
+
+        ST_ct_chunk_t chunk;
+        ST_ct_chunk_init(se->arena, &chunk);
+        u32 entry_ip = 0, cerr_line = s->line, cerr_col = s->col;
+        ST_string_t cerr_file = se->diag.file;
+        char cerr_msg[256] = {0};
+        if (!ST_ct_compile_program(se->arena, &chunk, se->prog, se, se->diag.src, se->diag.file,
+                                   entry, &entry_ip, &cerr_line, &cerr_col, &cerr_file, cerr_msg,
+                                   sizeof(cerr_msg))) {
+            ST_diag_error_in_file(se, cerr_file, cerr_line, cerr_col, "%s", cerr_msg);
+            continue;
+        }
+
+        ST_ct_vm_t vm;
+        ST_ct_vm_init(&vm);
+        ST_ct_val_t result = {0};
+        ST_ct_status_t vst = ST_ct_run(&vm, &chunk, &result);
+        if (vst != ST_CT_OK) {
+            ST_string_t vfile = ST_ct_chunk_file_at(&chunk, vm.err_ip);
+            if (!vfile.len)
+                vfile = se->diag.file;
+            if (vst == ST_CT_ERR_COMPTIME)
+                ST_diag_error_in_file(se, vfile, vm.err_line, s->col, "%s", vm.err_msg);
+            else
+                ST_diag_error_in_file(se, vfile, vm.err_line, s->col,
+                                      "internal: comptime VM error: %s", vm.err_msg);
+        }
+    }
+}
+
+
 static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t target,
                                    ST_expr_t *replacement) {
     if (!e)
@@ -3162,6 +3260,10 @@ static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t targ
                 ST_ast_substitute_expr(se, s->ret.values.items[i], target, replacement);
             return;
         case ST_ST_BLOCK:
+            ST_forrange(0, s->block.count)
+                ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
+            return;
+        case ST_ST_COMPTIME_BLOCK:
             ST_forrange(0, s->block.count)
                 ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
             return;
@@ -3712,6 +3814,9 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         case ST_ST_ASM:
             break;
+        case ST_ST_COMPTIME_BLOCK:
+            ST_check_comptime_block(se, s);
+            break;
         case ST_ST_COUNT:
             ST_assert(0);
             break;
@@ -3764,6 +3869,7 @@ static void ST_collect_labels(ST_sema_t *se, ST_ht_t *labels, ST_stmts_t *body) 
                 ST_collect_labels(se, labels, &one);
                 break;
             }
+            case ST_ST_COMPTIME_BLOCK:
             case ST_ST_EXPR:
             case ST_ST_PACK_EXPAND:
             case ST_ST_DECL:
@@ -4396,6 +4502,9 @@ static void ST_default_stmt(ST_sema_t *se, ST_stmt_t *s) {
         case ST_ST_BLOCK:
             ST_default_body(se, &s->block);
             break;
+        case ST_ST_COMPTIME_BLOCK:
+            ST_default_body(se, &s->block);
+            break;
         case ST_ST_DEFER:
             ST_default_stmt(se, s->defer_stmt);
             break;
@@ -4623,5 +4732,6 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
     ST_sema_check(se, prog);
     ST_sema_default_types(se, prog);
     ST_sema_check_main(se, prog);
+    ST_sema_run_comptime_blocks(se);
     return se->diag.n_errors == 0;
 }

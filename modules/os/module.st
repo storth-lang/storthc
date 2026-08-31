@@ -1,12 +1,15 @@
 // Linux important syscall:
+// reference: https://www.man7.org/linux/man-pages/man2/syscalls.2.html
+// TODO: Add sys_stat so that we can have more errors and also setting
+// behavior in files.
 
-pub PROT_NONE     :: 0;
-pub PROT_READ     :: 1;
-pub PROT_WRITE    :: 2;
-pub MAP_PRIVATE   :: 2;
-pub MAP_ANON      :: 32;
-pub MADV_DONTNEED :: 4;
-pub PAGE          :: 4096;
+pub PROT_NONE     :: #comptime 0;
+pub PROT_READ     :: #comptime 1;
+pub PROT_WRITE    :: #comptime 2;
+pub MAP_PRIVATE   :: #comptime 2;
+pub MAP_ANON      :: #comptime 32;
+pub MADV_DONTNEED :: #comptime 4;
+pub PAGE          :: #comptime 4096;
 
 pub struct timespec {
     tv_sec: i64;
@@ -76,7 +79,7 @@ pub fn sys_madvise(addr: *void, length: i64, advice: i32) -> i64 {
 	};
 }
 
-pub fn open(path: string, flags: i32, mode: i32) -> i32 {
+pub fn sys_open(path: string, flags: i32, mode: i32) -> i32 {
     buf : [4096]char;
     for i : 0..path.len {
         buf[i] = path[i];
@@ -94,7 +97,7 @@ pub fn open(path: string, flags: i32, mode: i32) -> i32 {
     };
 }
 
-pub fn close(fd: i32) -> i32 {
+pub fn sys_close(fd: i32) -> i32 {
     CLOSE :: 3;
 
     return #asm {
@@ -104,7 +107,7 @@ pub fn close(fd: i32) -> i32 {
     };
 }
 
-pub fn write(fd: i32, p: *char, n: i32) -> i32 {
+pub fn sys_write(fd: i32, p: *char, n: i32) -> i32 {
     return #asm {
         mov rax, 1
         mov rdi, fd
@@ -114,7 +117,7 @@ pub fn write(fd: i32, p: *char, n: i32) -> i32 {
     };
 }
 
-pub fn read(fd: i32, p: *char, n: i32) -> i32 {
+pub fn sys_read(fd: i32, p: *char, n: i32) -> i32 {
     READ :: 0;
 
     return #asm {
@@ -126,7 +129,7 @@ pub fn read(fd: i32, p: *char, n: i32) -> i32 {
     };
 }
 
-pub fn mkdir(path: string, permission: i32) -> i32 {
+pub fn sys_mkdir(path: string, permission: i32) -> i32 {
     MKDIR :: 83;
 
     fn decimal_to_octal_mask(decimal_input: i32) -> i32 {
@@ -154,9 +157,7 @@ pub fn mkdir(path: string, permission: i32) -> i32 {
     };
 }
 
-// /usr/include/unistd.h
-// https://www.man7.org/linux/man-pages/man2/syscalls.2.html
-pub fn execve(path: string, args: []string, env: []string) -> i32 {
+pub fn sys_execve(path: string, args: []string, env: []string) -> i32 {
     EXECVE :: 59;
 
     fn strs_bytes(strs: []string) -> u64 {
@@ -269,4 +270,14 @@ pub fn sys_exit(code: i32) {
         mov rdi, code
         syscall
     }
+}
+
+pub fn sys_rename(old:string, new:string) -> i32 {
+    RENAME :: 82;
+
+    return #asm {
+        mov rax, RENAME
+        mov rdi, old
+        mov rsi, new
+    };
 }

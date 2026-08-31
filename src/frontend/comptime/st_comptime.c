@@ -59,6 +59,26 @@ void ST_ct_chunk_init(ST_arena_t *arena, ST_ct_chunk_t *c) {
         }                                                                                        \
     } while (0)
 
+void ST_ct_chunk_mark_file(ST_ct_chunk_t *c, ST_string_t file) {
+    if (c->n_file_ranges && ST_string_eq(c->file_ranges[c->n_file_ranges - 1].file, file))
+        return;
+    ST_CT_ARENA_GROW(c->arena, c->file_ranges, c->cap_file_ranges, c->n_file_ranges,
+                     ST_ct_file_range_t);
+    c->file_ranges[c->n_file_ranges].start_ip = c->count;
+    c->file_ranges[c->n_file_ranges].file = file;
+    c->n_file_ranges++;
+}
+
+ST_string_t ST_ct_chunk_file_at(ST_ct_chunk_t *c, u32 ip) {
+    ST_string_t best = (ST_string_t){0};
+    ST_forrange(0, c->n_file_ranges) {
+        if (c->file_ranges[i].start_ip > ip)
+            break;
+        best = c->file_ranges[i].file;
+    }
+    return best;
+}
+
 static void ST_ct_write_byte(ST_ct_chunk_t *c, u8 b, u32 line) {
     // code and lines must grow together (one entry per byte), so they're
     // grown against the same capacity counter deliberately here
@@ -263,6 +283,8 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
 
     while (ip < chunk->count) {
         u32 line = chunk->lines[ip];
+        vm->err_ip = ip; // set unconditionally each instruction, so it's already
+                        // correct if this one is the one that fails
         ST_ct_op_t op = (ST_ct_op_t)chunk->code[ip++];
 
         switch (op) {
@@ -279,12 +301,43 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
             case ST_OP_ADD: case ST_OP_SUB: case ST_OP_MUL:
             case ST_OP_DIV: case ST_OP_MOD: {
                 ST_ct_val_t b = ST_ct_pop(vm), a = ST_ct_pop(vm);
-                if (a.kind == ST_CT_INT && b.kind == ST_CT_INT && op != ST_OP_DIV) {
+                if ((a.kind == ST_CT_PTR || b.kind == ST_CT_PTR) &&
+                    (op == ST_OP_ADD || op == ST_OP_SUB)) {
+                    // Raw pointer arithmetic (byte offsets), as used directly in
+                    // low-level code like an allocator's 'base + HDR'/'ptr - n' --
+                    // distinct from ST_OP_PTR_ADD, which is element-size-scaled
+                    // and used internally for array indexing.
+                    if (a.kind == ST_CT_PTR && b.kind == ST_CT_PTR) {
+                        if (op == ST_OP_SUB) {
+                            ST_ct_push(vm, ST_ct_int((i64)((u8 *)a.ptr - (u8 *)b.ptr)));
+                            break;
+                        }
+                        ST_ct_fail(vm, line, "comptime: can't add two pointers");
+                        break;
+                    }
+                    ST_ct_val_t p = a.kind == ST_CT_PTR ? a : b;
+                    ST_ct_val_t n = a.kind == ST_CT_PTR ? b : a;
+                    if (n.kind != ST_CT_INT) {
+                        ST_ct_fail(vm, line, "comptime: pointer arithmetic needs an integer offset");
+                        break;
+                    }
+                    if (op == ST_OP_SUB && a.kind != ST_CT_PTR) {
+                        ST_ct_fail(vm, line, "comptime: can't subtract a pointer from an integer");
+                        break;
+                    }
+                    i64 off = op == ST_OP_SUB ? -n.i : n.i;
+                    ST_ct_push(vm, ST_ct_ptr((u8 *)p.ptr + off));
+                    break;
+                }
+                if (a.kind == ST_CT_INT && b.kind == ST_CT_INT) {
                     i64 r = 0;
                     if (op == ST_OP_ADD) r = a.i + b.i;
                     else if (op == ST_OP_SUB) r = a.i - b.i;
                     else if (op == ST_OP_MUL) r = a.i * b.i;
-                    else if (op == ST_OP_MOD) {
+                    else if (op == ST_OP_DIV) {
+                        if (b.i == 0) { ST_ct_fail(vm, line, "comptime: division by zero"); break; }
+                        r = a.i / b.i;
+                    } else if (op == ST_OP_MOD) {
                         if (b.i == 0) { ST_ct_fail(vm, line, "comptime: modulo by zero"); break; }
                         r = a.i % b.i;
                     }
@@ -318,13 +371,32 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 break;
             }
 
+            case ST_OP_BAND: case ST_OP_BOR: case ST_OP_BXOR:
+            case ST_OP_SHL: case ST_OP_SHR: {
+                ST_ct_val_t b = ST_ct_pop(vm), a = ST_ct_pop(vm);
+                if (a.kind != ST_CT_INT || b.kind != ST_CT_INT) {
+                    ST_ct_fail(vm, line, "comptime: bitwise operators need integers");
+                    break;
+                }
+                i64 r = 0;
+                if (op == ST_OP_BAND) r = a.i & b.i;
+                else if (op == ST_OP_BOR) r = a.i | b.i;
+                else if (op == ST_OP_BXOR) r = a.i ^ b.i;
+                else if (op == ST_OP_SHL) r = a.i << b.i;
+                else if (op == ST_OP_SHR) r = a.i >> b.i;
+                ST_ct_push(vm, ST_ct_int(r));
+                break;
+            }
+
             case ST_OP_EQ: case ST_OP_NEQ: case ST_OP_LT:
             case ST_OP_LE: case ST_OP_GT: case ST_OP_GE: {
                 ST_ct_val_t b = ST_ct_pop(vm), a = ST_ct_pop(vm);
                 b8 r = 0;
                 if (op == ST_OP_EQ || op == ST_OP_NEQ) {
                     b8 eq;
-                    if (a.kind != b.kind) eq = 0;
+                    if (a.kind == ST_CT_NIL && b.kind == ST_CT_PTR) eq = (b.ptr == NULL);
+                    else if (b.kind == ST_CT_NIL && a.kind == ST_CT_PTR) eq = (a.ptr == NULL);
+                    else if (a.kind != b.kind) eq = 0;
                     else switch (a.kind) {
                         case ST_CT_NIL: eq = 1; break;
                         case ST_CT_BOOL: eq = a.b == b.b; break;
@@ -355,10 +427,12 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
 
             case ST_OP_STR_LEN: {
                 ST_ct_val_t s = ST_ct_pop(vm);
-                if (s.kind != ST_CT_STRING) { ST_ct_fail(vm, line, "comptime: '.len' needs a string"); break; }
-                ST_ct_push(vm, ST_ct_int(s.str.len));
+                if (s.kind == ST_CT_STRING) { ST_ct_push(vm, ST_ct_int(s.str.len)); break; }
+                if (s.kind == ST_CT_STRUCT) { ST_ct_push(vm, ST_ct_int(s.st.n_fields)); break; }
+                ST_ct_fail(vm, line, "comptime: '.len' needs a string or array value");
                 break;
             }
+
             case ST_OP_STR_INDEX: {
                 ST_ct_val_t idx = ST_ct_pop(vm), s = ST_ct_pop(vm);
                 if (s.kind != ST_CT_STRING || idx.kind != ST_CT_INT) {
@@ -371,6 +445,73 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                     break;
                 }
                 ST_ct_push(vm, ST_ct_int((u8)s.str.data[idx.i]));
+                break;
+            }
+
+	    case ST_OP_STR_PTR: {
+		ST_ct_val_t s = ST_ct_pop(vm);
+		if (s.kind != ST_CT_STRING) {
+		    ST_ct_fail(vm, line, "comptime: '.ptr' needs a string");
+                    break;
+		}
+                ST_ct_push(vm, ST_ct_ptr((void *)s.str.data));
+		break;
+	    }
+
+            case ST_OP_STRUCT_INDEX: {
+                ST_ct_val_t idx = ST_ct_pop(vm), s = ST_ct_pop(vm);
+                if (s.kind != ST_CT_STRUCT || idx.kind != ST_CT_INT) {
+                    ST_ct_fail(vm, line, "comptime: array index needs (array, int)");
+                    break;
+                }
+                if (idx.i < 0 || (u32)idx.i >= s.st.n_fields) {
+                    ST_ct_fail(vm, line, "comptime: array index %lld out of bounds (len %u)",
+                               (long long)idx.i, s.st.n_fields);
+                    break;
+                }
+                ST_ct_push(vm, s.st.fields[idx.i]);
+                break;
+            }
+
+            case ST_OP_CAST: {
+                u32 operand = ST_ct_read_u32(chunk, ip); ip += 4;
+                u32 tag = operand & 0xF;
+                u32 width = (operand >> 4) & 0xFF;
+                b8 is_signed = (operand >> 12) & 1;
+                ST_ct_val_t v = ST_ct_pop(vm);
+                if (tag == 0) {
+                    i64 iv;
+                    if (v.kind == ST_CT_INT) iv = v.i;
+                    else if (v.kind == ST_CT_FLOAT) iv = (i64)v.f;
+                    else if (v.kind == ST_CT_BOOL) iv = v.b ? 1 : 0;
+                    else if (v.kind == ST_CT_PTR) iv = (i64)(intptr_t)v.ptr;
+                    else { ST_ct_fail(vm, line, "comptime: can't cast this value to an integer"); break; }
+                    if (width > 0 && width < 8) {
+                        u64 mask = ((u64)1 << (width * 8)) - 1;
+                        u64 uv = (u64)iv & mask;
+                        if (is_signed) {
+                            u64 sign_bit = (u64)1 << (width * 8 - 1);
+                            if (uv & sign_bit)
+                                uv |= ~mask;
+                        }
+                        iv = (i64)uv;
+                    }
+                    ST_ct_push(vm, ST_ct_int(iv));
+                } else if (tag == 1) {
+                    f64 fv;
+                    if (v.kind == ST_CT_INT) fv = (f64)v.i;
+                    else if (v.kind == ST_CT_FLOAT) fv = v.f;
+                    else { ST_ct_fail(vm, line, "comptime: can't cast this value to a float"); break; }
+                    ST_ct_push(vm, ST_ct_float(fv));
+                } else if (tag == 2) {
+                    ST_ct_push(vm, ST_ct_bool(ST_ct_truthy(v)));
+                } else if (tag == 3) {
+                    if (v.kind == ST_CT_PTR) { ST_ct_push(vm, v); break; }
+                    if (v.kind == ST_CT_INT) { ST_ct_push(vm, ST_ct_ptr((void *)(intptr_t)v.i)); break; }
+                    ST_ct_fail(vm, line, "comptime: can't cast this value to a pointer");
+                } else {
+                    ST_ct_fail(vm, line, "comptime: unsupported cast");
+                }
                 break;
             }
 
@@ -473,6 +614,52 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 break;
             }
 
+            case ST_OP_NATIVE_ARG_STRING: {
+                ST_ct_val_t v = ST_ct_pop(vm);
+                if (v.kind != ST_CT_STRING) {
+                    ST_ct_fail(vm, line, "comptime: expected a string here");
+                    break;
+                }
+                ST_ct_push(vm, ST_ct_ptr((void *)v.str.data));
+                ST_ct_push(vm, ST_ct_int((i64)v.str.len));
+                break;
+            }
+
+            case ST_OP_NATIVE_ARG_STRING_ARRAY: {
+                ST_ct_val_t v = ST_ct_pop(vm);
+                if (v.kind != ST_CT_STRUCT) {
+                    ST_ct_fail(vm, line, "comptime: expected an array of strings here");
+                    break;
+                }
+                u32 n = v.st.n_fields;
+                u32 size = n * 16;
+                if ((u64)vm->mem_used + size > sizeof(vm->mem)) {
+                    ST_ct_fail(vm, line, "comptime: out of comptime scratch memory");
+                    break;
+                }
+                u8 *buf = vm->mem + vm->mem_used;
+                vm->mem_used += size;
+                b8 bad = 0;
+                for (u32 k = 0; k < n; k++) {
+                    ST_ct_val_t sv = v.st.fields[k];
+                    if (sv.kind != ST_CT_STRING) {
+                        bad = 1;
+                        break;
+                    }
+                    const void *ptr = sv.str.data;
+                    i64 len = (i64)sv.str.len;
+                    memcpy(buf + (u64)k * 16, &ptr, 8);
+                    memcpy(buf + (u64)k * 16 + 8, &len, 8);
+                }
+                if (bad) {
+                    ST_ct_fail(vm, line, "comptime: array element isn't a string");
+                    break;
+                }
+                ST_ct_push(vm, ST_ct_ptr(buf));
+                ST_ct_push(vm, ST_ct_int((i64)n));
+                break;
+            }
+
             case ST_OP_SYSCALL: {
                 i64 vals[7];
                 for (i64 k = 6; k >= 0; k--) {
@@ -514,6 +701,23 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 break;
             }
 
+            case ST_OP_SET_FIELD: {
+                u32 idx = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t v = ST_ct_pop(vm);
+                ST_ct_val_t s = ST_ct_pop(vm);
+                if (s.kind != ST_CT_STRUCT) {
+                    ST_ct_fail(vm, line, "comptime: field assignment on a non-struct value");
+                    break;
+                }
+                if (idx >= s.st.n_fields) {
+                    ST_ct_fail(vm, line, "comptime: struct field index out of range");
+                    break;
+                }
+                s.st.fields[idx] = v;
+                ST_ct_push(vm, v);
+                break;
+            }
+
             case ST_OP_PACK_STRUCT: {
                 u32 n = ST_ct_read_u32(chunk, ip); ip += 4;
                 u32 sizes[64];
@@ -548,6 +752,142 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                     offset += sizes[k];
                 }
                 ST_ct_push(vm, ST_ct_int((i64)packed));
+                break;
+            }
+
+            case ST_OP_ALLOC_ZEROED: {
+                u32 size = ST_ct_read_u32(chunk, ip); ip += 4;
+                if ((u64)vm->mem_used + size > sizeof(vm->mem)) {
+                    ST_ct_fail(vm, line,
+                              "comptime: out of comptime scratch memory (used for "
+                              "zero-initialized locals)");
+                    break;
+                }
+                void *p = vm->mem + vm->mem_used;
+                memset(p, 0, size);
+                vm->mem_used += size;
+                ST_ct_push(vm, ST_ct_ptr(p));
+                break;
+            }
+
+            case ST_OP_PTR_ADD: {
+                u32 elem_size = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t idx = ST_ct_pop(vm), base = ST_ct_pop(vm);
+                if (base.kind != ST_CT_PTR || idx.kind != ST_CT_INT) {
+                    ST_ct_fail(vm, line, "comptime: array indexing needs (pointer, int)");
+                    break;
+                }
+                ST_ct_push(vm, ST_ct_ptr((u8 *)base.ptr + idx.i * (i64)elem_size));
+                break;
+            }
+
+            case ST_OP_PTR_LOAD: {
+                u32 operand = ST_ct_read_u32(chunk, ip); ip += 4;
+                u32 tag = operand & 0xF;
+                u32 width = (operand >> 4) & 0xFF;
+                b8 is_signed = (operand >> 12) & 1;
+                ST_ct_val_t p = ST_ct_pop(vm);
+                if (p.kind != ST_CT_PTR) {
+                    ST_ct_fail(vm, line, "comptime: can't load through a non-pointer value");
+                    break;
+                }
+                if (tag == 3) {
+                    void *raw_ptr;
+                    memcpy(&raw_ptr, p.ptr, sizeof(void *));
+                    ST_ct_push(vm, ST_ct_ptr(raw_ptr));
+                    break;
+                }
+                u64 raw = 0;
+                memcpy(&raw, p.ptr, width > 8 ? 8 : width);
+                i64 iv;
+                if (width > 0 && width < 8) {
+                    u64 mask = ((u64)1 << (width * 8)) - 1;
+                    raw &= mask;
+                    if (is_signed) {
+                        u64 sign_bit = (u64)1 << (width * 8 - 1);
+                        if (raw & sign_bit)
+                            raw |= ~mask;
+                    }
+                }
+                iv = (i64)raw;
+                ST_ct_push(vm, ST_ct_int(iv));
+                break;
+            }
+
+            case ST_OP_PTR_STORE: {
+                u32 width = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t v = ST_ct_pop(vm), p = ST_ct_pop(vm);
+                if (p.kind != ST_CT_PTR) {
+                    ST_ct_fail(vm, line, "comptime: can't store through a non-pointer value");
+                    break;
+                }
+                if (v.kind == ST_CT_PTR) {
+                    memcpy(p.ptr, &v.ptr, sizeof(void *));
+                    ST_ct_push(vm, v);
+                    break;
+                }
+                i64 iv = 0;
+                if (v.kind == ST_CT_INT) iv = v.i;
+                else if (v.kind == ST_CT_BOOL) iv = v.b ? 1 : 0;
+                memcpy(p.ptr, &iv, width > 8 ? 8 : width);
+                ST_ct_push(vm, v);
+                break;
+            }
+
+            case ST_OP_PTR_LOAD_STR: {
+                ST_ct_val_t p = ST_ct_pop(vm);
+                if (p.kind != ST_CT_PTR) {
+                    ST_ct_fail(vm, line, "comptime: can't load through a non-pointer value");
+                    break;
+                }
+                const char *data;
+                u64 len;
+                memcpy(&data, p.ptr, sizeof(data));
+                memcpy(&len, (u8 *)p.ptr + sizeof(data), sizeof(len));
+                ST_ct_push(vm, ST_ct_str(data, (u32)len));
+                break;
+            }
+
+            case ST_OP_PTR_STORE_STR: {
+                ST_ct_val_t v = ST_ct_pop(vm), p = ST_ct_pop(vm);
+                if (p.kind != ST_CT_PTR) {
+                    ST_ct_fail(vm, line, "comptime: can't store through a non-pointer value");
+                    break;
+                }
+                if (v.kind != ST_CT_STRING) {
+                    ST_ct_fail(vm, line, "comptime: expected a string value to store here");
+                    break;
+                }
+                u64 len = v.str.len;
+                memcpy(p.ptr, &v.str.data, sizeof(v.str.data));
+                memcpy((u8 *)p.ptr + sizeof(v.str.data), &len, sizeof(len));
+                ST_ct_push(vm, v);
+                break;
+            }
+
+            case ST_OP_MEM_COPY: {
+                u32 size = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t src = ST_ct_pop(vm), dst = ST_ct_pop(vm);
+                if (dst.kind != ST_CT_PTR || src.kind != ST_CT_PTR) {
+                    ST_ct_fail(vm, line, "comptime: mem copy needs (pointer, pointer)");
+                    break;
+                }
+                memcpy(dst.ptr, src.ptr, size);
+                ST_ct_push(vm, dst);
+                break;
+            }
+
+            case ST_OP_STR_FROM_RAW: {
+                ST_ct_val_t len = ST_ct_pop(vm), p = ST_ct_pop(vm);
+                if (p.kind != ST_CT_PTR || len.kind != ST_CT_INT) {
+                    ST_ct_fail(vm, line, "comptime: str_from_raw needs (pointer, int)");
+                    break;
+                }
+                if (len.i < 0) {
+                    ST_ct_fail(vm, line, "comptime: str_from_raw got a negative length");
+                    break;
+                }
+                ST_ct_push(vm, ST_ct_str((const char *)p.ptr, (u32)len.i));
                 break;
             }
 
@@ -614,6 +954,7 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 ST_forrange(0, n) ST_ct_push(vm, vals[i]);
                 break;
             }
+
             case ST_OP_HALT:
                 if (vm->n_frames == 0) {
                     if (out) *out = ST_ct_nil();

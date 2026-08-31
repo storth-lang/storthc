@@ -1,8 +1,125 @@
 #include "st_comptime_compile.h"
 
+#include "st_comptime_native.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+static b8 ST_ct_expr_has_asm(ST_expr_t *e) {
+    if (!e)
+        return 0;
+    switch (e->kind) {
+        case ST_EX_ASM:
+            return 1;
+        case ST_EX_UNARY:
+            return ST_ct_expr_has_asm(e->unary.operand);
+        case ST_EX_BINARY:
+            return ST_ct_expr_has_asm(e->bin.l) || ST_ct_expr_has_asm(e->bin.r);
+        case ST_EX_CALL: {
+            if (ST_ct_expr_has_asm(e->call.callee))
+                return 1;
+            ST_forrange(0, e->call.args.count)
+                if (ST_ct_expr_has_asm(e->call.args.items[i].value)) return 1;
+            return 0;
+        }
+        case ST_EX_FIELD:
+            return ST_ct_expr_has_asm(e->field.base);
+        case ST_EX_INDEX:
+            return ST_ct_expr_has_asm(e->index.base) || ST_ct_expr_has_asm(e->index.index);
+        case ST_EX_CAST:
+            return ST_ct_expr_has_asm(e->cast.operand);
+        case ST_EX_STRUCT_LIT: {
+            ST_forrange(0, e->struct_lit.inits.count)
+                if (ST_ct_expr_has_asm(e->struct_lit.inits.items[i].value)) return 1;
+            return 0;
+        }
+        case ST_EX_SIZEOF:
+        case ST_EX_TYPEOF:
+        case ST_EX_KIND:
+        case ST_EX_CSTR:
+        case ST_EX_FIELDS:
+            return ST_ct_expr_has_asm(e->tyop.operand);
+        case ST_EX_COMP_ERROR: {
+            ST_forrange(0, e->comp_error.args.count)
+                if (ST_ct_expr_has_asm(e->comp_error.args.items[i])) return 1;
+            return 0;
+        }
+        case ST_EX_STR_FROM_RAW:
+            return ST_ct_expr_has_asm(e->str_from_raw.ptr) || ST_ct_expr_has_asm(e->str_from_raw.len);
+        default:
+            return 0;
+    }
+}
+
+static b8 ST_ct_stmts_have_asm(ST_stmts_t *body);
+
+static b8 ST_ct_stmt_has_asm(ST_stmt_t *s) {
+    if (!s)
+        return 0;
+    switch (s->kind) {
+        case ST_ST_ASM:
+            return 1;
+        case ST_ST_EXPR:
+            return ST_ct_expr_has_asm(s->expr);
+        case ST_ST_DECL:
+            return ST_ct_expr_has_asm(s->decl.init);
+        case ST_ST_ASSIGN:
+            return ST_ct_expr_has_asm(s->assign.lhs) || ST_ct_expr_has_asm(s->assign.rhs);
+        case ST_ST_MULTI_BIND: {
+            ST_forrange(0, s->multi.values.count)
+                if (ST_ct_expr_has_asm(s->multi.values.items[i])) return 1;
+            return 0;
+        }
+        case ST_ST_IF:
+            return ST_ct_expr_has_asm(s->if_.cond) || ST_ct_stmts_have_asm(&s->if_.then_body) ||
+                   ST_ct_stmt_has_asm(s->if_.else_stmt);
+        case ST_ST_SWITCH: {
+            if (ST_ct_expr_has_asm(s->switch_.cond))
+                return 1;
+            ST_forrange(0, s->switch_.cases.count) {
+                ST_case_t *c = &s->switch_.cases.items[i];
+                b8 case_has_asm = 0;
+                ST_forrange(0, c->values.count)
+                    if (ST_ct_expr_has_asm(c->values.items[i])) case_has_asm = 1;
+                if (case_has_asm || ST_ct_stmts_have_asm(&c->body))
+                    return 1;
+            }
+            return 0;
+        }
+        case ST_ST_WHILE:
+            return ST_ct_expr_has_asm(s->while_.cond) || ST_ct_stmts_have_asm(&s->while_.body);
+        case ST_ST_FOR_RANGE:
+            return ST_ct_expr_has_asm(s->for_range.lo) || ST_ct_expr_has_asm(s->for_range.hi) ||
+                   ST_ct_stmts_have_asm(&s->for_range.body);
+        case ST_ST_FOR_ARRAY:
+            return ST_ct_expr_has_asm(s->for_array.target) ||
+                   ST_ct_stmts_have_asm(&s->for_array.body);
+        case ST_ST_RETURN: {
+            ST_forrange(0, s->ret.values.count)
+                if (ST_ct_expr_has_asm(s->ret.values.items[i])) return 1;
+            return 0;
+        }
+        case ST_ST_BLOCK:
+            return ST_ct_stmts_have_asm(&s->block);
+        case ST_ST_DEFER:
+            return ST_ct_stmt_has_asm(s->defer_stmt);
+        default:
+            return 0;
+    }
+}
+
+static b8 ST_ct_stmts_have_asm(ST_stmts_t *body) {
+    ST_forrange(0, body->count)
+        if (ST_ct_stmt_has_asm(body->items[i])) return 1;
+    return 0;
+}
+
+b8 ST_ct_decl_needs_native(ST_decl_t *d) {
+    if (!d || d->kind != ST_DE_FN)
+        return 0;
+    return ST_ct_stmts_have_asm(&d->fn.body);
+}
 
 void ST_ct_compiler_init(ST_ct_compiler_t *cc, ST_arena_t *arena, ST_ct_chunk_t *chunk) {
     memset(cc, 0, sizeof(*cc));
@@ -10,16 +127,49 @@ void ST_ct_compiler_init(ST_ct_compiler_t *cc, ST_arena_t *arena, ST_ct_chunk_t 
     cc->chunk = chunk;
 }
 
+typedef enum {
+    ST_CT_LVAL_SCALAR,
+    ST_CT_LVAL_PTR,
+    ST_CT_LVAL_STRING,
+    ST_CT_LVAL_STRUCT,
+    ST_CT_LVAL_ARRAY,
+} ST_ct_lval_kind_t;
+
+typedef struct {
+    ST_ct_lval_kind_t kind;
+    ST_decl_t *struct_decl;   // valid when kind == ST_CT_LVAL_STRUCT
+    ST_tyexpr_t *te;         // element/field type; valid for SCALAR, ARRAY (element te), PTR
+    u32 elem_size;           // valid for ARRAY when te == NULL (a plain int-array local),
+                             // and for SCALAR when te == NULL (that array's element width)
+    b8 elem_is_signed;
+} ST_ct_lval_ty_t;
+
 static b8 ST_ct_prog_want_call(ST_ct_prog_ctx_t *pctx, ST_string_t callee_name, u32 patch_off,
                                u32 line, u32 col);
 static ST_decl_t *ST_ct_prog_find_extern(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_struct(ST_ct_prog_ctx_t *pctx, ST_string_t name);
+static ST_decl_t *ST_ct_prog_find_type_alias(ST_ct_prog_ctx_t *pctx, ST_string_t name);
+static ST_decl_t *ST_ct_prog_find_enum(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_const(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_decl(ST_ct_prog_ctx_t *pctx, ST_string_t name, b8 *not_callable);
 static i32 ST_ct_struct_field_index(ST_decl_t *struct_decl, ST_string_t field_name);
 static u32 ST_ct_field_byte_size(ST_tyexpr_t *te);
+static b8 ST_ct_tyexpr_byte_size(ST_ct_compiler_t *cc, ST_tyexpr_t *te, u32 *out_size);
+static b8 ST_ct_tyexpr_int_info(ST_tyexpr_t *te, u32 *width, b8 *is_signed);
+static b8 ST_ct_tyexpr_is_int_slice(ST_tyexpr_t *te, u32 *width, b8 *is_signed);
+static b8 ST_ct_ty_int_info(ST_ty_t *t, u32 *width, b8 *is_signed);
 static ST_string_t ST_ct_expr_struct_type(ST_ct_compiler_t *cc, ST_expr_t *e);
 static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call_expr);
+static b8 ST_ct_struct_total_size(ST_ct_compiler_t *cc, ST_decl_t *sd, u32 *out_size);
+static b8 ST_ct_struct_field_offset(ST_ct_compiler_t *cc, ST_decl_t *sd, ST_string_t field_name,
+                                    u32 *out_offset, ST_tyexpr_t **out_te);
+static b8 ST_ct_lval_addr(ST_ct_compiler_t *cc, ST_expr_t *e, ST_ct_lval_ty_t *out_ty);
+static b8 ST_ct_lval_classify_te(ST_ct_compiler_t *cc, ST_tyexpr_t *te, ST_ct_lval_ty_t *out_ty);
+static void ST_ct_emit_lval_load(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line);
+static b8 ST_ct_emit_lval_store(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line);
+static b8 ST_ct_compile_struct_rvalue(ST_ct_compiler_t *cc, ST_expr_t *e, ST_string_t struct_type);
+static ST_decl_t *ST_ct_compile_native_call(ST_ct_compiler_t *cc, ST_expr_t *call_expr,
+                                            ST_decl_t *callee_decl);
 static b8 ST_ct_compile_syscall_asm(ST_ct_compiler_t *cc, ST_token_t *tokens, u32 n_tokens,
                                     u32 line, u32 col);
 
@@ -29,6 +179,7 @@ static void ST_ct_cfail(ST_ct_compiler_t *cc, u32 line, u32 col, const char *fmt
     cc->failed = 1;
     cc->err_line = line;
     cc->err_col = col;
+    cc->err_file = cc->cur_file;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(cc->err_msg, sizeof(cc->err_msg), fmt, ap);
@@ -57,6 +208,13 @@ static u32 ST_ct_declare_local(ST_ct_compiler_t *cc, ST_string_t name) {
     cc->locals[cc->n_locals].name = name;
     cc->locals[cc->n_locals].slot = slot;
     cc->locals[cc->n_locals].struct_type = (ST_string_t){0};
+    cc->locals[cc->n_locals].is_buffer = 0;
+    cc->locals[cc->n_locals].has_elem_info = 0;
+    cc->locals[cc->n_locals].elem_size = 0;
+    cc->locals[cc->n_locals].elem_is_signed = 0;
+    cc->locals[cc->n_locals].has_known_len = 0;
+    cc->locals[cc->n_locals].known_len = 0;
+    cc->locals[cc->n_locals].len_slot = -1;
     cc->n_locals++;
     return slot;
 }
@@ -64,6 +222,36 @@ static u32 ST_ct_declare_local(ST_ct_compiler_t *cc, ST_string_t name) {
 static void ST_ct_local_set_struct_type(ST_ct_compiler_t *cc, ST_string_t struct_type) {
     if (cc->n_locals > 0)
         cc->locals[cc->n_locals - 1].struct_type = struct_type;
+}
+
+static void ST_ct_local_set_is_buffer(ST_ct_compiler_t *cc) {
+    if (cc->n_locals > 0)
+        cc->locals[cc->n_locals - 1].is_buffer = 1;
+}
+
+static void ST_ct_local_set_elem_info(ST_ct_compiler_t *cc, u32 size, b8 is_signed) {
+    if (cc->n_locals > 0) {
+        cc->locals[cc->n_locals - 1].has_elem_info = 1;
+        cc->locals[cc->n_locals - 1].elem_size = size;
+        cc->locals[cc->n_locals - 1].elem_is_signed = is_signed;
+    }
+}
+
+static void ST_ct_local_set_known_len(ST_ct_compiler_t *cc, u32 len) {
+    if (cc->n_locals > 0) {
+        cc->locals[cc->n_locals - 1].has_known_len = 1;
+        cc->locals[cc->n_locals - 1].known_len = len;
+    }
+}
+
+// Returns NULL if 'name' isn't a known local at all (distinct from "not
+// buffer-backed"/"no elem info"), so callers can tell "not a local" apart
+// from "a local with nothing useful to report" without a second lookup.
+static ST_ct_local_t *ST_ct_find_local_info(ST_ct_compiler_t *cc, ST_string_t name) {
+    for (i32 k = (i32)cc->n_locals - 1; k >= 0; k--)
+        if (ST_string_eq(cc->locals[k].name, name))
+            return &cc->locals[k];
+    return NULL;
 }
 
 static ST_string_t ST_ct_local_struct_type(ST_ct_compiler_t *cc, ST_string_t name) {
@@ -214,46 +402,23 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                             "context");
                 return;
             }
-            ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, e->struct_lit.type_name);
-            if (!sd) {
-                ST_ct_cfail(cc, e->line, e->col,
-                            "comptime: no struct named '" ST_sv_fmt "' found",
-                            ST_sv_args(e->struct_lit.type_name));
-                return;
-            }
-            u32 n_fields = sd->struct_.fields.count;
-            if (n_fields > 64) {
-                ST_ct_cfail(cc, e->line, e->col,
-                            "comptime: struct '" ST_sv_fmt "' has too many fields for a "
-                            "#comptime literal (max 64)",
-                            ST_sv_args(e->struct_lit.type_name));
-                return;
-            }
-            ST_expr_t *field_exprs[64] = {0};
-            ST_forrange(0, e->struct_lit.inits.count) {
-                ST_field_init_t *fi = &e->struct_lit.inits.items[i];
-                i32 idx = fi->name.len ? ST_ct_struct_field_index(sd, fi->name) : (i32)i;
-                if (idx < 0 || (u32)idx >= n_fields) {
-                    ST_ct_cfail(cc, fi->line, fi->col,
-                                "comptime: '" ST_sv_fmt "' has no such field",
-                                ST_sv_args(e->struct_lit.type_name));
-                    return;
-                }
-                field_exprs[idx] = fi->value;
-            }
-            ST_forrange(0, n_fields) {
-                if (!field_exprs[i]) {
+            if (e->struct_lit.type_name.len == 0) {
+                u32 n_elems = e->struct_lit.inits.count;
+                if (n_elems > 64) {
                     ST_ct_cfail(cc, e->line, e->col,
-                                "comptime: struct literal for '" ST_sv_fmt "' is missing a "
-                                "field",
-                                ST_sv_args(e->struct_lit.type_name));
+                                "comptime: array literal has too many elements for a "
+                                "#comptime literal (max 64)");
                     return;
                 }
-                ST_ct_compile_expr(cc, field_exprs[i]);
-                if (cc->failed)
-                    return;
+                ST_forrange(0, n_elems) {
+                    ST_ct_compile_expr(cc, e->struct_lit.inits.items[i].value);
+                    if (cc->failed)
+                        return;
+                }
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_MAKE_STRUCT, n_elems, e->line);
+                return;
             }
-            ST_ct_emit_op_u32(cc->chunk, ST_OP_MAKE_STRUCT, n_fields, e->line);
+            ST_ct_compile_struct_rvalue(cc, e, e->struct_lit.type_name);
             return;
         }
 
@@ -261,6 +426,15 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
             i32 slot = ST_ct_find_local(cc, e->name);
             if (slot >= 0) {
                 ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, (u32)slot, e->line);
+                // A zero-initialized scalar local's own VM value is a real pointer
+                // to its storage (see ST_OP_ALLOC_ZEROED), not the value itself
+                ST_ct_local_t *lo = ST_ct_find_local_info(cc, e->name);
+                u32 ew;
+                b8 es;
+                if (lo && lo->is_buffer && ST_ct_ty_int_info(e->ty, &ew, &es)) {
+                    u32 operand = (0 & 0xF) | ((ew & 0xFF) << 4) | ((es & 1) << 12);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, e->line);
+                }
                 return;
             }
             if (cc->prog_ctx) {
@@ -277,7 +451,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                 }
                 if (cd) {
                     ST_ct_cfail(cc, e->line, e->col,
-                                "'" ST_sv_fmt "' isn't usable in a #comptime scope -- add "
+                                "'" ST_sv_fmt "' isn't usable in a #comptime scope add "
                                 "'#comptime' after '::' to opt it in ('" ST_sv_fmt " :: "
                                 "#comptime ...;')",
                                 ST_sv_args(e->name), ST_sv_args(e->name));
@@ -293,6 +467,34 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
         }
 
         case ST_EX_UNARY: {
+            if (ST_string_eq_cstr(e->unary.op, "&")) {
+                ST_ct_lval_ty_t ty;
+                ST_ct_lval_addr(cc, e->unary.operand, &ty);
+                return;
+            }
+            if (ST_string_eq_cstr(e->unary.op, "*")) {
+                ST_ct_compile_expr(cc, e->unary.operand);
+                if (cc->failed)
+                    return;
+                if (e->ty && e->ty->kind == ST_TY_STRING) {
+                    ST_ct_emit_op(cc->chunk, ST_OP_PTR_LOAD_STR, e->line);
+                    return;
+                }
+                if (e->ty && e->ty->kind == ST_TY_PTR) {
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, 3, e->line);
+                    return;
+                }
+                u32 width;
+                b8 is_signed;
+                if (e->ty && ST_ct_ty_int_info(e->ty, &width, &is_signed)) {
+                    u32 operand = (0 & 0xF) | ((width & 0xFF) << 4) | ((is_signed & 1) << 12);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, e->line);
+                    return;
+                }
+                ST_ct_cfail(cc, e->line, e->col,
+                            "comptime: dereferencing this pointer type isn't supported yet");
+                return;
+            }
             ST_ct_compile_expr(cc, e->unary.operand);
             if (ST_string_eq_cstr(e->unary.op, "-"))
                 ST_ct_emit_op(cc->chunk, ST_OP_NEG, e->line);
@@ -349,6 +551,11 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
             else if (ST_string_eq_cstr(op, "<=")) o = ST_OP_LE;
             else if (ST_string_eq_cstr(op, ">")) o = ST_OP_GT;
             else if (ST_string_eq_cstr(op, ">=")) o = ST_OP_GE;
+            else if (ST_string_eq_cstr(op, "&")) o = ST_OP_BAND;
+            else if (ST_string_eq_cstr(op, "|")) o = ST_OP_BOR;
+            else if (ST_string_eq_cstr(op, "^")) o = ST_OP_BXOR;
+            else if (ST_string_eq_cstr(op, "<<")) o = ST_OP_SHL;
+            else if (ST_string_eq_cstr(op, ">>")) o = ST_OP_SHR;
             else {
                 ST_ct_cfail(cc, e->line, e->col,
                             "comptime: '" ST_sv_fmt "' isn't supported in a #comptime context "
@@ -361,52 +568,225 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
         }
 
         case ST_EX_FIELD: {
-            // A struct-typed base's field access is resolved purely from
-            // ST_ct_expr_struct_type (which covers locals, consts, and inline
-            // literals)
-            if (cc->prog_ctx) {
-                ST_string_t struct_type = ST_ct_expr_struct_type(cc, e->field.base);
-                if (struct_type.len) {
-                    ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, struct_type);
-                    if (!sd) {
+            // 'EnumType.Variant' is a symbolic lookup against the enum decl, not a
+            // value at all.
+            if (e->field.base->kind == ST_EX_IDENT && cc->prog_ctx) {
+                ST_decl_t *ed = ST_ct_prog_find_enum(cc->prog_ctx, e->field.base->name);
+                if (ed) {
+                    ST_variant_spec_t *variant = NULL;
+                    ST_forrange(0, ed->enum_.variants.count)
+                        if (ST_string_eq(ed->enum_.variants.items[i].name, e->field.name)) {
+                            variant = &ed->enum_.variants.items[i];
+                            break;
+                        }
+                    if (!variant) {
                         ST_ct_cfail(cc, e->line, e->col,
-                                    "comptime: no struct named '" ST_sv_fmt "' found",
-                                    ST_sv_args(struct_type));
+                                    "comptime: '" ST_sv_fmt "' has no variant '" ST_sv_fmt "'",
+                                    ST_sv_args(e->field.base->name), ST_sv_args(e->field.name));
                         return;
                     }
-                    i32 fidx = ST_ct_struct_field_index(sd, e->field.name);
-                    if (fidx < 0) {
+                    if (!variant->has_computed) {
                         ST_ct_cfail(cc, e->line, e->col,
-                                    "comptime: '" ST_sv_fmt "' has no field '" ST_sv_fmt "'",
-                                    ST_sv_args(struct_type), ST_sv_args(e->field.name));
+                                    "comptime: '" ST_sv_fmt "." ST_sv_fmt "' isn't resolved to "
+                                    "a value yet",
+                                    ST_sv_args(e->field.base->name), ST_sv_args(e->field.name));
                         return;
                     }
-                    ST_ct_compile_expr(cc, e->field.base);
-                    if (cc->failed)
-                        return;
-                    ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_FIELD, (u32)fidx, e->line);
+                    ST_ct_emit_const(cc->chunk, ST_ct_int(variant->computed), e->line);
                     return;
                 }
             }
 
+            // A dyn_array's fields ('items'/'count'/'capacity') always live at fixed
+            // byte offsets in real memory.
+            ST_ty_t *bt = e->field.base->ty;
+            ST_ty_t *dat = NULL;
+            if (bt && bt->kind == ST_TY_DYN_ARRAY)
+                dat = bt;
+            else if (bt && bt->kind == ST_TY_PTR && bt->inner && bt->inner->kind == ST_TY_DYN_ARRAY)
+                dat = bt->inner;
+            if (dat) {
+                u32 offset, tag = 0;
+                if (ST_string_eq_cstr(e->field.name, "items")) { offset = 0; tag = 3; }
+                else if (ST_string_eq_cstr(e->field.name, "count")) offset = 8;
+                else if (ST_string_eq_cstr(e->field.name, "capacity")) offset = 16;
+                else {
+                    ST_ct_cfail(cc, e->line, e->col,
+                                "comptime: a dyn_array has no field '" ST_sv_fmt "'",
+                                ST_sv_args(e->field.name));
+                    return;
+                }
+                ST_ct_compile_expr(cc, e->field.base);
+                if (cc->failed)
+                    return;
+                ST_ct_emit_const(cc->chunk, ST_ct_int(offset), e->line);
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, 1, e->line);
+                u32 operand = (tag & 0xF) | ((8 & 0xFF) << 4) | ((1 & 1) << 12);
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, e->line);
+                return;
+            }
+
+            // A struct-typed base (by static type, or by the local-tracked struct
+            // name) resolves its field via the general addressing helper, which
+            // also handles arbitrary nesting through further structs/arrays.
+            b8 looks_like_struct_field = (bt && bt->kind == ST_TY_STRUCT && bt->decl) ||
+                                         (cc->prog_ctx && ST_ct_expr_struct_type(cc, e->field.base).len);
+            if (looks_like_struct_field) {
+                ST_ct_lval_ty_t fty;
+                if (!ST_ct_lval_addr(cc, e, &fty))
+                    return;
+                if (fty.kind == ST_CT_LVAL_STRUCT || fty.kind == ST_CT_LVAL_ARRAY)
+                    return;
+                ST_ct_emit_lval_load(cc, &fty, e->line);
+                return;
+            }
+
+            if (ST_string_eq_cstr(e->field.name, "ptr") && e->field.base->ty && e->field.base->ty->kind == ST_TY_STRING) {
+		ST_ct_compile_expr(cc, e->field.base);
+		if (cc->failed) return;
+		ST_ct_emit_op(cc->chunk, ST_OP_STR_PTR, e->line);
+                return;
+            }
+
+
             if (!ST_string_eq_cstr(e->field.name, "len")) {
                 ST_ct_cfail(cc, e->line, e->col,
                             "comptime: '.'" ST_sv_fmt "' isn't comptime-evaluable "
-                            "(only '.len' on a string, and fields on a struct-typed "
+                            "fields on a struct-typed "
                             "local/const, are right now)",
                             ST_sv_args(e->field.name));
                 return;
+            }
+            if (e->field.base->kind == ST_EX_IDENT) {
+                ST_ct_local_t *lo = ST_ct_find_local_info(cc, e->field.base->name);
+                if (lo && lo->has_known_len) {
+                    ST_ct_emit_const(cc->chunk, ST_ct_int(lo->known_len), e->line);
+                    return;
+                }
+                if (lo && lo->len_slot >= 0) {
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, (u32)lo->len_slot, e->line);
+                    return;
+                }
             }
             ST_ct_compile_expr(cc, e->field.base);
             ST_ct_emit_op(cc->chunk, ST_OP_STR_LEN, e->line);
             return;
         }
 
-        case ST_EX_INDEX:
+        case ST_EX_INDEX: {
+            ST_expr_t *base = e->index.base;
+
+            if (base->ty && base->ty->kind == ST_TY_PTR) {
+                u32 ew;
+                b8 es;
+                if (ST_ct_ty_int_info(base->ty->inner, &ew, &es)) {
+                    ST_ct_compile_expr(cc, base);
+                    ST_ct_compile_expr(cc, e->index.index);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, ew, e->line);
+                    u32 operand = (0 & 0xF) | ((ew & 0xFF) << 4) | ((es & 1) << 12);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, e->line);
+                    return;
+                }
+            }
+
+            if (base->kind == ST_EX_IDENT) {
+                ST_ct_local_t *lo = ST_ct_find_local_info(cc, base->name);
+                if (lo && lo->is_buffer && lo->has_elem_info) {
+                    ST_ct_compile_expr(cc, base);
+                    ST_ct_compile_expr(cc, e->index.index);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, lo->elem_size, e->line);
+                    u32 tag = 0; // int
+                    u32 operand = (tag & 0xF) | ((lo->elem_size & 0xFF) << 4) |
+                                 ((lo->elem_is_signed & 1) << 12);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, e->line);
+                    return;
+                }
+            }
+
+            if (base->kind == ST_EX_FIELD && ST_string_eq_cstr(base->field.name, "ptr") &&
+                base->field.base->ty) {
+                ST_ty_kind_t bk = base->field.base->ty->kind;
+                if (bk == ST_TY_STRING) {
+                    ST_ct_compile_expr(cc, base->field.base);
+                    ST_ct_compile_expr(cc, e->index.index);
+                    ST_ct_emit_op(cc->chunk, ST_OP_STR_INDEX, e->line);
+                    return;
+                }
+                if (bk == ST_TY_SLICE || bk == ST_TY_ARRAY || bk == ST_TY_DYN_ARRAY) {
+                    ST_ct_compile_expr(cc, base->field.base);
+                    ST_ct_compile_expr(cc, e->index.index);
+                    ST_ct_emit_op(cc->chunk, ST_OP_STRUCT_INDEX, e->line);
+                    return;
+                }
+            }
+            if (base->kind == ST_EX_FIELD) {
+                ST_ty_t *fbt = base->field.base->ty;
+                b8 base_looks_like_struct = (fbt && fbt->kind == ST_TY_STRUCT && fbt->decl) ||
+                                            (cc->prog_ctx && ST_ct_expr_struct_type(cc, base->field.base).len);
+                if (base_looks_like_struct) {
+                    ST_ct_lval_ty_t ty;
+                    if (!ST_ct_lval_addr(cc, e, &ty))
+                        return;
+                    if (ty.kind == ST_CT_LVAL_STRUCT || ty.kind == ST_CT_LVAL_ARRAY)
+                        return;
+                    ST_ct_emit_lval_load(cc, &ty, e->line);
+                    return;
+                }
+            }
+            if (base->ty) {
+                ST_ty_kind_t bk = base->ty->kind;
+                if (bk == ST_TY_ARRAY || bk == ST_TY_SLICE || bk == ST_TY_DYN_ARRAY ||
+                    bk == ST_TY_STRUCT) {
+                    ST_ct_compile_expr(cc, base);
+                    ST_ct_compile_expr(cc, e->index.index);
+                    ST_ct_emit_op(cc->chunk, ST_OP_STRUCT_INDEX, e->line);
+                    return;
+                }
+            }
             ST_ct_compile_expr(cc, e->index.base);
             ST_ct_compile_expr(cc, e->index.index);
             ST_ct_emit_op(cc->chunk, ST_OP_STR_INDEX, e->line);
             return;
+        }
+
+        case ST_EX_CAST: {
+            ST_ct_compile_expr(cc, e->cast.operand);
+            if (cc->failed)
+                return;
+            ST_ty_t *t = e->ty;
+            if (!t) {
+                ST_ct_cfail(cc, e->line, e->col, "comptime: cast target type isn't known here");
+                return;
+            }
+            u32 tag, width = 0, is_signed = 0;
+            switch (t->kind) {
+                case ST_TY_INT: tag = 0; width = t->width / 8; is_signed = t->is_signed; break;
+                case ST_TY_UNTYPED_INT: tag = 0; width = 8; is_signed = 1; break;
+                case ST_TY_CHAR: tag = 0; width = 1; is_signed = 0; break;
+                case ST_TY_FLOAT: case ST_TY_UNTYPED_FLOAT: tag = 1; break;
+                case ST_TY_BOOL: tag = 2; break;
+                case ST_TY_PTR: tag = 3; break;
+                default:
+                    ST_ct_cfail(cc, e->line, e->col,
+                                "comptime: casting to this type isn't supported in a "
+                                "#comptime scope yet");
+                    return;
+            }
+            u32 operand = (tag & 0xF) | ((width & 0xFF) << 4) | ((is_signed & 1) << 12);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_CAST, operand, e->line);
+            return;
+        }
+
+        case ST_EX_STR_FROM_RAW: {
+            ST_ct_compile_expr(cc, e->str_from_raw.ptr);
+            if (cc->failed)
+                return;
+            ST_ct_compile_expr(cc, e->str_from_raw.len);
+            if (cc->failed)
+                return;
+            ST_ct_emit_op(cc->chunk, ST_OP_STR_FROM_RAW, e->line);
+            return;
+        }
 
         case ST_EX_KIND: {
             ST_ty_t *t = e->tyop.operand ? e->tyop.operand->ty : NULL;
@@ -472,16 +852,25 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
 
             ST_decl_t *extern_decl = ST_ct_prog_find_extern(cc->prog_ctx, callee_name);
             if (extern_decl) {
-                u32 n_params = extern_decl->extern_fn.sig.params.count;
-                if (e->call.args.count > n_params) {
+                u32 n_named = extern_decl->extern_fn.sig.params.count;
+                b8 is_variadic = extern_decl->extern_fn.sig.is_variadic;
+                if (!is_variadic && e->call.args.count > n_named) {
                     ST_ct_cfail(cc, e->line, e->col,
                                 "comptime: '" ST_sv_fmt "' expects at most %u argument%s, "
                                 "got %u",
-                                ST_sv_args(callee_name), n_params, n_params == 1 ? "" : "s",
+                                ST_sv_args(callee_name), n_named, n_named == 1 ? "" : "s",
                                 e->call.args.count);
                     return;
                 }
-                ST_forrange(0, n_params) {
+                u32 n_args = e->call.args.count > n_named ? e->call.args.count : n_named;
+                if (n_args > 8) {
+                    ST_ct_cfail(cc, e->line, e->col,
+                                "comptime: '" ST_sv_fmt "' has too many arguments for a "
+                                "#comptime native call (max 8)",
+                                ST_sv_args(callee_name));
+                    return;
+                }
+                ST_forrange(0, n_args) {
                     ST_expr_t *arg;
                     if (i < e->call.args.count) {
                         arg = e->call.args.items[i].value;
@@ -532,7 +921,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                     ST_ct_emit_const(cc->chunk, ST_ct_str((const char *)name_copy, callee_name.len),
                                      e->line);
                 }
-                ST_ct_emit_const(cc->chunk, ST_ct_int((i64)n_params), e->line);
+                ST_ct_emit_const(cc->chunk, ST_ct_int((i64)n_args), e->line);
                 ST_ct_emit_op(cc->chunk, ST_OP_BIND_SYM, e->line);
                 ST_ct_emit_op(cc->chunk, ST_OP_CALL_NATIVE, e->line);
                 return;
@@ -541,7 +930,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
             ST_decl_t *callee_decl = ST_ct_compile_plain_call(cc, e);
             if (!callee_decl)
                 return;
-            if (callee_decl->fn.sig.rets.count != 1) {
+            if (!ST_ct_decl_needs_native(callee_decl) && callee_decl->fn.sig.rets.count != 1) {
                 ST_ct_cfail(cc, e->line, e->col,
                             "comptime: '" ST_sv_fmt "' returns %u values, but is used here as "
                             "a single value (bind it with 'a, b := ...' instead)",
@@ -568,6 +957,120 @@ void ST_ct_compile_expr_return(ST_ct_compiler_t *cc, ST_expr_t *e) {
         ST_ct_emit_op_u32(cc->chunk, ST_OP_RETURN, 1, e ? e->line : 0);
 }
 
+static ST_decl_t *ST_ct_compile_native_call(ST_ct_compiler_t *cc, ST_expr_t *call_expr,
+                                            ST_decl_t *callee_decl) {
+    ST_string_t callee_name = callee_decl->name;
+    if (!callee_decl->is_pub) {
+        ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                    "comptime: '" ST_sv_fmt "' has to be declared 'pub' to be called from "
+                    "#comptime (it's implemented in assembly)",
+                    ST_sv_args(callee_name));
+        return NULL;
+    }
+
+    if (!ST_ct_ensure_native_module(cc->prog_ctx, cc->err_msg, sizeof(cc->err_msg))) {
+        cc->failed = 1;
+        cc->err_line = call_expr->line;
+        cc->err_col = call_expr->col;
+        return NULL;
+    }
+
+    u32 n_params = callee_decl->fn.sig.params.count;
+    if (call_expr->call.args.count > n_params) {
+        ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                    "comptime: '" ST_sv_fmt "' expects at most %u argument%s, got %u",
+                    ST_sv_args(callee_name), n_params, n_params == 1 ? "" : "s",
+                    call_expr->call.args.count);
+        return NULL;
+    }
+
+    u32 arity = 0;
+    ST_forrange(0, n_params) {
+        ST_expr_t *arg;
+        if (i < call_expr->call.args.count) {
+            arg = call_expr->call.args.items[i].value;
+        } else {
+            arg = callee_decl->fn.sig.params.items[i].def;
+            if (!arg) {
+                ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                            "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it "
+                            "has no default value)",
+                            ST_sv_args(callee_name), ST_sv_args(callee_decl->fn.sig.params.items[i].name));
+                return NULL;
+            }
+        }
+
+        // A real (asm-backed) Storth function follows Storth's own ABI, not C's:
+        // a 'string' is two eightbyte registers (ptr, len), and so is a
+        // '[]string' (items pointer, count)
+        ST_tyexpr_t *pte = callee_decl->fn.sig.params.items[i].te;
+        if (pte && pte->kind == ST_TE_NAME && ST_string_eq_cstr(pte->name, "string")) {
+            ST_ct_compile_expr(cc, arg);
+            if (cc->failed)
+                return NULL;
+            ST_ct_emit_op(cc->chunk, ST_OP_NATIVE_ARG_STRING, call_expr->line);
+            arity += 2;
+            continue;
+        }
+        if (pte && pte->kind == ST_TE_ARRAY && pte->inner && pte->inner->kind == ST_TE_NAME &&
+            ST_string_eq_cstr(pte->inner->name, "string")) {
+            ST_ct_compile_expr(cc, arg);
+            if (cc->failed)
+                return NULL;
+            ST_ct_emit_op(cc->chunk, ST_OP_NATIVE_ARG_STRING_ARRAY, call_expr->line);
+            arity += 2;
+            continue;
+        }
+
+        ST_string_t struct_type = ST_ct_expr_struct_type(cc, arg);
+        ST_ct_compile_expr(cc, arg);
+        if (cc->failed)
+            return NULL;
+        if (struct_type.len) {
+            ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, struct_type);
+            if (!sd) {
+                ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                            "comptime: no struct named '" ST_sv_fmt "' found",
+                            ST_sv_args(struct_type));
+                return NULL;
+            }
+            u32 n_fields = sd->struct_.fields.count;
+            if (n_fields > 64) {
+                ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                            "comptime: struct '" ST_sv_fmt "' has too many fields to pack "
+                            "for a native call (max 64)",
+                            ST_sv_args(struct_type));
+                return NULL;
+            }
+            u32 sizes[64];
+            ST_forrange(0, n_fields)
+                sizes[i] = ST_ct_field_byte_size(sd->struct_.fields.items[i].te);
+            ST_ct_emit_pack_struct(cc->chunk, sizes, n_fields, call_expr->line);
+        } else {
+            ST_ct_emit_op(cc->chunk, ST_OP_NATIVE_ARG, call_expr->line);
+        }
+        arity += 1;
+    }
+
+    {
+        u32 path_len = (u32)strlen(cc->prog_ctx->native_so_path);
+        u8 *path_copy = ST_arena_push(cc->arena, path_len);
+        memcpy(path_copy, cc->prog_ctx->native_so_path, path_len);
+        ST_ct_emit_const(cc->chunk, ST_ct_str((const char *)path_copy, path_len), call_expr->line);
+    }
+    ST_ct_emit_op(cc->chunk, ST_OP_LOAD_LIB, call_expr->line);
+    {
+        u8 *name_copy = ST_arena_push(cc->arena, callee_name.len);
+        memcpy(name_copy, callee_name.data, callee_name.len);
+        ST_ct_emit_const(cc->chunk, ST_ct_str((const char *)name_copy, callee_name.len),
+                         call_expr->line);
+    }
+    ST_ct_emit_const(cc->chunk, ST_ct_int((i64)arity), call_expr->line);
+    ST_ct_emit_op(cc->chunk, ST_OP_BIND_SYM, call_expr->line);
+    ST_ct_emit_op(cc->chunk, ST_OP_CALL_NATIVE, call_expr->line);
+    return callee_decl;
+}
+
 // Compiles a call to a plain (non-extern) Storth function: resolves the
 // callee, fills in any missing trailing arguments from their declared
 // defaults, compiles the (now-complete) argument list, emits the CALL,
@@ -575,6 +1078,311 @@ void ST_ct_compile_expr_return(ST_ct_compiler_t *cc, ST_expr_t *e) {
 // callee_decl->fn.sig.rets.count values on the stack once the callee
 // returns. Returns the callee decl on success, NULL on failure (with
 // cc->failed already set).
+static b8 ST_ct_struct_total_size(ST_ct_compiler_t *cc, ST_decl_t *sd, u32 *out_size) {
+    u32 total = 0;
+    ST_forrange(0, sd->struct_.fields.count) {
+        u32 fs;
+        if (!ST_ct_tyexpr_byte_size(cc, sd->struct_.fields.items[i].te, &fs))
+            return 0;
+        total += fs;
+    }
+    *out_size = total;
+    return 1;
+}
+
+static b8 ST_ct_struct_field_offset(ST_ct_compiler_t *cc, ST_decl_t *sd, ST_string_t field_name,
+                                    u32 *out_offset, ST_tyexpr_t **out_te) {
+    u32 offset = 0;
+    ST_forrange(0, sd->struct_.fields.count) {
+        ST_tyexpr_t *fte = sd->struct_.fields.items[i].te;
+        if (ST_string_eq(sd->struct_.fields.items[i].name, field_name)) {
+            *out_offset = offset;
+            *out_te = fte;
+            return 1;
+        }
+        u32 fs;
+        if (!ST_ct_tyexpr_byte_size(cc, fte, &fs))
+            return 0;
+        offset += fs;
+    }
+    return 0;
+}
+
+static b8 ST_ct_lval_classify_te(ST_ct_compiler_t *cc, ST_tyexpr_t *te, ST_ct_lval_ty_t *out_ty) {
+    out_ty->elem_size = 0;
+    out_ty->elem_is_signed = 0;
+    if (te->kind == ST_TE_PTR) {
+        out_ty->kind = ST_CT_LVAL_PTR;
+        out_ty->struct_decl = NULL;
+        out_ty->te = te;
+        return 1;
+    }
+    if (te->kind == ST_TE_ARRAY) {
+        out_ty->kind = ST_CT_LVAL_ARRAY;
+        out_ty->struct_decl = NULL;
+        out_ty->te = te->inner;
+        return 1;
+    }
+    if (te->kind == ST_TE_NAME) {
+        if (ST_string_eq_cstr(te->name, "string")) {
+            out_ty->kind = ST_CT_LVAL_STRING;
+            out_ty->struct_decl = NULL;
+            out_ty->te = te;
+            return 1;
+        }
+        if (cc->prog_ctx) {
+            ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, te->name);
+            if (sd) {
+                out_ty->kind = ST_CT_LVAL_STRUCT;
+                out_ty->struct_decl = sd;
+                out_ty->te = te;
+                return 1;
+            }
+        }
+    }
+    out_ty->kind = ST_CT_LVAL_SCALAR;
+    out_ty->struct_decl = NULL;
+    out_ty->te = te;
+    return 1;
+}
+
+static b8 ST_ct_lval_addr(ST_ct_compiler_t *cc, ST_expr_t *e, ST_ct_lval_ty_t *out_ty) {
+    out_ty->elem_size = 0;
+    out_ty->elem_is_signed = 0;
+    if (e->kind == ST_EX_IDENT) {
+        ST_ct_local_t *lo = ST_ct_find_local_info(cc, e->name);
+        if (!lo || !lo->is_buffer) {
+            ST_ct_cfail(cc, e->line, e->col,
+                        "comptime: '" ST_sv_fmt "' isn't addressable here", ST_sv_args(e->name));
+            return 0;
+        }
+        i32 slot = ST_ct_find_local(cc, e->name);
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, (u32)slot, e->line);
+        ST_decl_t *sd = NULL;
+        if (lo->struct_type.len && cc->prog_ctx)
+            sd = ST_ct_prog_find_struct(cc->prog_ctx, lo->struct_type);
+        if (!sd && cc->prog_ctx && e->ty && e->ty->kind == ST_TY_STRUCT && e->ty->decl)
+            sd = e->ty->decl;
+        if (sd) {
+            out_ty->kind = ST_CT_LVAL_STRUCT;
+            out_ty->struct_decl = sd;
+            out_ty->te = NULL;
+            return 1;
+        }
+        if (lo->has_elem_info) {
+            out_ty->kind = ST_CT_LVAL_ARRAY;
+            out_ty->struct_decl = NULL;
+            out_ty->te = NULL;
+            out_ty->elem_size = lo->elem_size;
+            out_ty->elem_is_signed = lo->elem_is_signed;
+            return 1;
+        }
+        out_ty->kind = ST_CT_LVAL_SCALAR;
+        out_ty->struct_decl = NULL;
+        out_ty->te = NULL;
+        return 1;
+    }
+
+    if (e->kind == ST_EX_FIELD) {
+        ST_ct_lval_ty_t base_ty;
+        if (!ST_ct_lval_addr(cc, e->field.base, &base_ty))
+            return 0;
+        if (base_ty.kind != ST_CT_LVAL_STRUCT) {
+            ST_ct_cfail(cc, e->line, e->col,
+                        "comptime: '." ST_sv_fmt "' needs a struct-typed base here",
+                        ST_sv_args(e->field.name));
+            return 0;
+        }
+        u32 offset;
+        ST_tyexpr_t *fte;
+        if (!ST_ct_struct_field_offset(cc, base_ty.struct_decl, e->field.name, &offset, &fte)) {
+            ST_ct_cfail(cc, e->line, e->col,
+                        "comptime: '" ST_sv_fmt "' has no field '" ST_sv_fmt "'",
+                        ST_sv_args(base_ty.struct_decl->name), ST_sv_args(e->field.name));
+            return 0;
+        }
+        ST_ct_emit_const(cc->chunk, ST_ct_int(offset), e->line);
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, 1, e->line);
+        return ST_ct_lval_classify_te(cc, fte, out_ty);
+    }
+
+    if (e->kind == ST_EX_INDEX) {
+        ST_ct_lval_ty_t base_ty;
+        if (!ST_ct_lval_addr(cc, e->index.base, &base_ty))
+            return 0;
+        if (base_ty.kind != ST_CT_LVAL_ARRAY) {
+            ST_ct_cfail(cc, e->line, e->col,
+                        "comptime: indexing needs an array-typed base here");
+            return 0;
+        }
+        u32 elem_size;
+        if (base_ty.te) {
+            if (!ST_ct_tyexpr_byte_size(cc, base_ty.te, &elem_size)) {
+                ST_ct_cfail(cc, e->line, e->col, "comptime: can't size this array's elements");
+                return 0;
+            }
+        } else {
+            elem_size = base_ty.elem_size;
+        }
+        ST_ct_compile_expr(cc, e->index.index);
+        if (cc->failed)
+            return 0;
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, elem_size, e->line);
+        if (base_ty.te)
+            return ST_ct_lval_classify_te(cc, base_ty.te, out_ty);
+        out_ty->kind = ST_CT_LVAL_SCALAR;
+        out_ty->struct_decl = NULL;
+        out_ty->te = NULL;
+        out_ty->elem_size = base_ty.elem_size;
+        out_ty->elem_is_signed = base_ty.elem_is_signed;
+        return 1;
+    }
+
+    ST_ct_cfail(cc, e->line, e->col, "comptime: this expression isn't addressable here");
+    return 0;
+}
+
+static void ST_ct_emit_lval_load(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line) {
+    if (ty->kind == ST_CT_LVAL_STRING) {
+        ST_ct_emit_op(cc->chunk, ST_OP_PTR_LOAD_STR, line);
+        return;
+    }
+    if (ty->kind == ST_CT_LVAL_PTR) {
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, 3, line);
+        return;
+    }
+    u32 width;
+    b8 is_signed;
+    if (ty->te && ST_ct_tyexpr_int_info(ty->te, &width, &is_signed)) {
+        u32 operand = (0 & 0xF) | ((width & 0xFF) << 4) | ((is_signed & 1) << 12);
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, line);
+        return;
+    }
+    if (!ty->te && ty->kind == ST_CT_LVAL_SCALAR && ty->elem_size) {
+        u32 operand = (0 & 0xF) | ((ty->elem_size & 0xFF) << 4) | ((ty->elem_is_signed & 1) << 12);
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, line);
+        return;
+    }
+    ST_ct_cfail(cc, line, 0, "comptime: don't know how to read this value through a pointer");
+}
+
+static b8 ST_ct_emit_lval_store(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line) {
+    if (ty->kind == ST_CT_LVAL_STRING) {
+        ST_ct_emit_op(cc->chunk, ST_OP_PTR_STORE_STR, line);
+        return 1;
+    }
+    if (ty->kind == ST_CT_LVAL_PTR) {
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, 8, line);
+        return 1;
+    }
+    u32 width;
+    b8 is_signed;
+    if (ty->te && ST_ct_tyexpr_int_info(ty->te, &width, &is_signed)) {
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, width, line);
+        return 1;
+    }
+    if (!ty->te && ty->kind == ST_CT_LVAL_SCALAR && ty->elem_size) {
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, ty->elem_size, line);
+        return 1;
+    }
+    ST_ct_cfail(cc, line, 0, "comptime: don't know how to write this value through a pointer");
+    return 0;
+}
+
+static b8 ST_ct_compile_struct_rvalue(ST_ct_compiler_t *cc, ST_expr_t *e, ST_string_t struct_type) {
+    if (!cc->prog_ctx) {
+        ST_ct_cfail(cc, e->line, e->col, "comptime: structs aren't usable in this context");
+        return 0;
+    }
+    ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, struct_type);
+    if (!sd) {
+        ST_ct_cfail(cc, e->line, e->col, "comptime: no struct named '" ST_sv_fmt "' found",
+                    ST_sv_args(struct_type));
+        return 0;
+    }
+    u32 total_size;
+    if (!ST_ct_struct_total_size(cc, sd, &total_size)) {
+        ST_ct_cfail(cc, e->line, e->col,
+                    "comptime: '" ST_sv_fmt "' has a field type this #comptime scope can't "
+                    "size yet", ST_sv_args(struct_type));
+        return 0;
+    }
+
+    if (e->kind == ST_EX_STRUCT_LIT) {
+        u32 n_fields = sd->struct_.fields.count;
+        if (n_fields > 64) {
+            ST_ct_cfail(cc, e->line, e->col,
+                        "comptime: struct '" ST_sv_fmt "' has too many fields (max 64)",
+                        ST_sv_args(struct_type));
+            return 0;
+        }
+        ST_expr_t *field_exprs[64] = {0};
+        ST_forrange(0, e->struct_lit.inits.count) {
+            ST_field_init_t *fi = &e->struct_lit.inits.items[i];
+            i32 idx = fi->name.len ? ST_ct_struct_field_index(sd, fi->name) : (i32)i;
+            if (idx < 0 || (u32)idx >= n_fields) {
+                ST_ct_cfail(cc, fi->line, fi->col, "comptime: '" ST_sv_fmt "' has no such field",
+                            ST_sv_args(struct_type));
+                return 0;
+            }
+            field_exprs[idx] = fi->value;
+        }
+
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_ALLOC_ZEROED, total_size, e->line);
+        u32 dst_slot = ST_ct_declare_local(cc, ST_cstr_to_str("$struct_scratch"));
+
+        u32 offset = 0;
+        ST_forrange(0, n_fields) {
+            ST_tyexpr_t *fte = sd->struct_.fields.items[i].te;
+            u32 fsize;
+            if (!ST_ct_tyexpr_byte_size(cc, fte, &fsize)) {
+                ST_ct_cfail(cc, e->line, e->col,
+                            "comptime: can't size field '" ST_sv_fmt "' of '" ST_sv_fmt "'",
+                            ST_sv_args(sd->struct_.fields.items[i].name), ST_sv_args(struct_type));
+                return 0;
+            }
+            if (!field_exprs[i]) {
+                ST_ct_cfail(cc, e->line, e->col,
+                            "comptime: struct literal for '" ST_sv_fmt "' is missing a field",
+                            ST_sv_args(struct_type));
+                return 0;
+            }
+            ST_ct_lval_ty_t fty;
+            ST_ct_lval_classify_te(cc, fte, &fty);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, dst_slot, e->line);
+            ST_ct_emit_const(cc->chunk, ST_ct_int(offset), e->line);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, 1, e->line);
+            if (fty.kind == ST_CT_LVAL_STRUCT) {
+                if (!ST_ct_compile_struct_rvalue(cc, field_exprs[i], fte->name))
+                    return 0;
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_MEM_COPY, fsize, e->line);
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, e->line);
+            } else {
+                ST_ct_compile_expr(cc, field_exprs[i]);
+                if (cc->failed)
+                    return 0;
+                if (!ST_ct_emit_lval_store(cc, &fty, e->line))
+                    return 0;
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, e->line);
+            }
+            offset += fsize;
+        }
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, dst_slot, e->line);
+        return 1;
+    }
+
+    ST_ct_emit_op_u32(cc->chunk, ST_OP_ALLOC_ZEROED, total_size, e->line);
+    u32 dst_slot = ST_ct_declare_local(cc, ST_cstr_to_str("$struct_scratch"));
+    ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, dst_slot, e->line);
+    ST_ct_compile_expr(cc, e);
+    if (cc->failed)
+        return 0;
+    ST_ct_emit_op_u32(cc->chunk, ST_OP_MEM_COPY, total_size, e->line);
+    ST_ct_emit_op(cc->chunk, ST_OP_POP, e->line);
+    ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, dst_slot, e->line);
+    return 1;
+}
+
 static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call_expr) {
     if (!cc->prog_ctx) {
         ST_ct_cfail(cc, call_expr->line, call_expr->col,
@@ -610,6 +1418,9 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
         return NULL;
     }
 
+    if (ST_ct_decl_needs_native(callee_decl))
+        return ST_ct_compile_native_call(cc, call_expr, callee_decl);
+
     u32 n_params = callee_decl->fn.sig.params.count;
     if (call_expr->call.args.count > n_params) {
         ST_ct_cfail(cc, call_expr->line, call_expr->col,
@@ -619,26 +1430,64 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
         return NULL;
     }
 
-    ST_forrange(0, call_expr->call.args.count) {
-        ST_ct_compile_expr(cc, call_expr->call.args.items[i].value);
-        if (cc->failed)
-            return NULL;
+    if (n_params > 64) {
+        ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                    "comptime: '" ST_sv_fmt "' has too many parameters for a #comptime call "
+                    "(max 64)", ST_sv_args(callee_name));
+        return NULL;
     }
-    for (u32 k = call_expr->call.args.count; k < n_params; k++) {
-        ST_expr_t *def = callee_decl->fn.sig.params.items[k].def;
-        if (!def) {
-            ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                        "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it "
-                        "has no default value)",
-                        ST_sv_args(callee_name), ST_sv_args(callee_decl->fn.sig.params.items[k].name));
-            return NULL;
+    u32 arity = 0;
+    ST_forrange(0, n_params) {
+        ST_expr_t *arg;
+        if (i < call_expr->call.args.count) {
+            arg = call_expr->call.args.items[i].value;
+        } else {
+            arg = callee_decl->fn.sig.params.items[i].def;
+            if (!arg) {
+                ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                            "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it "
+                            "has no default value)",
+                            ST_sv_args(callee_name), ST_sv_args(callee_decl->fn.sig.params.items[i].name));
+                return NULL;
+            }
         }
-        ST_ct_compile_expr(cc, def);
-        if (cc->failed)
-            return NULL;
+        ST_tyexpr_t *pte = callee_decl->fn.sig.params.items[i].te;
+        ST_string_t param_struct_type = (ST_string_t){0};
+        if (pte && pte->kind == ST_TE_NAME && ST_ct_prog_find_struct(cc->prog_ctx, pte->name))
+            param_struct_type = pte->name;
+        if (param_struct_type.len) {
+            if (!ST_ct_compile_struct_rvalue(cc, arg, param_struct_type))
+                return NULL;
+        } else {
+            ST_ct_compile_expr(cc, arg);
+            if (cc->failed)
+                return NULL;
+        }
+        arity++;
+
+        // A slice-typed parameter needs the caller to also push its length,
+        // right after the pointer
+        u32 sw;
+        b8 ssig;
+        if (!param_struct_type.len && pte && ST_ct_tyexpr_is_int_slice(pte, &sw, &ssig)) {
+            ST_ct_local_t *lo = arg->kind == ST_EX_IDENT ? ST_ct_find_local_info(cc, arg->name) : NULL;
+            if (lo && lo->has_known_len) {
+                ST_ct_emit_const(cc->chunk, ST_ct_int(lo->known_len), call_expr->line);
+            } else if (lo && lo->len_slot >= 0) {
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, (u32)lo->len_slot, call_expr->line);
+            } else {
+                ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                            "comptime: can't tell how long this slice argument to '" ST_sv_fmt
+                            "' is pass a fixed-size array local or another slice "
+                            "parameter directly",
+                            ST_sv_args(callee_name));
+                return NULL;
+            }
+            arity++;
+        }
     }
 
-    u32 patch_off = ST_ct_emit_call(cc->chunk, n_params, call_expr->line);
+    u32 patch_off = ST_ct_emit_call(cc->chunk, arity, call_expr->line);
     if (!ST_ct_prog_want_call(cc->prog_ctx, callee_name, patch_off, call_expr->line,
                               call_expr->col)) {
         cc->failed = 1;
@@ -647,6 +1496,7 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
         memcpy(cc->err_msg, cc->prog_ctx->err_msg, sizeof(cc->err_msg));
         return NULL;
     }
+
     return callee_decl;
 }
 
@@ -674,37 +1524,242 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
     switch (s->kind) {
         case ST_ST_DECL: {
             if (!s->decl.init) {
-                ST_ct_cfail(cc, s->line, s->col,
-                            "comptime: '" ST_sv_fmt "' needs an initializer in a #comptime scope "
-                            "(no zero-init locals yet)",
-                            ST_sv_args(s->decl.name));
+                u32 size;
+                if (!s->decl.te || !ST_ct_tyexpr_byte_size(cc, s->decl.te, &size)) {
+                    ST_ct_cfail(cc, s->line, s->col,
+                                "comptime: '" ST_sv_fmt "' needs an initializer here its "
+                                "type isn't one this #comptime scope knows how to "
+                                "zero-initialize yet",
+                                ST_sv_args(s->decl.name));
+                    return;
+                }
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_ALLOC_ZEROED, size, s->line);
+                ST_ct_declare_local(cc, s->decl.name);
+                ST_ct_local_set_is_buffer(cc);
+                if (s->decl.te->kind == ST_TE_NAME && cc->prog_ctx) {
+                    ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, s->decl.te->name);
+                    if (sd)
+                        ST_ct_local_set_struct_type(cc, s->decl.te->name);
+                }
+                if (s->decl.te->kind == ST_TE_ARRAY) {
+                    u32 ew;
+                    b8 es;
+                    if (ST_ct_tyexpr_int_info(s->decl.te->inner, &ew, &es))
+                        ST_ct_local_set_elem_info(cc, ew, es);
+                    // A fixed-size array's own element count is a compile-time
+                    // constant, known straight from its declaration
+                    if (s->decl.te->count_expr && cc->prog_ctx && cc->prog_ctx->sema) {
+                        i64 count;
+                        if (ST_const_eval(cc->prog_ctx->sema, s->decl.te->count_expr, &count) &&
+                            count >= 0)
+                            ST_ct_local_set_known_len(cc, (u32)count);
+                    }
+                }
                 return;
             }
             // Computed before declaring the new local, using ST_ct_expr_struct_type
             // rather than checking for a direct ST_EX_STRUCT_LIT only, so this also
             // covers 'd := c;' (copying an already struct-typed local) and
             // 'd := RED;' (copying a struct-typed global const), not just a struct
-            // literal written inline.
+            // literal written inline. Falls back to the local's own declared type
+            // name when the initializer is a bracket literal ('out: Process = {...};')
             ST_string_t struct_type = ST_ct_expr_struct_type(cc, s->decl.init);
-            ST_ct_compile_expr(cc, s->decl.init); // leaves the local's value on the stack...
-            if (cc->failed)
-                return;
+            if (!struct_type.len && s->decl.init->kind == ST_EX_STRUCT_LIT &&
+                s->decl.te && s->decl.te->kind == ST_TE_NAME)
+                struct_type = s->decl.te->name;
+            if (!struct_type.len && s->decl.te && s->decl.te->kind == ST_TE_NAME && cc->prog_ctx &&
+                ST_ct_prog_find_struct(cc->prog_ctx, s->decl.te->name))
+                struct_type = s->decl.te->name;
+            if (struct_type.len) {
+                if (!ST_ct_compile_struct_rvalue(cc, s->decl.init, struct_type))
+                    return;
+            } else {
+                ST_ct_compile_expr(cc, s->decl.init); // leaves the local's value on the stack...
+                if (cc->failed)
+                    return;
+            }
             ST_ct_declare_local(cc, s->decl.name); // ...which becomes its permanent slot
-            if (struct_type.len)
+            if (struct_type.len) {
                 ST_ct_local_set_struct_type(cc, struct_type);
+                ST_ct_local_set_is_buffer(cc);
+            }
             return;
         }
 
         case ST_ST_ASSIGN: {
-            if (s->assign.lhs->kind != ST_EX_IDENT) {
-                ST_ct_cfail(cc, s->line, s->col,
-                            "comptime: can only assign to a plain local name in a #comptime scope");
-                return;
-            }
             if (!ST_string_eq_cstr(s->assign.op, "=")) {
                 ST_ct_cfail(cc, s->line, s->col,
                             "comptime: only plain '=' assignment is supported in a #comptime scope "
                             "yet (no '+=' etc)");
+                return;
+            }
+            if (s->assign.lhs->kind == ST_EX_FIELD) {
+                ST_ty_t *bt = s->assign.lhs->field.base->ty;
+                ST_ty_t *dat = NULL;
+                if (bt && bt->kind == ST_TY_DYN_ARRAY)
+                    dat = bt;
+                else if (bt && bt->kind == ST_TY_PTR && bt->inner &&
+                         bt->inner->kind == ST_TY_DYN_ARRAY)
+                    dat = bt->inner;
+                if (dat) {
+                    u32 offset;
+                    if (ST_string_eq_cstr(s->assign.lhs->field.name, "items")) offset = 0;
+                    else if (ST_string_eq_cstr(s->assign.lhs->field.name, "count")) offset = 8;
+                    else if (ST_string_eq_cstr(s->assign.lhs->field.name, "capacity")) offset = 16;
+                    else {
+                        ST_ct_cfail(cc, s->line, s->col,
+                                    "comptime: a dyn_array has no field '" ST_sv_fmt "'",
+                                    ST_sv_args(s->assign.lhs->field.name));
+                        return;
+                    }
+                    ST_ct_compile_expr(cc, s->assign.lhs->field.base);
+                    if (cc->failed)
+                        return;
+                    ST_ct_emit_const(cc->chunk, ST_ct_int(offset), s->line);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, 1, s->line);
+                    ST_ct_compile_expr(cc, s->assign.rhs);
+                    if (cc->failed)
+                        return;
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, 8, s->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+            }
+            if (s->assign.lhs->kind == ST_EX_FIELD) {
+                ST_ty_t *fbt = s->assign.lhs->field.base->ty;
+                b8 looks_like_struct_field = (fbt && fbt->kind == ST_TY_STRUCT && fbt->decl) ||
+                                             (cc->prog_ctx && ST_ct_expr_struct_type(cc, s->assign.lhs->field.base).len);
+                if (looks_like_struct_field) {
+                    ST_ct_lval_ty_t ty;
+                    if (!ST_ct_lval_addr(cc, s->assign.lhs, &ty))
+                        return;
+                    if (ty.kind == ST_CT_LVAL_STRUCT) {
+                        u32 total_size;
+                        if (!ST_ct_struct_total_size(cc, ty.struct_decl, &total_size)) {
+                            ST_ct_cfail(cc, s->line, s->col,
+                                        "comptime: '" ST_sv_fmt "' has a field type this "
+                                        "#comptime scope can't size yet",
+                                        ST_sv_args(ty.struct_decl->name));
+                            return;
+                        }
+                        if (!ST_ct_compile_struct_rvalue(cc, s->assign.rhs, ty.struct_decl->name))
+                            return;
+                        ST_ct_emit_op_u32(cc->chunk, ST_OP_MEM_COPY, total_size, s->line);
+                        ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                        return;
+                    }
+                    ST_ct_compile_expr(cc, s->assign.rhs);
+                    if (cc->failed)
+                        return;
+                    if (!ST_ct_emit_lval_store(cc, &ty, s->line))
+                        return;
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+            }
+            if (s->assign.lhs->kind == ST_EX_UNARY && ST_string_eq_cstr(s->assign.lhs->unary.op, "*")) {
+                ST_ct_compile_expr(cc, s->assign.lhs->unary.operand);
+                if (cc->failed)
+                    return;
+                ST_ct_compile_expr(cc, s->assign.rhs);
+                if (cc->failed)
+                    return;
+                ST_ty_t *pt = s->assign.lhs->ty;
+                if (pt && pt->kind == ST_TY_STRING) {
+                    ST_ct_emit_op(cc->chunk, ST_OP_PTR_STORE_STR, s->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+                if (pt && pt->kind == ST_TY_PTR) {
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, 8, s->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+                u32 width;
+                b8 is_signed;
+                if (pt && ST_ct_ty_int_info(pt, &width, &is_signed)) {
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, width, s->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: assigning through this pointer type isn't supported yet");
+                return;
+            }
+            if (s->assign.lhs->kind == ST_EX_INDEX) {
+                ST_expr_t *ibase = s->assign.lhs->index.base;
+                u32 ew = 0;
+                b8 es = 0;
+                b8 have_elem = 0;
+                if (ibase->ty && ibase->ty->kind == ST_TY_PTR &&
+                    ST_ct_ty_int_info(ibase->ty->inner, &ew, &es))
+                    have_elem = 1;
+                else if (ibase->kind == ST_EX_IDENT) {
+                    ST_ct_local_t *lo = ST_ct_find_local_info(cc, ibase->name);
+                    if (lo && lo->is_buffer && lo->has_elem_info) {
+                        ew = lo->elem_size;
+                        es = lo->elem_is_signed;
+                        have_elem = 1;
+                    }
+                }
+                if (have_elem) {
+                    ST_ct_compile_expr(cc, ibase);
+                    ST_ct_compile_expr(cc, s->assign.lhs->index.index);
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, ew, s->line);
+                    ST_ct_compile_expr(cc, s->assign.rhs);
+                    if (cc->failed)
+                        return;
+                    ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_STORE, ew, s->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+            }
+            if (s->assign.lhs->kind == ST_EX_INDEX && s->assign.lhs->index.base->kind == ST_EX_FIELD) {
+                ST_expr_t *fb = s->assign.lhs->index.base;
+                ST_ty_t *fbt2 = fb->field.base->ty;
+                b8 looks_like_struct_field = (fbt2 && fbt2->kind == ST_TY_STRUCT && fbt2->decl) ||
+                                             (cc->prog_ctx && ST_ct_expr_struct_type(cc, fb->field.base).len);
+                if (looks_like_struct_field) {
+                    ST_ct_lval_ty_t ty;
+                    if (!ST_ct_lval_addr(cc, s->assign.lhs, &ty))
+                        return;
+                    ST_ct_compile_expr(cc, s->assign.rhs);
+                    if (cc->failed)
+                        return;
+                    if (!ST_ct_emit_lval_store(cc, &ty, s->line))
+                        return;
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                    return;
+                }
+            }
+            if (s->assign.lhs->kind == ST_EX_IDENT) {
+                ST_ct_local_t *lo = ST_ct_find_local_info(cc, s->assign.lhs->name);
+                if (lo && lo->struct_type.len && cc->prog_ctx) {
+                    ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, lo->struct_type);
+                    if (sd) {
+                        u32 total_size;
+                        if (!ST_ct_struct_total_size(cc, sd, &total_size)) {
+                            ST_ct_cfail(cc, s->line, s->col,
+                                        "comptime: '" ST_sv_fmt "' has a field type this "
+                                        "#comptime scope can't size yet",
+                                        ST_sv_args(lo->struct_type));
+                            return;
+                        }
+                        i32 dslot = ST_ct_find_local(cc, s->assign.lhs->name);
+                        ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, (u32)dslot, s->line);
+                        if (!ST_ct_compile_struct_rvalue(cc, s->assign.rhs, lo->struct_type))
+                            return;
+                        ST_ct_emit_op_u32(cc->chunk, ST_OP_MEM_COPY, total_size, s->line);
+                        ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                        return;
+                    }
+                }
+            }
+            if (s->assign.lhs->kind != ST_EX_IDENT) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: can only assign to a plain local name, a field of a "
+                            "struct-typed local, or an element of a buffer-backed array "
+                            "local, in a #comptime scope");
                 return;
             }
             i32 slot = ST_ct_find_local(cc, s->assign.lhs->name);
@@ -726,6 +1781,24 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                     ST_ct_compile_expr(cc, s->expr->comp_error.args.items[i]);
                 ST_ct_emit_op_u32(cc->chunk, ST_OP_COMP_ERROR, s->expr->comp_error.args.count, s->line);
                 return; // COMP_ERROR halts the VM; nothing to pop
+            }
+            if (s->expr && s->expr->kind == ST_EX_CALL && cc->prog_ctx &&
+                s->expr->call.callee->kind == ST_EX_IDENT &&
+                !ST_ct_prog_find_extern(cc->prog_ctx, s->expr->call.callee->name)) {
+                ST_decl_t *callee_decl = ST_ct_compile_plain_call(cc, s->expr);
+                if (!callee_decl)
+                    return;
+                // A native call always leaves exactly 1 value (CALL_NATIVE's own
+                // convention). A plain VM call declared void (rets.count == 0)
+                // STILL leaves exactly 1 value too: ST_OP_HALT (used both when a
+                // function falls off the end of its body and for a bare
+                // 'return;') unconditionally pushes one nil, regardless of the
+                // callee's declared return count
+                u32 n_pop = ST_ct_decl_needs_native(callee_decl) ? 1
+                          : callee_decl->fn.sig.rets.count == 0 ? 1
+                          : callee_decl->fn.sig.rets.count;
+                ST_forrange(0, n_pop) ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+                return;
             }
             ST_ct_compile_expr(cc, s->expr);
             ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line); // statement result is discarded
@@ -837,6 +1910,107 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             return;
         }
 
+        case ST_ST_FOR_ARRAY: {
+            if (s->for_array.is_comptime) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: '#for' unrolling isn't supported in a #comptime scope "
+                            "yet");
+                return;
+            }
+            // Desugars to:
+            //   __arr := target; __idx := 0;
+            //   while __idx < __arr.len {
+            //       iter := __arr[__idx]; [spec_iter := __idx;]
+            //       body
+            //       __idx = __idx + 1;
+            //   }
+            // reusing STR_LEN (already dispatches on string vs. struct-shaped)
+            // for the length check, and dispatching STR_INDEX vs. STRUCT_INDEX
+            // for the element fetch based on the target's own static type.
+            u32 saved_locals = cc->n_locals;
+
+            ST_ct_compile_expr(cc, s->for_array.target);
+            if (cc->failed)
+                return;
+            u32 arr_slot = ST_ct_declare_local(cc, ST_cstr_to_str("$for_arr"));
+
+            ST_ct_emit_const(cc->chunk, ST_ct_int(0), s->line);
+            u32 idx_slot = ST_ct_declare_local(cc, ST_cstr_to_str("$for_idx"));
+
+            ST_ct_emit_op(cc->chunk, ST_OP_NIL, s->line);
+            u32 iter_slot = ST_ct_declare_local(cc, s->for_array.iter);
+
+            b8 has_spec = s->for_array.spec_iter.len > 0;
+            u32 spec_slot = 0;
+            if (has_spec) {
+                ST_ct_emit_op(cc->chunk, ST_OP_NIL, s->line);
+                spec_slot = ST_ct_declare_local(cc, s->for_array.spec_iter);
+            }
+
+            u32 loop_start = cc->chunk->count;
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, idx_slot, s->line);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, arr_slot, s->line);
+            ST_ct_emit_op(cc->chunk, ST_OP_STR_LEN, s->line);
+            ST_ct_emit_op(cc->chunk, ST_OP_LT, s->line);
+            u32 exit_jump = ST_ct_emit_jump(cc->chunk, ST_OP_JMP_IF_FALSE, s->line);
+
+            if (cc->n_loops >= ST_array_len(cc->loop_stack)) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: loops nested too deeply in a #comptime scope");
+                return;
+            }
+            ST_ct_loop_ctx_t *loop = &cc->loop_stack[cc->n_loops++];
+            loop->n_break_patches = 0;
+            loop->n_continue_patches = 0;
+
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, arr_slot, s->line);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, idx_slot, s->line);
+            // A string iterates byte-by-byte via ST_OP_STR_INDEX (it's never a
+            // boxed ST_CT_STRUCT); anything else (array/slice/dyn_array/struct)
+            // uses ST_OP_STRUCT_INDEX, same dispatch ST_EX_INDEX already does.
+            b8 is_string_target = s->for_array.target->ty &&
+                                  s->for_array.target->ty->kind == ST_TY_STRING;
+            ST_ct_emit_op(cc->chunk, is_string_target ? ST_OP_STR_INDEX : ST_OP_STRUCT_INDEX,
+                         s->line);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_SET_LOCAL, iter_slot, s->line);
+            ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+
+            if (has_spec) {
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, idx_slot, s->line);
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_SET_LOCAL, spec_slot, s->line);
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+            }
+
+            loop->body_start_locals = cc->n_locals;
+            ST_ct_compile_scoped(cc, &s->for_array.body);
+
+            if (!cc->failed) {
+                u32 continue_point = cc->chunk->count;
+                ST_forrange(0, loop->n_continue_patches)
+                    ST_ct_patch_jump_to(cc->chunk, loop->continue_patches[i], continue_point);
+
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, idx_slot, s->line);
+                ST_ct_emit_const(cc->chunk, ST_ct_int(1), s->line);
+                ST_ct_emit_op(cc->chunk, ST_OP_ADD, s->line);
+                ST_ct_emit_op_u32(cc->chunk, ST_OP_SET_LOCAL, idx_slot, s->line);
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+
+                ST_ct_emit_loop(cc->chunk, loop_start, s->line);
+                ST_ct_patch_jump(cc->chunk, exit_jump);
+                ST_forrange(0, loop->n_break_patches)
+                    ST_ct_patch_jump(cc->chunk, loop->break_patches[i]);
+
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line); // drop iter
+                if (has_spec)
+                    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line); // drop spec_iter
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line); // drop $for_idx
+                ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line); // drop $for_arr
+            }
+            cc->n_loops--;
+            cc->n_locals = saved_locals;
+            return;
+        }
+
         case ST_ST_BLOCK:
             ST_ct_compile_scoped(cc, &s->block);
             return;
@@ -852,9 +2026,20 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 return;
             }
             ST_forrange(0, s->ret.values.count) {
-                ST_ct_compile_expr(cc, s->ret.values.items[i]);
-                if (cc->failed)
-                    return;
+                ST_expr_t *rv = s->ret.values.items[i];
+                ST_string_t struct_type = (ST_string_t){0};
+                if (rv->ty && rv->ty->kind == ST_TY_STRUCT && rv->ty->decl)
+                    struct_type = rv->ty->decl->name;
+                else if (cc->prog_ctx)
+                    struct_type = ST_ct_expr_struct_type(cc, rv);
+                if (struct_type.len) {
+                    if (!ST_ct_compile_struct_rvalue(cc, rv, struct_type))
+                        return;
+                } else {
+                    ST_ct_compile_expr(cc, rv);
+                    if (cc->failed)
+                        return;
+                }
             }
             ST_ct_emit_op_u32(cc->chunk, ST_OP_RETURN, s->ret.values.count, s->line);
             return;
@@ -876,6 +2061,13 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             ST_decl_t *callee_decl = ST_ct_compile_plain_call(cc, s->multi.values.items[0]);
             if (!callee_decl)
                 return;
+            if (ST_ct_decl_needs_native(callee_decl)) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: '" ST_sv_fmt "' is implemented in assembly and only "
+                            "supports a single return value, can't multi-bind it",
+                            ST_sv_args(callee_decl->name));
+                return;
+            }
             u32 n_rets = callee_decl->fn.sig.rets.count;
             if (n_rets != s->multi.n_names) {
                 ST_ct_cfail(cc, s->line, s->col,
@@ -886,8 +2078,16 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             }
             // The call already left n_rets values on the stack in order;
             // declaring a local per name just records "the value already
-            // sitting here now has this name" -- nothing more to push.
-            ST_forrange(0, s->multi.n_names) ST_ct_declare_local(cc, s->multi.names[i]);
+            // sitting here now has this name"
+            ST_forrange(0, s->multi.n_names) {
+                ST_ct_declare_local(cc, s->multi.names[i]);
+                if (i < callee_decl->fn.sig.rets.count) {
+                    ST_tyexpr_t *rte = callee_decl->fn.sig.rets.items[i];
+                    if (rte && rte->kind == ST_TE_NAME && cc->prog_ctx &&
+                        ST_ct_prog_find_struct(cc->prog_ctx, rte->name))
+                        ST_ct_local_set_struct_type(cc, rte->name);
+                }
+            }
             return;
         }
 
@@ -932,10 +2132,22 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             return;
         }
 
-        default:
+        default: {
+            static const char *kind_names[] = {
+                "expr", "decl", "assign", "multi_bind", "if", "switch", "while", "for_range",
+                "for_array", "return", "block", "defer", "break", "continue", "label",
+                "godown", "asm", "comptime_block", "pack_expand",
+            };
+            const char *nm = (s->kind >= 0 &&
+                              (u32)s->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                                  ? kind_names[s->kind]
+                                  : "?";
             ST_ct_cfail(cc, s->line, s->col,
-                        "comptime: this statement form isn't supported in a #comptime scope yet");
+                        "comptime: this statement form ('%s', kind %d) isn't supported in a "
+                        "#comptime scope yet",
+                        nm, (int)s->kind);
             return;
+        }
     }
 }
 
@@ -986,6 +2198,24 @@ static ST_decl_t *ST_ct_prog_find_struct(ST_ct_prog_ctx_t *pctx, ST_string_t nam
     return NULL;
 }
 
+static ST_decl_t *ST_ct_prog_find_type_alias(ST_ct_prog_ctx_t *pctx, ST_string_t name) {
+    ST_forrange(0, pctx->prog->decls.count) {
+        ST_decl_t *d = pctx->prog->decls.items[i];
+        if (d && d->kind == ST_DE_TYPE_ALIAS && ST_string_eq(d->name, name))
+            return d;
+    }
+    return NULL;
+}
+
+static ST_decl_t *ST_ct_prog_find_enum(ST_ct_prog_ctx_t *pctx, ST_string_t name) {
+    ST_forrange(0, pctx->prog->decls.count) {
+        ST_decl_t *d = pctx->prog->decls.items[i];
+        if (d && d->kind == ST_DE_ENUM && ST_string_eq(d->name, name))
+            return d;
+    }
+    return NULL;
+}
+
 static ST_decl_t *ST_ct_prog_find_const(ST_ct_prog_ctx_t *pctx, ST_string_t name) {
     ST_forrange(0, pctx->prog->decls.count) {
         ST_decl_t *d = pctx->prog->decls.items[i];
@@ -1015,6 +2245,132 @@ static u32 ST_ct_field_byte_size(ST_tyexpr_t *te) {
         ST_string_eq_cstr(n, "f32"))
         return 4;
     return 8;
+}
+
+// Unlike ST_ct_field_byte_size (which only needs a rough width for packing
+// a value into an extern-call register and defaults to 8 for anything it
+// doesn't recognize), this has to get the SIZE RIGHT: it decides how many
+// bytes ST_OP_ALLOC_ZEROED reserves for a zero-initialized local, and a
+// native call may write through that memory (e.g. pipe(2) filling in an
+// 'out_pipe : [2]i32;'). Returns 0 (failure) rather than guessing when it
+// doesn't know a type, since a guessed-too-small buffer is a real,
+// silent-corruption bug, not just a cosmetic one.
+static b8 ST_ct_tyexpr_byte_size(ST_ct_compiler_t *cc, ST_tyexpr_t *te, u32 *out_size) {
+    if (!te)
+        return 0;
+    switch (te->kind) {
+        case ST_TE_PTR:
+            *out_size = 8;
+            return 1;
+        case ST_TE_ARRAY: {
+            if (te->is_dynamic) {
+                // A dyn_array is always {items: ptr, count: i64, capacity: i64}
+                // regardless of element type
+                *out_size = 24;
+                return 1;
+            }
+            if (!te->count_expr || !cc->prog_ctx || !cc->prog_ctx->sema) {
+                // No count_expr and not dynamic: a slice ('[]T'. {ptr, len}).
+                if (!te->count_expr && !te->is_dynamic) {
+                    *out_size = 16;
+                    return 1;
+                }
+                return 0;
+            }
+            i64 count;
+            if (!ST_const_eval(cc->prog_ctx->sema, te->count_expr, &count) || count < 0)
+                return 0;
+            u32 elem_size;
+            if (!ST_ct_tyexpr_byte_size(cc, te->inner, &elem_size))
+                return 0;
+            *out_size = (u32)count * elem_size;
+            return 1;
+        }
+        case ST_TE_NAME: {
+            static const struct { const char *name; u32 size; } prims[] = {
+                {"i8", 1}, {"u8", 1}, {"bool", 1}, {"char", 1},
+                {"i16", 2}, {"u16", 2},
+                {"i32", 4}, {"u32", 4}, {"f32", 4},
+                {"i64", 8}, {"u64", 8}, {"f64", 8},
+                {"f128", 16}, {"string", 16}, {"any", 16},
+            };
+            ST_forrange(0, sizeof(prims) / sizeof(prims[0]))
+                if (ST_string_eq_cstr(te->name, prims[i].name)) {
+                    *out_size = prims[i].size;
+                    return 1;
+                }
+            if (!cc->prog_ctx)
+                return 0;
+            ST_decl_t *sd = ST_ct_prog_find_struct(cc->prog_ctx, te->name);
+            if (sd) {
+                u32 total = 0;
+                ST_forrange(0, sd->struct_.fields.count) {
+                    u32 fs;
+                    if (!ST_ct_tyexpr_byte_size(cc, sd->struct_.fields.items[i].te, &fs))
+                        return 0;
+                    total += fs;
+                }
+                *out_size = total;
+                return 1;
+            }
+            ST_decl_t *ad = ST_ct_prog_find_type_alias(cc->prog_ctx, te->name);
+            if (ad)
+                return ST_ct_tyexpr_byte_size(cc, ad->type_alias.te, out_size);
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+// Like ST_ct_tyexpr_byte_size but also reports signedness, for a recognized
+// primitive int type only used to fill in a buffer-backed array local's
+// elem_size/elem_is_signed so 'arr[i]'/'&arr[i]' can be compiled.
+static b8 ST_ct_tyexpr_int_info(ST_tyexpr_t *te, u32 *width, b8 *is_signed) {
+    if (!te || te->kind != ST_TE_NAME)
+        return 0;
+    static const struct { const char *name; u32 size; b8 is_signed; } ints[] = {
+        {"i8", 1, 1}, {"u8", 1, 0}, {"char", 1, 0}, {"bool", 1, 0},
+        {"i16", 2, 1}, {"u16", 2, 0},
+        {"i32", 4, 1}, {"u32", 4, 0},
+        {"i64", 8, 1}, {"u64", 8, 0},
+    };
+    ST_forrange(0, sizeof(ints) / sizeof(ints[0]))
+        if (ST_string_eq_cstr(te->name, ints[i].name)) {
+            *width = ints[i].size;
+            *is_signed = ints[i].is_signed;
+            return 1;
+        }
+    return 0;
+}
+
+// A genuine slice ('[]T', as opposed to a fixed-size array '[N]T' or a
+// dyn_array '[..]T') of a recognized primitive int element. Its VM
+// representation is a bare ST_CT_PTR with NO length attached (unlike a
+// zero-initialized fixed array, whose length is a compile-time constant, or
+// a dyn_array, which carries its own length in real memory).
+static b8 ST_ct_tyexpr_is_int_slice(ST_tyexpr_t *te, u32 *width, b8 *is_signed) {
+    if (!te || te->kind != ST_TE_ARRAY || te->is_dynamic || te->count_expr)
+        return 0;
+    return ST_ct_tyexpr_int_info(te->inner, width, is_signed);
+}
+
+// Same idea as ST_ct_tyexpr_int_info but works from a real, resolved ST_ty_t
+// (post-generic-instantiation, e.g. a bound '$T') instead of a raw type
+// expression used for indexing through an actual pointer value ('base:
+// *T'), where the representation is unambiguously ST_CT_PTR (unlike an
+// array/slice type, which could be either a real pointer or a boxed
+// ST_CT_STRUCT depending on how that particular value was built).
+static b8 ST_ct_ty_int_info(ST_ty_t *t, u32 *width, b8 *is_signed) {
+    if (!t)
+        return 0;
+    switch (t->kind) {
+        case ST_TY_INT: *width = t->width / 8; *is_signed = t->is_signed; return 1;
+        case ST_TY_UNTYPED_INT: *width = 8; *is_signed = 1; return 1;
+        case ST_TY_CHAR: *width = 1; *is_signed = 0; return 1;
+        case ST_TY_BOOL: *width = 1; *is_signed = 0; return 1;
+        default: return 0;
+    }
 }
 
 // The base of a field-access or a call argument is struct-typed in three
@@ -1109,12 +2465,17 @@ static b8 ST_ct_prog_want_call(ST_ct_prog_ctx_t *pctx, ST_string_t callee_name, 
 }
 
 b8 ST_ct_compile_program(ST_arena_t *arena, ST_ct_chunk_t *chunk, ST_program_t *prog,
+                         ST_sema_t *sema, ST_string_t src, ST_string_t file,
                          ST_decl_t *entry_decl, u32 *out_entry_ip, u32 *err_line, u32 *err_col,
-                         char *err_msg, u32 err_msg_cap) {
+                         ST_string_t *err_file, char *err_msg, u32 err_msg_cap) {
     ST_ct_prog_ctx_t pctx = {0};
     pctx.arena = arena;
     pctx.chunk = chunk;
     pctx.prog = prog;
+    pctx.sema = sema;
+    pctx.src = src;
+    pctx.file = file;
+    pctx.err_file = file;
 
     pctx.fns[0].name = entry_decl->name;
     pctx.fns[0].decl = entry_decl;
@@ -1139,14 +2500,55 @@ b8 ST_ct_compile_program(ST_arena_t *arena, ST_ct_chunk_t *chunk, ST_program_t *
 
         entry->entry_ip = chunk->count;
         entry->compiled = 1;
+        ST_ct_chunk_mark_file(chunk, d->file);
 
         ST_ct_compiler_t cc;
         ST_ct_compiler_init(&cc, arena, chunk);
         cc.prog_ctx = &pctx;
+        cc.cur_file = d->file;
 
         if (d != entry_decl)
-            ST_forrange(0, d->fn.sig.params.count)
-                ST_ct_declare_local(&cc, d->fn.sig.params.items[i].name);
+            ST_forrange(0, d->fn.sig.params.count) {
+                ST_param_t *p = &d->fn.sig.params.items[i];
+                ST_ct_declare_local(&cc, p->name);
+                if (p->te && p->te->kind == ST_TE_NAME) {
+                    ST_decl_t *psd = ST_ct_prog_find_struct(&pctx, p->te->name);
+                    if (psd) {
+                        ST_ct_local_set_is_buffer(&cc);
+                        ST_ct_local_set_struct_type(&cc, p->te->name);
+                    }
+                }
+                // A slice/array/dyn_array-typed parameter of a recognized primitive
+                // int element is assumed to arrive as a real pointer (the caller is
+                // the one that actually allocated the backing storage, e.g. a
+                // zero-initialized local passed by a caller), so 'param[i]' and
+                // 'param[i] = value;' both need to know its element width/signedness
+                // the same way a zero-initialized local does.
+                if (p->te && p->te->kind == ST_TE_ARRAY) {
+                    u32 ew;
+                    b8 es;
+                    if (ST_ct_tyexpr_int_info(p->te->inner, &ew, &es)) {
+                        ST_ct_local_set_is_buffer(&cc);
+                        ST_ct_local_set_elem_info(&cc, ew, es);
+                    }
+                }
+                // A genuine slice ('[]T', not '[N]T' or '[..]T') carries no length
+                // in its own bare-pointer VM value at all.
+                u32 sw;
+                b8 ssig;
+                if (p->te && ST_ct_tyexpr_is_int_slice(p->te, &sw, &ssig)) {
+                    u32 len_slot = ST_ct_declare_local(&cc, ST_cstr_to_str("$slice_len"));
+                    ST_ct_local_t *param_local = ST_ct_find_local_info(&cc, p->name);
+                    if (param_local)
+                        param_local->len_slot = (i32)len_slot;
+                } else if (p->te && p->te->kind == ST_TE_ARRAY && p->te->count_expr) {
+                    // A fixed-size array parameter's length, unlike a slice's, is
+                    // right there in its own declared type.
+                    i64 count;
+                    if (ST_const_eval(pctx.sema, p->te->count_expr, &count) && count >= 0)
+                        ST_ct_local_set_known_len(&cc, (u32)count);
+                }
+            }
 
         ST_ct_compile_block(&cc, &d->fn.body);
 
@@ -1154,6 +2556,7 @@ b8 ST_ct_compile_program(ST_arena_t *arena, ST_ct_chunk_t *chunk, ST_program_t *
             pctx.failed = 1;
             pctx.err_line = cc.err_line;
             pctx.err_col = cc.err_col;
+            pctx.err_file = cc.err_file.len ? cc.err_file : d->file;
             memcpy(pctx.err_msg, cc.err_msg, sizeof(pctx.err_msg));
         }
     }
@@ -1178,6 +2581,8 @@ b8 ST_ct_compile_program(ST_arena_t *arena, ST_ct_chunk_t *chunk, ST_program_t *
             *err_line = pctx.err_line;
         if (err_col)
             *err_col = pctx.err_col;
+        if (err_file)
+            *err_file = pctx.err_file;
         if (err_msg && err_msg_cap) {
             u32 n = (u32)strlen(pctx.err_msg);
             if (n >= err_msg_cap)

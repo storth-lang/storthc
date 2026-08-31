@@ -420,6 +420,9 @@ static void ST_modrw_stmt(ST_module_rw_t *rw, ST_stmt_t *s) {
         case ST_ST_BLOCK:
             ST_modrw_body(rw, &s->block);
             break;
+        case ST_ST_COMPTIME_BLOCK:
+            ST_modrw_body(rw, &s->block);
+            break;
         case ST_ST_DEFER:
             ST_modrw_stmt(rw, s->defer_stmt);
             break;

@@ -1,6 +1,3 @@
-#import "error";
-#import "os";
-
 pub struct Arena {
 	base:      *u8;
 	reserved:  i64;
@@ -8,7 +5,7 @@ pub struct Arena {
 	used:      i64;
 }
 
-DEFAULT_ARENA_SIZE :: 67108864;
+DEFAULT_ARENA_SIZE :: #comptime 67108864 ;
 
 fn arena_init(reserve : i64) -> (*Arena, memoryError) {
 	raw := sys_mmap(null, reserve #as i64, PROT_NONE,
@@ -94,7 +91,7 @@ pub fn temp_end(t: Temp) -> void {
 	t.arena.used = t.mark;
 }
 
-HDR :: 16;
+HDR :: #comptime 16;
 
 pub fn alloc(size: i64) -> (*void, memoryError) {
 	total := ((size + HDR + PAGE - 1) / PAGE) * PAGE;
@@ -144,3 +141,6 @@ pub fn realloc(ptr: *void, new_size: i64) -> (*void, memoryError) {
 	}
 	return new_raw, memoryError.None;
 }
+
+#import "error";
+#import "os";

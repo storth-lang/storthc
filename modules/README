@@ -1,0 +1,16 @@
+# Module readme
+
+This readme does not explain what the functions are more so the calling convetion used in this standard library and module.
+
+- public functions, struct, enums or anything of that sort visible outside of module are denoted via camelCase as in
+  most cases users will write in snake case hence they will not have much of namespace issue.
+
+- Funtions we only use onces will only be in local functions scope.
+
+- Except OS module exposing global constants is not allowed.
+
+- When something is guaranteed that it must be a constant it uses :: declaration
+
+- Comments is always at the begining before the function explaining what it does.
+
+- EnumFlag members always start with capital letter.
