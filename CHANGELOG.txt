@@ -321,3 +321,5 @@ above and it's easy to lose track of:
   manual bug-hunting, but aren't wired into the pipeline added that same day.
 
 - 'file' now uses the sys_ naming correctly. More functions are update.
+
+- Comptime has if switch statment and also not only that but also it now can do field access on arbitrary struct.

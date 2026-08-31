@@ -2084,8 +2084,10 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 if (i < callee_decl->fn.sig.rets.count) {
                     ST_tyexpr_t *rte = callee_decl->fn.sig.rets.items[i];
                     if (rte && rte->kind == ST_TE_NAME && cc->prog_ctx &&
-                        ST_ct_prog_find_struct(cc->prog_ctx, rte->name))
+                        ST_ct_prog_find_struct(cc->prog_ctx, rte->name)) {
                         ST_ct_local_set_struct_type(cc, rte->name);
+                        ST_ct_local_set_is_buffer(cc);
+                    }
                 }
             }
             return;
@@ -2132,9 +2134,67 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             return;
         }
 
+	case ST_ST_SWITCH: {
+	    u32 saved_locals = cc->n_locals;
+
+	    ST_ct_compile_expr(cc, s->switch_.cond);
+	    if (cc->failed) return;
+	    u32 cond_slot = ST_ct_declare_local(cc, ST_cstr_to_str("$switch_cond"));
+
+	    u32 n_cases = s->switch_.cases.count;
+	    u32 *end_jumps = n_cases ? ST_arena_push(cc->arena, sizeof(u32) * n_cases) : NULL;
+	    u32 n_end_jumps = 0;
+	    ST_case_t *default_case = NULL;
+
+	    for (u32 i = 0; i < n_cases; i++) {
+		ST_case_t *c = &s->switch_.cases.items[i];
+		if (c->values.count == 0) {
+		    default_case = c;
+		    continue;
+		}
+
+		u32 *to_body_jumps = ST_arena_push(cc->arena, sizeof(u32) * c->values.count);
+		u32 n_to_body = 0;
+		for (u32 k = 0; k < c->values.count; k++) {
+		    ST_ct_emit_op_u32(cc->chunk, ST_OP_GET_LOCAL, cond_slot, c->line);
+		    ST_ct_compile_expr(cc, c->values.items[k]);
+		    if (cc->failed)
+                    return;
+		    ST_ct_emit_op(cc->chunk, ST_OP_EQ, c->line);
+		    u32 fail_jump = ST_ct_emit_jump(cc->chunk, ST_OP_JMP_IF_FALSE, c->line);
+		    to_body_jumps[n_to_body++] = ST_ct_emit_jump(cc->chunk, ST_OP_JMP, c->line);
+		    ST_ct_patch_jump(cc->chunk, fail_jump);
+		}
+
+		u32 skip_body_jump = ST_ct_emit_jump(cc->chunk, ST_OP_JMP, c->line);
+		for (u32 k = 0; k < n_to_body; k++)
+		ST_ct_patch_jump(cc->chunk, to_body_jumps[k]);
+
+		ST_ct_compile_scoped(cc, &c->body);
+		if (cc->failed)
+		return;
+		end_jumps[n_end_jumps++] = ST_ct_emit_jump(cc->chunk, ST_OP_JMP, c->line);
+
+		ST_ct_patch_jump(cc->chunk, skip_body_jump);
+	    }
+
+	    if (default_case) {
+		ST_ct_compile_scoped(cc, &default_case->body);
+		if (cc->failed)
+		return;
+	    }
+
+	    for (u32 i = 0; i < n_end_jumps; i++)
+            ST_ct_patch_jump(cc->chunk, end_jumps[i]);
+
+	    ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
+	    cc->n_locals = saved_locals;
+	    return;
+	}
+
         default: {
             static const char *kind_names[] = {
-                "expr", "decl", "assign", "multi_bind", "if", "switch", "while", "for_range",
+                "expr", "decl", "assign", "multi_bind", "if", "while", "for_range",
                 "for_array", "return", "block", "defer", "break", "continue", "label",
                 "godown", "asm", "comptime_block", "pack_expand",
             };
