@@ -1,6 +1,6 @@
 pub fn arrayReserve(arr: *[..]$T, capacity : i64 = 256) {
     if arr.capacity == 0 then arr.capacity = capacity;
-    else { arr.capacity *= 2; }
+    else { arr.capacity = arr.capacity  * 2; }
 }
 
 pub fn arrayPush(arr: *[..]$T, item: $T) {
@@ -11,7 +11,7 @@ pub fn arrayPush(arr: *[..]$T, item: $T) {
     }
 
     arr.items[arr.count] = item;
-    arr.count += 1;
+    arr.count = arr.count + 1;
 }
 
 pub fn arrayRemoveUnordered(arr: *[..]$T, index: i32) {

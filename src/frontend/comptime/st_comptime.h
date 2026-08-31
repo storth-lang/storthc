@@ -8,6 +8,7 @@
 
 #include "../../utils/st_arena.h"
 #include "../../utils/st_helper.h"
+#include "../../utils/st_string.h"
 
 #include <stdarg.h>
 
@@ -68,9 +69,18 @@ typedef enum {
     ST_OP_ADD, ST_OP_SUB, ST_OP_MUL, ST_OP_DIV, ST_OP_MOD, ST_OP_NEG,
     ST_OP_EQ, ST_OP_NEQ, ST_OP_LT, ST_OP_LE, ST_OP_GT, ST_OP_GE,
     ST_OP_NOT,
-
-    ST_OP_STR_LEN,
+    ST_OP_BAND, ST_OP_BOR, ST_OP_BXOR, ST_OP_SHL, ST_OP_SHR, // bitwise int ops:
+                         // '&' '|' '^' '<<' '>>'. '>>' is arithmetic (sign-extending),
+                         // matching plain i64 semantics
+    ST_OP_STR_LEN,       // pops a string or a #comptime array/struct value -> push its length
     ST_OP_STR_INDEX,     // pop index, pop string -> push int (char code) backs 'fmt[i]'
+    ST_OP_STR_PTR,       // pop a string -> push a ST_CSTR_PTR with no deep copy.
+    ST_OP_STRUCT_INDEX,  // pop index, pop struct/array value -> push that field/element,
+                         // runtime-indexed (unlike ST_OP_GET_FIELD's compile-time-constant index);
+                         // backs 'arr.ptr[i]' for a #comptime array/slice literal
+
+    ST_OP_CAST,          // operand: u32 encoding (tag | width<<4 | is_signed<<12); tag 0=int,
+                         // 1=float, 2=bool, 3=ptr. pops one value, pushes the converted value
 
     ST_OP_GET_LOCAL,     // operand: u32 stack slot index (relative to frame base)
     ST_OP_SET_LOCAL,     // operand: u32 stack slot index
@@ -87,14 +97,51 @@ typedef enum {
     ST_OP_NATIVE_ARG,    // pop one value; if it's ST_CT_STRING, push a ST_CT_PTR to a fresh
                          // nul-terminated copy (native/C-ABI calls need real C strings, not
                          // storth's fat {ptr,len} strings); anything else passes through as-is
+    ST_OP_NATIVE_ARG_STRING, // pop a string -> push its raw data pointer (no copy, no
+                             // nul-termination), then push its length as a separate int.
+                             // Backs a 'string'-typed parameter of a REAL Storth function
+                             // (asm-backed, called via ST_ct_compile_native_call)
+    ST_OP_NATIVE_ARG_STRING_ARRAY, // pop a struct value holding an array of strings ->
+                                  // build a real, contiguous {ptr,len}-per-element buffer
+                                  // in the VM's own scratch memory (matching how a real
+                                  // '[]string' is laid out in memory), then push that
+                                  // buffer's pointer and the element count as two separate
+                                  // args
     ST_OP_SYSCALL,       // pop 7 values (syscall number, then arg0..arg5, number pushed first)
                          // -> perform a real x86-64 Linux syscall directly, push the i64 result
 
     ST_OP_MAKE_STRUCT,   // operand: u32 n_fields
                          // -> push a ST_CT_STRUCT holding them in declaration order
     ST_OP_GET_FIELD,     // operand: u32 field_index
+    ST_OP_SET_FIELD,     // operand: u32 field_index; pop new value, pop struct -> mutate
+                         // struct.fields[field_index] in place (the fields array is its own
+                         // fresh allocation per ST_OP_MAKE_STRUCT, so this is safe), push the
+                         // new value back (same convention as ST_OP_SET_LOCAL). Backs
+                         // 'some_struct_local.field = value;'
     ST_OP_PACK_STRUCT,   // operand: u32 n_fields, then n_fields more u32s (each field's byte
                          // width)
+    ST_OP_ALLOC_ZEROED, // operand: u32 byte size -> zero a fresh block from the VM's own
+                        // scratch memory and push a ST_CT_PTR to it. Backs a zero-initialized
+                        // local ('name : T;' with no initializer) whose address can genuinely
+                        // be taken and handed to a native call that writes through it (e.g.
+                        // an output parameter like pipe(2)'s int[2])
+    ST_OP_PTR_ADD,      // operand: u32 elem_size; pop index (int), pop base (ptr) -> push
+                        // base + index*elem_size. Backs '&arr[i]' and reading 'arr[i]' (see
+                        // ST_OP_PTR_LOAD) for a zero-initialized, buffer-backed local array
+    ST_OP_PTR_LOAD,     // operand: u32 encoding (tag|width<<4|is_signed<<12), same encoding
+                        // as ST_OP_CAST; pop a ptr -> read that many bytes from it, push the
+                        // resulting int. Backs reading 'arr[i]' as a value (as opposed to
+                        // '&arr[i]', which stops at ST_OP_PTR_ADD)
+    ST_OP_PTR_STORE,    // operand: u32 byte width; pop value, pop ptr -> write the value's
+                        // low 'width' bytes to *ptr, push the value back (same convention as
+                        // ST_OP_SET_LOCAL/ST_OP_SET_FIELD). Backs 'arr[i] = value;' for a
+                        // buffer-backed array (a zero-initialized local, or an array/slice
+                        // parameter
+    ST_OP_STR_FROM_RAW, // pop len (int), pop ptr -> push a ST_CT_STRING viewing that same
+                        // memory (no copy). Backs the 'str_from_raw(ptr, len)' intrinsic
+    ST_OP_PTR_LOAD_STR,
+    ST_OP_PTR_STORE_STR,
+    ST_OP_MEM_COPY,
 
     ST_OP_CALL,          // operand: u32 entry_ip, u32 n_args. Top n_args values become the
                          // callee's first locals; pushes a frame and jumps to entry_ip
@@ -107,6 +154,11 @@ typedef enum {
 } ST_ct_op_t;
 
 typedef struct {
+    u32 start_ip;
+    ST_string_t file;
+} ST_ct_file_range_t;
+
+typedef struct {
     ST_arena_t *arena; // everything below grows through this, never malloc/free
 
     u8 *code;
@@ -116,9 +168,27 @@ typedef struct {
 
     ST_ct_val_t *consts;
     u32 n_consts, cap_consts;
+
+    // Which source file each stretch of 'code' actually came from lines[]
+    // alone is ambiguous once a program's call graph spans multiple #import'd
+    // files, since it's just a line number with no file attached. Appended to
+    // (via ST_ct_chunk_mark_file) once per function as ST_ct_compile_program
+    // compiles it, in increasing start_ip order, so a failure at some ip can
+    // be mapped back to the right file with ST_ct_chunk_file_at.
+    ST_ct_file_range_t *file_ranges;
+    u32 n_file_ranges, cap_file_ranges;
 } ST_ct_chunk_t;
 
 void ST_ct_chunk_init(ST_arena_t *arena, ST_ct_chunk_t *c);
+
+// Records that code from here on (starting at the chunk's current byte
+// offset) came from 'file'. Cheap to call on every function compiled
+void ST_ct_chunk_mark_file(ST_ct_chunk_t *c, ST_string_t file);
+
+// Which file the instruction at byte offset 'ip' came from (the most
+// recent ST_ct_chunk_mark_file call whose start_ip <= ip), or an empty
+// string if nothing was ever marked.
+ST_string_t ST_ct_chunk_file_at(ST_ct_chunk_t *c, u32 ip);
 
 u32 ST_ct_emit_op(ST_ct_chunk_t *c, ST_ct_op_t op, u32 line);
 u32 ST_ct_emit_op_u32(ST_ct_chunk_t *c, ST_ct_op_t op, u32 operand, u32 line);
@@ -162,6 +232,14 @@ typedef struct {
     ST_ct_status_t status;
     char err_msg[512];
     u32 err_line;
+    u32 err_ip; // byte offset of the instruction that failed; look up
+               // ST_ct_chunk_file_at(chunk, err_ip) for which file err_line
+               // is actually in
+
+    u8 mem[1 << 20]; // scratch memory for ST_OP_ALLOC_ZEROED (zero-init locals whose
+                     // address gets taken); a real, stable, byte-addressable buffer,
+                     // not a boxed ST_ct_val_t
+    u32 mem_used;
 } ST_ct_vm_t;
 
 void ST_ct_vm_init(ST_ct_vm_t *vm);

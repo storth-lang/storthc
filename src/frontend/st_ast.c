@@ -353,6 +353,10 @@ void ST_dump_stmt(FILE *out, ST_stmt_t *s, u32 depth) {
             fprintf(out, "block\n");
             ST_dump_body(out, &s->block, depth + 1);
             break;
+        case ST_ST_COMPTIME_BLOCK:
+            fprintf(out, "#comptime block\n");
+            ST_dump_body(out, &s->block, depth + 1);
+            break;
         case ST_ST_DEFER:
             fprintf(out, "defer\n");
             ST_dump_stmt(out, s->defer_stmt, depth + 1);

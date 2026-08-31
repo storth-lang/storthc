@@ -74,3 +74,16 @@ I need to also choose what type of version numbering system I have to choose. Gr
 Also freaking write CI/CD dude I am becoming lazy by not writing test cases and recoding bugs.
 
 So all the parsing bugs will have their own file so that I will have to stress test it to the max with out sacrificing my sanity.
+
+# Optimization List
+
+- Constant folding.
+- Copy/const propagation
+- Dead code elimination
+- Unreachable block / branch simplification
+- Dominator tree construction — infrastructure needed for 7 and 8 (Cooper-Harvey-Kennedy iterative algorithm is the simplest correct approach)
+- Global value numbering (GVN)
+- Loop-invariant code motion (LICM)
+- Strength reduction  `x*2` -> `x<<1`, `x%pow2` -> `x&(pow2-1)`, induction-variable simplification (pairs with LICM)
+- Function inlining
+- Branch/jump threading

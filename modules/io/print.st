@@ -1,7 +1,7 @@
-STDOUT :: 1;
-STDERR :: 2;
+STDOUT :: #comptime 1;
+STDERR :: #comptime 2;
 
-fn io_write_byte(fd: i32, b: i8) {
+pub fn io_write_byte(fd: i32, b: i8) {
     #asm {
         xor rbx, rbx
         mov bl, b
@@ -33,7 +33,7 @@ fn io_write_uint(fd: i32, n: u64) {
 
 fn io_write_str(fd: i32, s: string) {
     for i: 0..s.len {
-        io_write_byte(fd, s.ptr[i] #as i8);
+        io_write_byte(fd, s[i] #as i8);
     }
 }
 
@@ -165,7 +165,7 @@ fn print_value(fd: i32, v: $V) {
 fn write_until_percent(fd: i32, fmt: string, pos: i64) -> i64 {
     i := pos;
     while i < fmt.len #as i64 {
-        ch := fmt.ptr[i] #as char;
+        ch := fmt[i];
         i = i + 1;
         if ch == '%' then return i;
         io_write_byte(fd, ch #as i8);

@@ -161,6 +161,10 @@ static void ST_asan_walk_stmt(ST_arena_t *arena, ST_stmt_t *s, ST_string_t file)
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
         case ST_ST_ASM:
+        case ST_ST_COMPTIME_BLOCK: // no-op deliberately: never reaches real codegen, see
+                                  // ST_sema_run_comptime_blocks -- it's rewritten to a
+                                  // plain (already-instrumented) empty block long before
+                                  // this pass would ever see it as this kind
         case ST_ST_PACK_EXPAND:
         case ST_ST_COUNT:
             break;
@@ -1959,7 +1963,7 @@ void ST_asan_write_runtime_asm(FILE *out, b8 use_fasm) {
 b8 ST_asan_instrument(ST_arena_t *arena, ST_program_t *prog, ST_srcmap_t *srcs) {
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
-        if (d && d->kind == ST_DE_FN)
+        if (d && d->kind == ST_DE_FN && !d->fn.sig.is_comptime)
             ST_asan_walk_stmts(arena, &d->fn.body, d->file);
     }
 
@@ -1981,7 +1985,7 @@ b8 ST_asan_instrument(ST_arena_t *arena, ST_program_t *prog, ST_srcmap_t *srcs) 
     ST_decl_t *main_decl = NULL;
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
-        if (d && d->kind == ST_DE_FN && ST_string_eq_cstr(d->name, "main")) {
+        if (d && d->kind == ST_DE_FN && !d->fn.sig.is_comptime && ST_string_eq_cstr(d->name, "main")) {
             main_decl = d;
             break;
         }

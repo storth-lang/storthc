@@ -6,6 +6,9 @@
 #include <string.h>
 #include <time.h>
 
+#include <glob.h>
+#include <unistd.h>
+
 #include "backend/st_address_sanitizer.h"
 #include "backend/st_dwarf.h"
 #include "backend/st_fasm_x86_64_linux.h"
@@ -242,10 +245,15 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
                 ST_ct_chunk_t chunk;
                 ST_ct_chunk_init(arena, &chunk);
                 u32 entry_ip = 0, cerr_line = 0, cerr_col = 0;
+                ST_string_t cerr_file = file;
                 char cerr_msg[256] = {0};
-                if (!ST_ct_compile_program(arena, &chunk, &prog, comptime_main, &entry_ip,
-                                           &cerr_line, &cerr_col, cerr_msg, sizeof(cerr_msg))) {
-                    ST_diag_t diag = {.src = src, .file = file, .max_errors = ST_SEMA_MAX_ERRORS};
+                if (!ST_ct_compile_program(arena, &chunk, &prog, &sema, src, file, comptime_main,
+                                           &entry_ip, &cerr_line, &cerr_col, &cerr_file, cerr_msg,
+                                           sizeof(cerr_msg))) {
+                    ST_string_t err_src = cerr_file.len ? ST_srcmap_get(&srcs, cerr_file) : src;
+                    ST_diag_t diag = {.src = err_src.len ? err_src : src,
+                                      .file = cerr_file.len ? cerr_file : file,
+                                      .max_errors = ST_SEMA_MAX_ERRORS};
                     ST_diag_error(&diag, cerr_line, cerr_col, "%s", cerr_msg);
                     goto done;
                 }
@@ -254,7 +262,12 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
                 ST_ct_val_t result = {0};
                 ST_ct_status_t vst = ST_ct_run(&vm, &chunk, &result);
                 if (vst != ST_CT_OK) {
-                    ST_diag_t diag = {.src = src, .file = file, .max_errors = ST_SEMA_MAX_ERRORS};
+                    ST_string_t vfile = ST_ct_chunk_file_at(&chunk, vm.err_ip);
+                    if (!vfile.len)
+                        vfile = file;
+                    ST_string_t vsrc = ST_srcmap_get(&srcs, vfile);
+                    ST_diag_t diag = {.src = vsrc.len ? vsrc : src, .file = vfile,
+                                      .max_errors = ST_SEMA_MAX_ERRORS};
                     if (vst == ST_CT_ERR_COMPTIME)
                         ST_diag_error(&diag, vm.err_line, 1, "%s", vm.err_msg);
                     else
@@ -358,7 +371,18 @@ done:
     return ok;
 }
 
+static void st_clean_comptime_cache(void) {
+    glob_t g = {0};
+    if (glob("/tmp/storthc-ct-*", 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++)
+            unlink(g.gl_pathv[i]);
+        globfree(&g);
+    }
+}
+
 int main(int argc, char **argv) {
+    st_clean_comptime_cache();
+
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-version") == 0)) {
         st_print_version();
         return 0;
