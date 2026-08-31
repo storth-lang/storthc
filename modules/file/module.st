@@ -111,6 +111,22 @@ pub fn readEntireFile(path: string) -> (string, bool) {
     return content, true;
 }
 
+pub fn writeEntireFile(path : string, str: string) -> bool {
+    fd, ferr := openFileDescriptor(path, openMode.writeOnly);
+    if ferr != ioError.None {
+        eprint("open failed: path=% ferr=% fd=%\n", path, ferr, fd);
+        return false;
+    }
+    errno, err := writeToFileDescriptor(fd, str);
+    closeFileDescriptor(fd);
+    if err != ioError.None {
+        eprint("read failed: path=% rerr=%\n", path, getErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
 // pub fn renameFile(file1: string, file2: string) -> bool;
 // This will rename an existing 'file1' to 'file2'. So if
 // you have a file renameFile(foo, bar); This obviously will not check if 'foo' is a
