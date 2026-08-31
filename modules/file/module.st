@@ -111,6 +111,9 @@ pub fn readEntireFile(path: string) -> (string, bool) {
     return content, true;
 }
 
+// pub fn writeEntireFile(path : string, str: string) -> bool;
+// This is a wrapper combining both openFIledescriptor, readFromfiledescriptor and
+// closeFiledescriptor and directly writing to the fd.
 pub fn writeEntireFile(path : string, str: string) -> bool {
     fd, ferr := openFileDescriptor(path, openMode.writeOnly);
     if ferr != ioError.None {
