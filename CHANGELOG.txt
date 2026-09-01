@@ -288,7 +288,7 @@
     reclaimed (true before this work too, for zero-init locals), so a `#comptime` loop doing
     heavy struct work can still exhaust it.
 
-- None of the above touches the real (non-comptime) NASM/WASM backends or the SSA lowering pass;
+- None of the above touches the real (non-comptime) NASM/FASM backends or the SSA lowering pass;
   this was scoped entirely to the `st_comptime*` bytecode VM and its compiler, since that's
   what actually executes `#comptime` blocks and `storthc run`.
 
@@ -322,4 +322,6 @@ above and it's easy to lose track of:
 
 - 'file' now uses the sys_ naming correctly. More functions are update.
 
-- Comptime has if switch statment and also not only that but also it now can do field access on arbitrary struct.
+- Comptime has if switch statment and also not only that but also it now can do field access on
+  arbitrary struct. Comptime has named parameter the previous bug of which we can not have as the
+  address is not lowered.
