@@ -61,7 +61,7 @@ pub fn trimLeft(str: string, count : i64 = 1) -> string {
 // such array. resetBuilder does not just free the dynamic array it also actually
 // resets the count and capacity to 0.
 pub fn resetBuilder(sb: *StringBuilder) -> void {
-    sb.items = null;
+    free(sb.items);
     sb.count = 0;
     sb.capacity = 0;
 }

@@ -1560,15 +1560,47 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
 // Statements
 static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s);
 
+// Emits the deferred statements registered in defer scopes
+// [from_scope, cc->n_defer_scopes), most-recently-registered first: walks
+// scopes from innermost down to (and including) 'from_scope', and within
+// each scope runs its own statements in reverse declaration order.
+static void ST_ct_emit_defers_from(ST_ct_compiler_t *cc, u32 from_scope) {
+    for (u32 sc = cc->n_defer_scopes; sc > from_scope; sc--) {
+        ST_ct_defer_scope_t *ds = &cc->defer_scopes[sc - 1];
+        for (u32 k = ds->count; k > 0; k--) {
+            if (cc->failed)
+                return;
+            ST_ct_compile_stmt(cc, ds->items[k - 1]);
+        }
+    }
+}
+
 // Compiles a body as its own lexical scope: locals declared inside are
 // unreachable (and their stack slots reclaimed) once the body ends, same
 // discipline a real stack-slot compiler uses for block scope.
 static void ST_ct_compile_scoped(ST_ct_compiler_t *cc, ST_stmts_t *body) {
     u32 saved = cc->n_locals;
+
+    b8 pushed_defer_scope = cc->n_defer_scopes < ST_array_len(cc->defer_scopes);
+    if (pushed_defer_scope) {
+        cc->defer_scopes[cc->n_defer_scopes].count = 0;
+        cc->n_defer_scopes++;
+    } else {
+        ST_ct_cfail(cc, 0, 0, "comptime: scopes nested too deeply in a #comptime scope "
+                              "(defer bookkeeping)");
+    }
+
     ST_forrange(0, body->count) {
-        if (cc->failed) return;
+        if (cc->failed) break;
         ST_ct_compile_stmt(cc, body->items[i]);
     }
+
+    if (pushed_defer_scope) {
+        if (!cc->failed)
+            ST_ct_emit_defers_from(cc, cc->n_defer_scopes - 1);
+        cc->n_defer_scopes--;
+    }
+
     u32 introduced = cc->n_locals - saved;
     ST_forrange(0, introduced) ST_ct_emit_op(cc->chunk, ST_OP_POP, 0);
     cc->n_locals = saved;
@@ -1893,6 +1925,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             loop->n_break_patches = 0;
             loop->n_continue_patches = 0;
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
 
             ST_ct_compile_scoped(cc, &s->while_.body);
 
@@ -1939,6 +1972,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             loop->n_break_patches = 0;
             loop->n_continue_patches = 0;
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
 
             ST_ct_compile_scoped(cc, &s->for_range.body);
 
@@ -2039,6 +2073,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             }
 
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
             ST_ct_compile_scoped(cc, &s->for_array.body);
 
             if (!cc->failed) {
@@ -2072,8 +2107,26 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             ST_ct_compile_scoped(cc, &s->block);
             return;
 
+        case ST_ST_DEFER: {
+            if (cc->n_defer_scopes == 0) {
+                ST_ct_cfail(cc, s->line, s->col, "comptime: internal: 'defer' outside of any scope");
+                return;
+            }
+            ST_ct_defer_scope_t *ds = &cc->defer_scopes[cc->n_defer_scopes - 1];
+            if (ds->count >= ST_array_len(ds->items)) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: too many 'defer's in one #comptime scope");
+                return;
+            }
+            ds->items[ds->count++] = s->defer_stmt;
+            return;
+        }
+
         case ST_ST_RETURN: {
             if (s->ret.values.count == 0) {
+                ST_ct_emit_defers_from(cc, 0);
+                if (cc->failed)
+                    return;
                 ST_ct_emit_op(cc->chunk, ST_OP_HALT, s->line);
                 return;
             }
@@ -2098,6 +2151,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                         return;
                 }
             }
+            ST_ct_emit_defers_from(cc, 0);
+            if (cc->failed)
+                return;
             ST_ct_emit_op_u32(cc->chunk, ST_OP_RETURN, s->ret.values.count, s->line);
             return;
         }
@@ -2167,6 +2223,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 ST_ct_cfail(cc, s->line, s->col, "comptime: too many 'break's in one loop");
                 return;
             }
+            ST_ct_emit_defers_from(cc, loop->body_start_defer_scopes);
+            if (cc->failed)
+                return;
             ST_forrange(loop->body_start_locals, cc->n_locals)
                 ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
             loop->break_patches[loop->n_break_patches++] =
@@ -2184,6 +2243,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 ST_ct_cfail(cc, s->line, s->col, "comptime: too many 'continue's in one loop");
                 return;
             }
+            ST_ct_emit_defers_from(cc, loop->body_start_defer_scopes);
+            if (cc->failed)
+                return;
             ST_forrange(loop->body_start_locals, cc->n_locals)
                 ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
             loop->continue_patches[loop->n_continue_patches++] =
@@ -2249,11 +2311,17 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
 	    return;
 	}
 
+        case ST_ST_NESTED_FN:
+            // The fn itself gets compiled on demand, via the worklist, the first
+            // time something actually calls it (see ST_ct_prog_find_fn) -- nothing
+            // to emit at its declaration point.
+            return;
+
         default: {
             static const char *kind_names[] = {
-                "expr", "decl", "assign", "multi_bind", "if", "while", "for_range",
+                "expr", "decl", "assign", "multi_bind", "if", "switch", "while", "for_range",
                 "for_array", "return", "block", "defer", "break", "continue", "label",
-                "godown", "asm", "comptime_block", "pack_expand",
+                "godown", "asm", "comptime_block", "pack_expand", "nested_fn",
             };
             const char *nm = (s->kind >= 0 &&
                               (u32)s->kind < sizeof(kind_names) / sizeof(kind_names[0]))

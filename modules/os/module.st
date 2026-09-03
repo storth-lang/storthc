@@ -108,8 +108,10 @@ pub fn sys_close(fd: i32) -> i32 {
 }
 
 pub fn sys_write(fd: i32, p: *char, n: i32) -> i32 {
+    WRITE :: 1;
+
     return #asm {
-        mov rax, 1
+        mov rax, WRITE
         mov rdi, fd
         mov rsi, p
         mov rdx, n
@@ -279,5 +281,21 @@ pub fn sys_rename(old:string, new:string) -> i32 {
         mov rax, RENAME
         mov rdi, old
         mov rsi, new
+    };
+}
+
+pub fn sys_chdir(path: string) -> i32 {
+    buf : [4096]char;
+    for i : 0..path.len {
+        buf[i] = path[i];
+    }
+    buf[path.len] = 0 #as char;
+    p := &buf[0];
+    CHDIR :: 80;
+
+    return #asm {
+        mov rax, CHDIR
+        mov rdi, p
+        syscall
     };
 }

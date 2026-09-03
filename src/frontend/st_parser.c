@@ -1180,6 +1180,10 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
     if (ST_at_symbol(p, ":=") || ST_at_symbol(p, "::")) {
         s->decl.is_const = ST_at_symbol(p, "::");
         p->pos++;
+        if (s->decl.is_const && ST_at_symbol(p, "#comptime")) {
+            p->pos++;
+            s->decl.is_comptime = 1;
+        }
         s->decl.init = ST_parse_expr(p);
         if (!s->decl.init)
             return NULL;
@@ -1201,6 +1205,10 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
         // 'x : T : expr;'
         p->pos++;
         s->decl.is_const = 1;
+        if (ST_at_symbol(p, "#comptime")) {
+            p->pos++;
+            s->decl.is_comptime = 1;
+        }
         s->decl.init = ST_parse_expr(p);
         if (!s->decl.init)
             return NULL;
@@ -1335,7 +1343,11 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_COMPTIME_BLOCK, t->line, t->col);
         if (!ST_expect_sym(p, "{"))
             return NULL;
-        if (!ST_parse_body(p, &s->block))
+        b8 save_in_comptime = p->in_comptime_scope;
+        p->in_comptime_scope = 1;
+        b8 body_ok = ST_parse_body(p, &s->block);
+        p->in_comptime_scope = save_in_comptime;
+        if (!body_ok)
             return NULL;
         if (!ST_expect_sym(p, "}"))
             return NULL;
@@ -1616,6 +1628,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
 }
 
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
+    u32 block_id = ++p->next_block_id;
     while (p->pos < p->n_tokens && !ST_at_symbol(p, "}")) {
         if (p->n_errors >= ST_PARSE_MAX_ERRORS)
              return 0;
@@ -1628,7 +1641,19 @@ static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
 	    }
 
 	    nd->file = start_tok && start_tok->file.len ? start_tok->file : p->file;
+	    nd->fn.decl_block_id = block_id;
+	    if (p->in_comptime_scope)
+	        nd->fn.sig.is_comptime = 1; // only ever callable from a #comptime scope
+	                                   // (see ST_lower_program's existing skip for it)
 	    ST_da_append_arena(p->arena, &p->nested_fns, nd);
+
+	    // Leave a marker exactly where 'fn' was written so semantic analysis
+	    // can scope its visibility to this block instead of the whole
+	    // enclosing function (see ST_ST_NESTED_FN in ST_check_stmt).
+	    ST_stmt_t *marker =
+	        ST_stmt_new(p->arena, ST_ST_NESTED_FN, start_tok->line, start_tok->col);
+	    marker->nested_fn = nd;
+	    ST_da_append_arena(p->arena, out, marker);
 	    continue;
 	}
 

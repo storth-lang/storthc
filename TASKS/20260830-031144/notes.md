@@ -4,7 +4,7 @@
 
 ## PRIORITY: 100
 
-## STATUS: OPEN
+## STATUS: CLOSED
 
 ## TAGS: error, build, parser
 

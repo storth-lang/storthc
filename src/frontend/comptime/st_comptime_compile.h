@@ -69,11 +69,19 @@ typedef struct {
 
 typedef struct {
     u32 body_start_locals; // cc->n_locals when the loop body starts;
+    u32 body_start_defer_scopes; // cc->n_defer_scopes when the loop body starts; 'break'
+                                // and 'continue' flush every defer scope at or above this
+                                // depth (see ST_ct_emit_defers_from) before jumping
     u32 continue_patches[32];   // 'continue' jumps (forward) here, patched once known
     u32 n_continue_patches;
     u32 break_patches[32];      // offsets of forward JMPs waiting for the loop's exit point
     u32 n_break_patches;
 } ST_ct_loop_ctx_t;
+
+typedef struct {
+    ST_stmt_t *items[16];
+    u32 count;
+} ST_ct_defer_scope_t;
 
 typedef struct {
     ST_arena_t *arena;
@@ -84,6 +92,9 @@ typedef struct {
 
     ST_ct_loop_ctx_t loop_stack[16];
     u32 n_loops;
+
+    ST_ct_defer_scope_t defer_scopes[32];
+    u32 n_defer_scopes;
 
     ST_ct_prog_ctx_t *prog_ctx;
 

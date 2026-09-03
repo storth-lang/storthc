@@ -430,6 +430,7 @@ static void ST_modrw_stmt(ST_module_rw_t *rw, ST_stmt_t *s) {
         case ST_ST_CONTINUE:
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
+        case ST_ST_NESTED_FN:
             break;
         case ST_ST_ASM:
             ST_forrange(0, s->asm_.n_tokens) {
