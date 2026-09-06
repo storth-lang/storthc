@@ -1,6 +1,6 @@
 # float with more than 2 return does not work
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
 - TAGS: asm, backend
 

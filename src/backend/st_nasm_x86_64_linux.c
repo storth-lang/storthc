@@ -660,7 +660,10 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
 	       else
 	           fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
             } else if (rc > 2)
-                fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+	        if (in->ty && ST_ty_is_float(in->ty))
+                    fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+                else
+		    fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
             else if (rc == 1 && in->ty && ST_ty_is_float(in->ty) && in->ty->size == 4)
                 fprintf(out, "    cvtss2sd xmm0, xmm0\n");
         } break;
