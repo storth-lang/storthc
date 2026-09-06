@@ -93,16 +93,18 @@ pub fn temp_end(t: Temp) -> void {
 
 HDR :: #comptime 16;
 
-pub fn alloc(size: i64) -> (*void, memoryError) {
+pub fn alloc(size: i64) -> *void {
 	total := ((size + HDR + PAGE - 1) / PAGE) * PAGE;
 	raw := sys_mmap(null, total, (PROT_READ | PROT_WRITE) #as i32,
 	                (MAP_PRIVATE | MAP_ANON) #as i32, -1 #as i32, 0);
-	if (raw #as i64) == -1 then return null, memoryError.ReserveFailed;
+	if (raw #as i64) == -1 {
+        return null;
+    }
 
 	base := raw #as *u8;
 	szp := base #as *i64;
 	szp[0] = total;
-	return (base + HDR) #as *void, memoryError.None;
+	return (base + HDR) #as *void;
 }
 
 pub fn free(p: *void) -> void {
@@ -125,46 +127,23 @@ pub fn memcpy(dst: *u8, src: *u8, n: i64) {
 	}
 }
 
-pub fn realloc(ptr: *void, new_size: i64) -> (*void, memoryError) {
-	new_raw, err := alloc(new_size);
-	if err != memoryError.None {
-		return null, err;
-	}
-	if ptr != null {
-		old_base := ((ptr #as i64) - HDR) #as *i64;
-		old_size := old_base[0] - HDR;
-		copy_size := old_size;
-		if new_size < copy_size {
-			copy_size = new_size;
-		}
-		memcpy(new_raw #as *u8, ptr #as *u8, copy_size);
-	}
-	return new_raw, memoryError.None;
-}
+// pub fn realloc(ptr: *void, new_size: i64) -> (*void, memoryError) {
+// 	new_raw, err := alloc(new_size);
+// 	if err != memoryError.None {
+// 		return null, err;
+// 	}
+// 	if ptr != null {
+// 		old_base := ((ptr #as i64) - HDR) #as *i64;
+// 		old_size := old_base[0] - HDR;
+// 		copy_size := old_size;
+// 		if new_size < copy_size {
+// 			copy_size = new_size;
+// 		}
+// 		memcpy(new_raw #as *u8, ptr #as *u8, copy_size);
+// 	}
+// 	return new_raw, memoryError.None;
+// }
 
-fn memmove(dst: *u8, src: *u8, n: u64) -> *u8 {
-    if (dst as u64) == (src as u64) {
-        return dst;
-    }
-
-    if (src as u64) < (dst as u64) {
-        if (dst as u64) < (src as u64) + n {
-            i : u64 : n;
-            while i > 0 {
-                i = i - 1;
-                dst[i] = src[i];
-            }
-            return dst;
-        }
-    }
-
-    i : u64 : 0;
-    while i < n {
-        defer i += 1;
-        dst[i] = src[i];
-    }
-    return dst;
-}
 
 #import "error";
 #import "os";

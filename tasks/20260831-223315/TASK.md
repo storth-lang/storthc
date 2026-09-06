@@ -1,7 +1,7 @@
 # comptime function should not be accessible outside of comptime
 
 -PRIORITY: 100
--STATUS: OPEN
+-STATUS: CLOSED
 -TAGS:
 
 pub fn main(args: []string) -> i32 {
