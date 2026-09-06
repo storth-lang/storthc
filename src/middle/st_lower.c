@@ -1811,8 +1811,33 @@ static void ST_lower_body(ST_lower_ctx_t *c, ST_stmts_t *body) {
     ST_forrange(0, body->count) ST_lower_stmt(c, body->items[i]);
 }
 
+static void ST_lower_enum_step_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
+                                      ST_ir_inst_t *addr) {
+    b8 forward = ST_string_eq_cstr(s->assign.op, "+=");
+    ST_decl_t *ed = ty->decl;
+    u32 n = ed->enum_.variants.count;
+    ST_ir_inst_t *cur = ST_ir_load(c->cur, ty, addr, s->line, s->col);
+    ST_ty_t *bty = c->sema->tys.prim[ST_tbool];
+    ST_ir_inst_t *result = ST_ir_const_int(c->cur, ty, 0);
+    ST_forrange(0, n) {
+        i64 v = ed->enum_.variants.items[i].computed;
+        i64 nv = ed->enum_.variants.items[forward ? (i + 1) % n : (i + n - 1) % n].computed;
+        ST_ir_inst_t *vc = ST_ir_const_int(c->cur, ty, v);
+        ST_ir_inst_t *eq = ST_ir_binop(c->cur, ST_IR_ICMP_EQ, bty, cur, vc, s->line, s->col);
+        ST_ir_inst_t *eqi = ST_ir_cast(c->cur, ty, eq, s->line, s->col);
+        ST_ir_inst_t *nvc = ST_ir_const_int(c->cur, ty, nv);
+        ST_ir_inst_t *term = ST_ir_binop(c->cur, ST_IR_MUL, ty, eqi, nvc, s->line, s->col);
+        result = ST_ir_binop(c->cur, ST_IR_ADD, ty, result, term, s->line, s->col);
+    }
+    ST_ir_store(c->cur, ty, addr, result, s->line, s->col);
+}
+
 static void ST_lower_store_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
                                   ST_ir_inst_t *addr) {
+    if (ty->kind == ST_TY_ENUM && !ST_string_eq_cstr(s->assign.op, "=")) {
+        ST_lower_enum_step_assign(c, s, ty, addr);
+        return;
+    }
     ST_ir_inst_t *rhs = ST_lower_expr(c, s->assign.rhs);
     if (!ST_string_eq_cstr(s->assign.op, "=")) {
         ST_ir_inst_t *cur = ST_ir_load(c->cur, ty, addr, s->line, s->col);

@@ -196,6 +196,8 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
         return 1;
     if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_INT)
         return 1;
+    if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_ENUM)
+        return 1;
     if (from->kind == ST_TY_UNTYPED_FLOAT && to->kind == ST_TY_FLOAT)
         return 1;
     if (from->kind == ST_TY_PTR && to->kind == ST_TY_PTR &&
@@ -2898,6 +2900,16 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
 
     b8 arith = ST_op_is(op, "+=", "-=") || ST_op_is(op, "*=", "/=");
     if (arith) {
+        if (lt->kind == ST_TY_ENUM) {
+            b8 step = ST_op_is(op, "+=", "-=") && s->assign.rhs->kind == ST_EX_INT &&
+                     s->assign.rhs->ival == 1;
+            if (!step)
+                ST_diag_error(&se->diag, s->line, s->col,
+                              "'" ST_sv_fmt "' isn't supported on enum '" ST_sv_fmt "' -- use "
+                              "'++'/'--' to cycle to the next/previous variant",
+                              ST_sv_args(op), ST_sv_args(ST_decl_display_name(lt->decl)));
+            return;
+        }
         if (!ST_ty_num_unify(se, lt, rt))
             ST_diag_error(&se->diag, s->line, s->col,
                           "invalid operands to '" ST_sv_fmt "': '%s' and '%s'", ST_sv_args(op),
