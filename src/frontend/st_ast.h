@@ -265,6 +265,7 @@ struct ST_stmt_t {
             ST_string_t spec_iter; // optional second binding, len==0 if unused (see '#for' parsing)
             ST_expr_t *target;
             b8 is_comptime; // '#for ch[, spec]: string_expr'
+            b8 deref_iter;
             ST_stmts_t body;
         } for_array;
         struct {

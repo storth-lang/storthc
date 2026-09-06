@@ -3041,7 +3041,26 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             u32 scale = elem_ty->size ? elem_ty->size : 1;
             ST_ir_inst_t *elem_ptr =
                 ST_ir_addr(c->cur, eptr_ty, data_ptr, idx, scale, 0, s->line, s->col);
-            if (ST_lower_ty_is_scalar(elem_ty)) {
+
+            if (s->for_array.deref_iter) {
+                if (elem_ty->kind != ST_TY_PTR) {
+                    ST_diag_error(&c->diag, s->line, s->col,
+                                  "internal: 'for *name : ...' needs a slice/array of "
+                                  "pointers");
+                    break;
+                }
+                ST_ir_inst_t *pv = ST_ir_load(c->cur, elem_ty, elem_ptr, s->line, s->col);
+                ST_ty_t *deref_ty = elem_ty->inner;
+                if (ST_lower_ty_is_scalar(deref_ty)) {
+                    ST_ir_inst_t *dv = ST_ir_load(c->cur, deref_ty, pv, s->line, s->col);
+                    ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, deref_ty,
+                                                      s->for_array.iter, s->line, s->col);
+                    ST_ir_store(c->cur, deref_ty, slot, dv, s->line, s->col);
+                    ST_lower_bind_addr(c, s->for_array.iter, slot, deref_ty);
+                } else {
+                    ST_lower_bind_addr(c, s->for_array.iter, pv, deref_ty);
+                }
+            } else if (ST_lower_ty_is_scalar(elem_ty)) {
                 ST_ir_inst_t *ev = ST_ir_load(c->cur, elem_ty, elem_ptr, s->line, s->col);
                 ST_ir_inst_t *slot =
                     ST_ir_alloca(c->fn, &c->sema->tys, elem_ty, s->for_array.iter, s->line, s->col);

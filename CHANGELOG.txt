@@ -340,3 +340,5 @@ above and it's easy to lose track of:
 - Now multiple return with more than 2 cases are valid and working.
 
 - Added new tasks after testing.
+
+- Supported for loops for dereferencing an element for iteration.

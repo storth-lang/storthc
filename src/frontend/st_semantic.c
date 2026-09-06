@@ -3821,6 +3821,18 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 else
                     ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
                                   "cannot iterate a value of type '%s'", ST_tstr(se, tt));
+                if (iter && s->for_array.deref_iter) {
+                    if (iter->kind != ST_TY_PTR) {
+                        ST_diag_error(&se->diag, s->for_array.target->line,
+                                      s->for_array.target->col,
+                                      "'for *name : ...' needs a slice/array of pointers, "
+                                      "not '%s'",
+                                      ST_tstr(se, iter));
+                        iter = NULL;
+                    } else {
+                        iter = iter->inner;
+                    }
+                }
             }
             ST_scope_push(se);
             ST_declare_local(se, s->for_array.iter, iter, s->line, s->col);
