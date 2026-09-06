@@ -336,3 +336,5 @@ above and it's easy to lose track of:
 
 - We had a bug of returning multiple floats from a function right now it works with 2 floats.
   So if you have fn foo() -> (f32, f32) {} and bind it with x, y := foo(); it will work correctly.
+
+- Now multiple return with more than 2 cases are valid and working.
