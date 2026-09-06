@@ -344,3 +344,5 @@ above and it's easy to lose track of:
 - Supported for loops for dereferencing an element for iteration.
 
 - Adding support for extern variable and accepting extern params.
+
+- Adding support for no return.
