@@ -592,6 +592,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
         case ST_TE_FN: {
             ST_ty_t *t = ST_ty_fn_new(&se->tys);
             t->is_variadic = te->fn_is_variadic;
+            t->is_noreturn = te->fn_is_noreturn;
             ST_forrange(0, te->fn_params.count) {
                 ST_ty_t *pt = ST_resolve_tyexpr(se, te->fn_params.items[i]);
                 ST_da_append_arena(se->arena, &t->params, pt);
@@ -2963,6 +2964,14 @@ static void ST_check_multi(ST_sema_t *se, ST_stmt_t *s) {
 }
 
 static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
+    if (se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN &&
+        se->cur_fn_decl->fn.sig.is_noreturn) {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "cannot 'return' from '" ST_sv_fmt "', which is declared '-> noreturn' "
+                      "-- a function that never returns can't have a return statement",
+                      ST_sv_args(se->cur_fn_decl->name));
+        return;
+    }
     u32 want = se->cur_rets ? se->cur_rets->count : 0;
     u32 got = s->ret.values.count;
     if (want != got) {
@@ -4151,6 +4160,7 @@ static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig) {
     ST_ty_t *t = ST_ty_fn_new(&se->tys);
     t->is_variadic = sig->is_variadic;
     t->has_any_pack = sig->has_any_pack;
+    t->is_noreturn = sig->is_noreturn;
     ST_forrange(0, sig->params.count) {
         ST_param_t *p = &sig->params.items[i];
         ST_ty_t *pt = p->te ? ST_resolve_tyexpr(se, p->te) : NULL;

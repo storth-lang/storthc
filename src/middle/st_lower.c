@@ -2284,10 +2284,39 @@ static b8 ST_lower_arr_root_is_safe(ST_lower_ctx_t *c, ST_string_t name) {
     return ST_lower_scope_find(c, name) == NULL;
 }
 
+static b8 ST_lower_expr_is_noreturn_call(ST_lower_ctx_t *c, ST_expr_t *e) {
+    if (!e || e->kind != ST_EX_CALL)
+        return 0;
+    ST_expr_t *callee = e->call.callee;
+    if (callee->kind == ST_EX_IDENT && !ST_lower_scope_find(c, callee->name)) {
+        ST_string_t name = callee->name;
+        ST_ht_generic_t key = {.tag = name.data, .size = name.len};
+        ST_sym_t *sym = ST_ht_get(&c->sema->globals, key).tag;
+        if (!sym || !sym->decl)
+            return 0;
+        if (sym->decl->kind == ST_DE_FN)
+            return sym->decl->fn.sig.is_noreturn;
+        if (sym->decl->kind == ST_DE_EXTERN_FN)
+            return sym->decl->extern_fn.sig.is_noreturn;
+        return 0;
+    }
+    ST_ty_t *cty = callee->ty;
+    if (cty && cty->kind == ST_TY_PTR)
+        cty = cty->inner;
+    return cty && cty->kind == ST_TY_FN && cty->is_noreturn;
+}
+
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
+    if (ST_ir_block_is_terminated(c->cur))
+        return;
     switch (s->kind) {
         case ST_ST_EXPR:
             ST_lower_expr(c, s->expr);
+            if (ST_lower_expr_is_noreturn_call(c, s->expr)) {
+                ST_lower_run_defers(c, 0);
+                ST_ir_term_unreachable(c->cur, s->line, s->col);
+                ST_lower_start_dead_block(c, s->line, s->col);
+            }
             break;
 
         case ST_ST_DECL: {
@@ -3497,7 +3526,12 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                                                  fn_ty->rets.items[0]->kind == ST_TY_VOID);
 
     if (!ST_ir_block_is_terminated(c->cur)) {
-        if (returns_void) {
+        if (d->fn.sig.is_noreturn) {
+            ST_diag_error(&c->diag, d->line, d->col,
+                          "function '" ST_sv_fmt "' is declared '-> noreturn' but can fall "
+                          "through without diverging",
+                          ST_sv_args(d->name));
+        } else if (returns_void) {
             ST_lower_run_defers(c, 0);
             ST_ir_term_ret(c->cur, NULL, 0, d->line, d->col);
         } else

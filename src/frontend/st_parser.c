@@ -329,6 +329,19 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
                     return NULL;
                 ST_da_append_arena(p->arena, &te->fn_rets, rte);
             }
+            b8 any_noreturn = 0;
+            ST_forrange(0, te->fn_rets.count)
+                if (te->fn_rets.items[i]->kind == ST_TE_NAME &&
+                    ST_string_eq_cstr(te->fn_rets.items[i]->name, "noreturn"))
+                    any_noreturn = 1;
+            if (any_noreturn) {
+                if (te->fn_rets.count != 1) {
+                    ST_perr_here(p, "'noreturn' can't be combined with other return types");
+                    return NULL;
+                }
+                te->fn_is_noreturn = 1;
+                te->fn_rets.count = 0;
+            }
         }
         return te;
     }
@@ -2055,6 +2068,19 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             if (!te)
                 return 0;
             ST_da_append_arena(p->arena, &sig->rets, te);
+        }
+        b8 any_noreturn = 0;
+        ST_forrange(0, sig->rets.count)
+            if (sig->rets.items[i]->kind == ST_TE_NAME &&
+                ST_string_eq_cstr(sig->rets.items[i]->name, "noreturn"))
+                any_noreturn = 1;
+        if (any_noreturn) {
+            if (sig->rets.count != 1) {
+                ST_perr_here(p, "'noreturn' can't be combined with other return types");
+                return 0;
+            }
+            sig->is_noreturn = 1;
+            sig->rets.count = 0;
         }
     }
     if (ST_at_symbol(p, "#comptime")) {

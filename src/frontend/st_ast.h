@@ -50,6 +50,7 @@ struct ST_tyexpr_t {
     ST_tyexprs_t fn_params;
     ST_tyexprs_t fn_rets;
     b8 fn_is_variadic;
+    b8 fn_is_noreturn;
     b8 is_generic_param;
     ST_tyexprs_t generic_constraints; // '$T(A | B)'
     ST_tyexprs_t generic_args;
@@ -350,6 +351,7 @@ typedef struct {
     b8 has_any_pack;  // trailing 'name: any...' (non-extern; collected into an array)
     b8 has_generic_pack; // trailing 'name: $T...' (comptime; one synthetic param per call-site arg)
     b8 is_comptime;   // trailing '#comptime'
+    b8 is_noreturn;
     ST_strings_t generics;
 } ST_fn_sig_t;
 
