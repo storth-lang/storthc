@@ -342,3 +342,5 @@ above and it's easy to lose track of:
 - Added new tasks after testing.
 
 - Supported for loops for dereferencing an element for iteration.
+
+- Adding support for extern variable and accepting extern params.

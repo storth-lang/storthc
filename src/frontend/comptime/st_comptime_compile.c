@@ -149,6 +149,7 @@ typedef struct {
 static b8 ST_ct_prog_want_call(ST_ct_prog_ctx_t *pctx, ST_string_t callee_name, u32 patch_off,
                                u32 line, u32 col);
 static ST_decl_t *ST_ct_prog_find_extern(ST_ct_prog_ctx_t *pctx, ST_string_t name);
+static ST_decl_t *ST_ct_prog_find_extern_var(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_struct(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_type_alias(ST_ct_prog_ctx_t *pctx, ST_string_t name);
 static ST_decl_t *ST_ct_prog_find_enum(ST_ct_prog_ctx_t *pctx, ST_string_t name);
@@ -172,6 +173,7 @@ static b8 ST_ct_struct_field_offset(ST_ct_compiler_t *cc, ST_decl_t *sd, ST_stri
                                     u32 *out_offset, ST_tyexpr_t **out_te);
 static b8 ST_ct_lval_addr(ST_ct_compiler_t *cc, ST_expr_t *e, ST_ct_lval_ty_t *out_ty);
 static b8 ST_ct_lval_classify_te(ST_ct_compiler_t *cc, ST_tyexpr_t *te, ST_ct_lval_ty_t *out_ty);
+static void ST_ct_emit_struct_load_from_ptr(ST_ct_compiler_t *cc, ST_ty_t *ty, u32 line);
 static void ST_ct_emit_lval_load(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line);
 static b8 ST_ct_emit_lval_store(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line);
 static b8 ST_ct_compile_struct_rvalue(ST_ct_compiler_t *cc, ST_expr_t *e, ST_string_t struct_type);
@@ -537,6 +539,20 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                                 "'#comptime' after '::' to opt it in ('" ST_sv_fmt " :: "
                                 "#comptime ...;')",
                                 ST_sv_args(e->name), ST_sv_args(e->name));
+                    return;
+                }
+                ST_decl_t *ev = ST_ct_prog_find_extern_var(cc->prog_ctx, e->name);
+                if (ev) {
+                    ST_ct_emit_const(cc->chunk, ST_ct_str("", 0), e->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_LOAD_LIB, e->line);
+                    u8 *name_copy = ST_arena_push(cc->arena, e->name.len);
+                    memcpy(name_copy, e->name.data, e->name.len);
+                    ST_ct_emit_const(cc->chunk, ST_ct_str((const char *)name_copy, e->name.len),
+                                     e->line);
+                    ST_ct_emit_op(cc->chunk, ST_OP_BIND_DATA_SYM, e->line);
+                    ST_ct_lval_ty_t ty;
+                    ST_ct_lval_classify_te(cc, ev->extern_var.te, &ty);
+                    ST_ct_emit_lval_load(cc, &ty, e->line);
                     return;
                 }
             }
@@ -1314,6 +1330,44 @@ static b8 ST_ct_lval_addr(ST_ct_compiler_t *cc, ST_expr_t *e, ST_ct_lval_ty_t *o
     return 0;
 }
 
+static void ST_ct_emit_struct_load_from_ptr(ST_ct_compiler_t *cc, ST_ty_t *ty, u32 line) {
+    if (!ty) {
+        ST_ct_cfail(cc, line, 0, "comptime: don't know how to read this struct's layout");
+        return;
+    }
+    u32 n_fields = ty->fields.count;
+    ST_forrange(0, n_fields) {
+        ST_ty_field_t *f = &ty->fields.items[i];
+        ST_ct_emit_op(cc->chunk, ST_OP_DUP, line);
+        ST_ct_emit_const(cc->chunk, ST_ct_int((i64)f->offset), line);
+        ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_ADD, 1, line);
+        if (f->ty && (f->ty->kind == ST_TY_STRUCT || f->ty->kind == ST_TY_TAG_UNION)) {
+            ST_ct_emit_struct_load_from_ptr(cc, f->ty, line);
+            if (cc->failed)
+                return;
+            continue;
+        }
+        if (f->ty && f->ty->kind == ST_TY_PTR) {
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, 3, line);
+            continue;
+        }
+        u32 width;
+        b8 is_signed;
+        if (f->ty && ST_ct_ty_int_info(f->ty, &width, &is_signed)) {
+            u32 operand = (0 & 0xF) | ((width & 0xFF) << 4) | ((is_signed & 1) << 12);
+            ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, operand, line);
+            continue;
+        }
+        ST_ct_cfail(cc, line, 0,
+                    "comptime: don't know how to read '" ST_sv_fmt "' (field '" ST_sv_fmt
+                    "') through a pointer yet",
+                    ST_sv_args(ty->decl ? ty->decl->name : (ST_string_t){0}), ST_sv_args(f->name));
+        return;
+    }
+    ST_ct_emit_op_u32(cc->chunk, ST_OP_MAKE_STRUCT, n_fields, line);
+    ST_ct_emit_op(cc->chunk, ST_OP_NIP, line);
+}
+
 static void ST_ct_emit_lval_load(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 line) {
     if (ty->kind == ST_CT_LVAL_STRING) {
         ST_ct_emit_op(cc->chunk, ST_OP_PTR_LOAD_STR, line);
@@ -1321,6 +1375,17 @@ static void ST_ct_emit_lval_load(ST_ct_compiler_t *cc, ST_ct_lval_ty_t *ty, u32 
     }
     if (ty->kind == ST_CT_LVAL_PTR) {
         ST_ct_emit_op_u32(cc->chunk, ST_OP_PTR_LOAD, 3, line);
+        return;
+    }
+    if (ty->kind == ST_CT_LVAL_STRUCT && ty->struct_decl) {
+        if (!cc->prog_ctx || !cc->prog_ctx->sema) {
+            ST_ct_cfail(cc, line, 0,
+                        "comptime: struct values aren't readable through a pointer in "
+                        "this context");
+            return;
+        }
+        ST_ty_t *sty = ST_ty_for_decls(&cc->prog_ctx->sema->tys, ty->struct_decl);
+        ST_ct_emit_struct_load_from_ptr(cc, sty, line);
         return;
     }
     u32 width;
@@ -2374,6 +2439,15 @@ static ST_decl_t *ST_ct_prog_find_extern(ST_ct_prog_ctx_t *pctx, ST_string_t nam
     return NULL;
 }
 
+static ST_decl_t *ST_ct_prog_find_extern_var(ST_ct_prog_ctx_t *pctx, ST_string_t name) {
+    ST_forrange(0, pctx->prog->decls.count) {
+        ST_decl_t *d = pctx->prog->decls.items[i];
+        if (d && d->kind == ST_DE_EXTERN_VAR && ST_string_eq(d->name, name))
+            return d;
+    }
+    return NULL;
+}
+
 static ST_decl_t *ST_ct_prog_find_struct(ST_ct_prog_ctx_t *pctx, ST_string_t name) {
     ST_forrange(0, pctx->prog->decls.count) {
         ST_decl_t *d = pctx->prog->decls.items[i];
@@ -2554,6 +2628,7 @@ static b8 ST_ct_ty_int_info(ST_ty_t *t, u32 *width, b8 *is_signed) {
         case ST_TY_UNTYPED_INT: *width = 8; *is_signed = 1; return 1;
         case ST_TY_CHAR: *width = 1; *is_signed = 0; return 1;
         case ST_TY_BOOL: *width = 1; *is_signed = 0; return 1;
+        case ST_TY_ENUM: *width = 8; *is_signed = 0; return 1;
         default: return 0;
     }
 }

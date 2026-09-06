@@ -297,6 +297,17 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
             case ST_OP_TRUE: ST_ct_push(vm, ST_ct_bool(1)); break;
             case ST_OP_FALSE: ST_ct_push(vm, ST_ct_bool(0)); break;
             case ST_OP_POP: ST_ct_pop(vm); break;
+            case ST_OP_DUP: {
+                if (vm->sp == 0) { ST_ct_fail(vm, line, "comptime: stack underflow on dup"); break; }
+                ST_ct_push(vm, vm->stack[vm->sp - 1]);
+                break;
+            }
+            case ST_OP_NIP: {
+                ST_ct_val_t top = ST_ct_pop(vm);
+                ST_ct_pop(vm);
+                ST_ct_push(vm, top);
+                break;
+            }
 
             case ST_OP_ADD: case ST_OP_SUB: case ST_OP_MUL:
             case ST_OP_DIV: case ST_OP_MOD: {
@@ -580,6 +591,20 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                     break;
                 }
                 ST_ct_push(vm, (ST_ct_val_t){.kind = ST_CT_NATIVE, .native = nat});
+                break;
+            }
+            case ST_OP_BIND_DATA_SYM: {
+                ST_ct_val_t name = ST_ct_pop(vm), handle = ST_ct_pop(vm);
+                if (handle.kind != ST_CT_PTR || name.kind != ST_CT_STRING) {
+                    ST_ct_fail(vm, line, "comptime: bad extern-variable symbol lookup arguments");
+                    break;
+                }
+                char buf[256];
+                u32 n = name.str.len < sizeof(buf) - 1 ? name.str.len : (u32)sizeof(buf) - 1;
+                memcpy(buf, name.str.data, n);
+                buf[n] = 0;
+                void *addr = dlsym(handle.ptr, buf);
+                ST_ct_push(vm, addr ? ST_ct_ptr(addr) : ST_ct_nil());
                 break;
             }
             case ST_OP_CALL_NATIVE: {

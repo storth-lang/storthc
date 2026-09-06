@@ -250,6 +250,7 @@ typedef struct {
     i64 init_int;
     f64 init_float;
     b8 is_pub;
+    b8 is_extern;
     ST_ir_global_field_inits_t field_inits;
 } ST_ir_global_var_t;
 
@@ -289,6 +290,8 @@ ST_ir_fn_t *ST_ir_module_find_fn(ST_ir_module_t *m, ST_string_t name);
 // exactly one of init_int/init_float depending on init_is_float.
 void ST_ir_module_add_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty, b8 is_pub,
                              b8 has_init, b8 init_is_float, i64 init_int, f64 init_float);
+
+void ST_ir_module_add_extern_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty);
 
 // @note: ST_ir_module_find_global looks up a registered global variable by name.
 ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name);

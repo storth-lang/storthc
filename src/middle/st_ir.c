@@ -55,6 +55,22 @@ void ST_ir_module_add_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty, b
              (ST_ht_generic_t){.tag = (void *)(uintptr_t)(m->globals.count), .size = 0});
 }
 
+void ST_ir_module_add_extern_global(ST_ir_module_t *m, ST_string_t name, ST_ty_t *ty) {
+    ST_ir_global_var_t g = {0};
+    g.name = name;
+    g.ty = ty;
+    g.is_extern = 1;
+    ST_da_append_arena(m->arena, &m->globals, g);
+
+    // Same rationale as ST_ir_module_add_global: cache the index, not a raw
+    // pointer, since 'globals' stores these by value and can relocate.
+    ST_ht_generic_t *hk = ST_arena_push(m->arena, sizeof(*hk));
+    hk->tag = name.data;
+    hk->size = name.len;
+    ST_ht_set(&m->global_index, hk,
+             (ST_ht_generic_t){.tag = (void *)(uintptr_t)(m->globals.count), .size = 0});
+}
+
 ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name) {
     ST_ht_generic_t key = {.tag = name.data, .size = name.len};
     uintptr_t slot = (uintptr_t)ST_ht_get(&m->global_index, key).tag;

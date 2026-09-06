@@ -1,6 +1,6 @@
 # Iterating over a pointer of slice/array
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 80
 - TAGS: parser, semantic
 
