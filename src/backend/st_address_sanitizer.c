@@ -161,10 +161,8 @@ static void ST_asan_walk_stmt(ST_arena_t *arena, ST_stmt_t *s, ST_string_t file)
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
         case ST_ST_ASM:
-        case ST_ST_COMPTIME_BLOCK: // no-op deliberately: never reaches real codegen, see
-                                  // ST_sema_run_comptime_blocks -- it's rewritten to a
-                                  // plain (already-instrumented) empty block long before
-                                  // this pass would ever see it as this kind
+        case ST_ST_NESTED_FN:
+        case ST_ST_COMPTIME_BLOCK:
         case ST_ST_PACK_EXPAND:
         case ST_ST_COUNT:
             break;

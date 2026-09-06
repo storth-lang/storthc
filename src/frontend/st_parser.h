@@ -21,6 +21,8 @@ typedef struct {
     u32 suppress_errors; // Issue fix: https://github.com/storth-lang/storthc/issues/40
     ST_decls_t nested_fns;
     ST_strings_t fn_name_stack;
+    u32 next_block_id;
+    b8 in_comptime_scope;
 } ST_parser_t;
 
 b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t file,

@@ -12,4 +12,10 @@ pub fn timeToMillisecond(x: u64) -> f64 {
     return (x #as f64 / 1000000.0);
 }
 
+// The format for getCurrentDate is yr -> month -> data
+// Resource: https://en.wikipedia.org/wiki/Unix_time
+pub fn getCurrentDate() -> string {
+    return "";
+}
+
 #import "os";

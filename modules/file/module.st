@@ -16,6 +16,15 @@ fn flags_for_mode(mode: openMode) -> i32 {
     return 66;
 }
 
+fn handle_error(error_code: i32, error_print : bool) -> bool {
+    if err != 0  {
+        if error_print then eprint("%\n", getErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
 // pub fn openFileDescriptor(path: string, mode := openMode.readAndWrite) -> (i32, ioError);
 // Wrapper around 'sys_open'(os module) for us to have language error code instead of errno
 // libc error message and till we need all the error messages just keep things minimal.
@@ -134,23 +143,23 @@ pub fn writeEntireFile(path : string, str: string) -> bool {
 // This will rename an existing 'file1' to 'file2'. So if
 // you have a file renameFile(foo, bar); This obviously will not check if 'foo' is a
 // directory or not.
-pub fn renameFile(file1: string, file2: string) -> bool {
+pub fn renameFile(file1: string, file2: string, error_print := false) -> bool {
     err := sys_rename(file1, file2);
-    if err != 0 then {
-        return false;
-    }
-
-    return true;
+    return handle_error(err, error_print);
 }
 
 // pub fn createDirectoryIfNotExist(dir_name: string) -> bool;
-// This function will create a directory if it does not exist.
-pub fn createDirectoryIfNotExist(dir_name: string) -> bool {
+// This function will create a directory if it does not exist. Other wise it return
+// false.
+pub fn createDirectoryIfNotExist(dir_name: string, error_print := false) -> bool {
     err := sys_mkdir(dir_name, 0644);
-    if err == 17 {
-        eprint("Directory % already exists\n", dir_name);
-        return false;
-    }
+    return handle_error(err, error_print);
+}
 
-    return true;
+// pub fn changeCurrentWorkingDirectory(dir_name: string, error_print := false) -> bool;
+// This will change the current working directory from what it is now to the new directory.
+// TODO: handle all the cases if a directory exists or not and stuff of that nature.
+pub fn changeCurrentWorkingDirectory(dir_name: string, error_print := false) -> bool {
+    err := sys_chdir(dir_name);
+    return handle_error(err, error_print);
 }

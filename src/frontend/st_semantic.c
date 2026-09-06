@@ -920,6 +920,10 @@ static ST_stmt_t *ST_clone_stmt(ST_arena_t *a, ST_stmt_t *s) {
     case ST_ST_CONTINUE:
         break;
 
+    case ST_ST_NESTED_FN:
+        n->nested_fn = s->nested_fn;
+        break;
+
     case ST_ST_COUNT:
         ST_assert(0);
         break;
@@ -2671,8 +2675,30 @@ static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s);
 static void ST_check_comptime_block(ST_sema_t *se, ST_stmt_t *s);
 static void ST_sema_run_comptime_blocks(ST_sema_t *se);
 
+static void ST_declare_nested_fn_sym(ST_sema_t *se, ST_decl_t *nd) {
+    ST_string_t bare = ST_decl_display_name(nd);
+    if (ST_string_eq(bare, nd->name))
+        return;
+    if (ST_sym_find_in(&se->scope->table, bare))
+        return;
+    ST_sym_t *gsym = ST_sym_find_in(&se->globals, nd->name);
+    if (!gsym)
+        return;
+    ST_sym_insert(se, &se->scope->table,
+                  ST_sym_new(se, ST_SYM_FN, bare, nd, gsym->t, nd->line, nd->col));
+}
+
+static void ST_prescan_nested_fns(ST_sema_t *se, ST_stmts_t *body) {
+    ST_forrange(0, body->count) {
+        ST_stmt_t *s = body->items[i];
+        if (s && s->kind == ST_ST_NESTED_FN)
+            ST_declare_nested_fn_sym(se, s->nested_fn);
+    }
+}
+
 static void ST_check_body(ST_sema_t *se, ST_stmts_t *body) {
     ST_scope_push(se);
+    ST_prescan_nested_fns(se, body);
     ST_forrange(0, body->count) {
         if (se->hit_comp_error)
             break;
@@ -2783,6 +2809,16 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
             ST_diag_note_in_file(se, ST_sym_file(csym), csym->line, csym->col,
                                  "'" ST_sv_fmt "' is declared here", ST_sv_args(csym->name));
         }
+    }
+
+    if (s->decl.is_comptime) {
+        i64 dummy;
+        if (!s->decl.init || !ST_const_eval(se, s->decl.init, &dummy))
+            ST_diag_error(&se->diag, s->line, s->col,
+                          "'" ST_sv_fmt "' is declared '#comptime' so it can be used inside a "
+                          "nested '#comptime' scope, but its value isn't a compile-time "
+                          "constant expression",
+                          ST_sv_args(s->decl.name));
     }
 
     ST_declare_local_ex(se, s->decl.name, t, s->line, s->col, s->decl.is_const);
@@ -3756,6 +3792,7 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             }
             ST_scope_push(se);
             ST_declare_local(se, s->for_range.iter, ST_ty_defaulted(se, decl_ty), s->line, s->col);
+            ST_prescan_nested_fns(se, &s->for_range.body);
             ST_forrange(0, s->for_range.body.count) ST_check_stmt(se, s->for_range.body.items[i]);
             ST_scope_pop(se);
             break;
@@ -3784,11 +3821,24 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 else
                     ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
                                   "cannot iterate a value of type '%s'", ST_tstr(se, tt));
+                if (iter && s->for_array.deref_iter) {
+                    if (iter->kind != ST_TY_PTR) {
+                        ST_diag_error(&se->diag, s->for_array.target->line,
+                                      s->for_array.target->col,
+                                      "'for *name : ...' needs a slice/array of pointers, "
+                                      "not '%s'",
+                                      ST_tstr(se, iter));
+                        iter = NULL;
+                    } else {
+                        iter = iter->inner;
+                    }
+                }
             }
             ST_scope_push(se);
             ST_declare_local(se, s->for_array.iter, iter, s->line, s->col);
             if (s->for_array.spec_iter.len)
                 ST_declare_local(se, s->for_array.spec_iter, se->tys.prim[ST_ti64], s->line, s->col);
+            ST_prescan_nested_fns(se, &s->for_array.body);
             ST_forrange(0, s->for_array.body.count) ST_check_stmt(se, s->for_array.body.items[i]);
             ST_scope_pop(se);
             break;
@@ -3816,6 +3866,9 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         case ST_ST_COMPTIME_BLOCK:
             ST_check_comptime_block(se, s);
+            break;
+        case ST_ST_NESTED_FN:
+            ST_declare_nested_fn_sym(se, s->nested_fn);
             break;
         case ST_ST_COUNT:
             ST_assert(0);
@@ -3880,6 +3933,7 @@ static void ST_collect_labels(ST_sema_t *se, ST_ht_t *labels, ST_stmts_t *body) 
             case ST_ST_CONTINUE:
             case ST_ST_GODOWN:
             case ST_ST_ASM:
+            case ST_ST_NESTED_FN:
                 break;
             case ST_ST_COUNT:
                 ST_assert(0);
@@ -4288,55 +4342,31 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
     }
 }
 
-static ST_string_t ST_decl_parent_prefix(ST_string_t name) {
-    for (u32 i = name.len; i > 0; i--) {
-        if (name.data[i - 1] == '$')
-            return (ST_string_t){.data = name.data, .len = i - 1};
-    }
-    return (ST_string_t){0};
+// A nested fn can always call itself directly ('power' calling 'power'),
+// regardless of which block it was written in.
+static void ST_declare_self_recursive(ST_sema_t *se, ST_decl_t *d) {
+    ST_string_t bare = ST_decl_display_name(d);
+    if (ST_string_eq(bare, d->name))
+        return;
+    if (ST_sym_find_in(&se->scope->table, bare))
+        return;
+    ST_sym_t *gsym = ST_sym_find_in(&se->globals, d->name);
+    if (!gsym)
+        return;
+    ST_sym_insert(se, &se->scope->table,
+                  ST_sym_new(se, ST_SYM_FN, bare, d, gsym->t, d->line, d->col));
 }
 
-static void ST_apply_nested_fn_renames(ST_sema_t *se, ST_decl_t *d) {
-    ST_string_t parent_prefix = ST_decl_parent_prefix(d->name);
-    ST_forrange(0, se->prog->decls.count) {
-        ST_decl_t *sib = se->prog->decls.items[i];
-        if (!sib || sib->kind != ST_DE_FN)
-            continue;
-        if (!ST_string_eq(ST_decl_parent_prefix(sib->name), parent_prefix))
-            continue;
-        ST_string_t bare = ST_decl_display_name(sib);
-        if (ST_string_eq(bare, sib->name))
-            continue;
-        ST_expr_t repl = {0};
-        repl.kind = ST_EX_IDENT;
-        repl.name = sib->name;
-        ST_forrange(0, d->fn.body.count)
-            ST_ast_substitute_stmt(se, d->fn.body.items[i], bare, &repl);
-    }
-}
-
-static void ST_declare_visible_nested_fns(ST_sema_t *se, ST_decl_t *d) {
-    ST_string_t as_parent = d->name;
-    ST_string_t own_parent = ST_decl_parent_prefix(d->name);
+static void ST_declare_block_siblings(ST_sema_t *se, ST_decl_t *d) {
+    if (!d->fn.decl_block_id)
+        return;
     ST_forrange(0, se->prog->decls.count) {
         ST_decl_t *cand = se->prog->decls.items[i];
-        if (!cand || cand->kind != ST_DE_FN)
+        if (!cand || cand->kind != ST_DE_FN || cand == d)
             continue;
-        ST_string_t cand_parent = ST_decl_parent_prefix(cand->name);
-        b8 is_child = ST_string_eq(cand_parent, as_parent);
-        b8 is_sibling_or_self = ST_string_eq(cand_parent, own_parent);
-        if (!is_child && !is_sibling_or_self)
+        if (cand->fn.decl_block_id != d->fn.decl_block_id)
             continue;
-        ST_string_t bare = ST_decl_display_name(cand);
-        if (ST_string_eq(bare, cand->name))
-            continue;
-        if (ST_sym_find_in(&se->scope->table, bare))
-            continue;
-        ST_sym_t *gsym = ST_sym_find_in(&se->globals, cand->name);
-        if (!gsym)
-            continue;
-        ST_sym_insert(se, &se->scope->table,
-                      ST_sym_new(se, ST_SYM_FN, bare, cand, gsym->t, cand->line, cand->col));
+        ST_declare_nested_fn_sym(se, cand);
     }
 }
 
@@ -4364,7 +4394,6 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     if (!d->fn.is_prototype) {
         ST_collect_labels(se, &labels, &d->fn.body);
         ST_check_infinite_goto_loops(se, &d->fn.body);
-        ST_apply_nested_fn_renames(se, d);
     }
 
     b8 save_has_pack = se->has_pack;
@@ -4394,7 +4423,9 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
         ST_pack_substitute_body(se, &d->fn.body);
 
     ST_scope_push(se);
-    ST_declare_visible_nested_fns(se, d);
+    ST_declare_self_recursive(se, d);
+    ST_declare_block_siblings(se, d);
+    ST_prescan_nested_fns(se, &d->fn.body);
     ST_forrange(0, sig->params.count) {
         ST_param_t *p = &sig->params.items[i];
         ST_ty_t *pt = fnty && i < fnty->params.count ? fnty->params.items[i] : NULL;
@@ -4513,6 +4544,7 @@ static void ST_default_stmt(ST_sema_t *se, ST_stmt_t *s) {
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
         case ST_ST_ASM:
+        case ST_ST_NESTED_FN:
             break;
         case ST_ST_COUNT:
             ST_assert(0);
@@ -4732,6 +4764,8 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
     ST_sema_check(se, prog);
     ST_sema_default_types(se, prog);
     ST_sema_check_main(se, prog);
-    ST_sema_run_comptime_blocks(se);
+
+    if (se->diag.n_errors == 0)
+        ST_sema_run_comptime_blocks(se);
     return se->diag.n_errors == 0;
 }

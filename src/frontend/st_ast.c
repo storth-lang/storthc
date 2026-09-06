@@ -376,6 +376,9 @@ void ST_dump_stmt(FILE *out, ST_stmt_t *s, u32 depth) {
         case ST_ST_ASM:
             fprintf(out, "asm (%u tokens)\n", s->asm_.n_tokens);
             break;
+        case ST_ST_NESTED_FN:
+            fprintf(out, "nested_fn " ST_sv_fmt "\n", ST_sv_args(s->nested_fn->name));
+            break;
         case ST_ST_COUNT:
             ST_assert(0);
             break;

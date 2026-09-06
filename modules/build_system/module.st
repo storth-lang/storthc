@@ -1,7 +1,3 @@
-#import "os";
-#import "io";
-#import "process";
-
 enum_flag Build_Type{
     EXE;
     OBJ;
@@ -23,3 +19,9 @@ pub fn build(main:string,output:string,type:Build_Type=Build_Type.EXE)->bool{
     proc, so :=runCommandProcess(cms,true,true);
     return (proc.exitCode==0);
 }
+
+pub fn setTargetBuild() ->
+
+#import "os";
+#import "io";
+#import "process";

@@ -195,6 +195,10 @@ typedef enum {
                          // function's locals), then discarded -- see ST_check_comptime_block
                          // in st_semantic.c
     ST_ST_PACK_EXPAND,
+    ST_ST_NESTED_FN, // marks the exact point inside a block where a nested 'fn' was
+                     // written; the fn itself is hoisted out into the program's own
+                     // decl list (see ST_parse_body), so this is just a scoping marker
+                     // that makes it visible to ST_check_stmt exactly where it belongs
     ST_ST_COUNT,
 } ST_stmt_kind_t;
 
@@ -220,6 +224,7 @@ struct ST_stmt_t {
             ST_expr_t *init;
             b8 is_static;
             b8 is_const;
+            b8 is_comptime; // 'name :: #comptime expr;'
         } decl;
         struct {
             ST_expr_t *lhs;
@@ -260,6 +265,7 @@ struct ST_stmt_t {
             ST_string_t spec_iter; // optional second binding, len==0 if unused (see '#for' parsing)
             ST_expr_t *target;
             b8 is_comptime; // '#for ch[, spec]: string_expr'
+            b8 deref_iter;
             ST_stmts_t body;
         } for_array;
         struct {
@@ -271,6 +277,7 @@ struct ST_stmt_t {
         } asm_;
         ST_stmts_t block;
         ST_stmt_t *defer_stmt;
+        ST_decl_t *nested_fn; // payload for ST_ST_NESTED_FN
         ST_string_t label;
     };
 };
@@ -398,6 +405,11 @@ struct ST_decl_t {
             b8 has_call_site;
             ST_string_t call_file;
             u32 call_line, call_col;
+            u32 decl_block_id; // >0 for a nested 'fn' declared inside another function's
+                              // body: the id of the exact block (ST_parser_t.next_block_id)
+                              // it was written in. Used to scope its visibility and to
+                              // find its same-block siblings (ST_declare_block_siblings).
+                              // 0 for an ordinary top-level function.
         } fn;
         struct {
             ST_string_t module_name; // directory name under modules/

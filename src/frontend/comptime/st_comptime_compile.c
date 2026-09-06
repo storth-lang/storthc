@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define ST_CT_MAX_CALL_PARAMS 256
+
 static b8 ST_ct_expr_has_asm(ST_expr_t *e) {
     if (!e)
         return 0;
@@ -160,6 +162,11 @@ static b8 ST_ct_tyexpr_is_int_slice(ST_tyexpr_t *te, u32 *width, b8 *is_signed);
 static b8 ST_ct_ty_int_info(ST_ty_t *t, u32 *width, b8 *is_signed);
 static ST_string_t ST_ct_expr_struct_type(ST_ct_compiler_t *cc, ST_expr_t *e);
 static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call_expr);
+static b8 ST_ct_resolve_call_args(ST_ct_compiler_t *cc, ST_expr_t *call_expr,
+                                  ST_string_t callee_name, ST_string_t *param_names,
+                                  ST_expr_t **param_defaults, u32 n_params,
+                                  b8 allow_extra_positional, ST_expr_t **out_args,
+                                  ST_expr_t **out_extra, u32 *out_n_extra, u32 max_extra);
 static b8 ST_ct_struct_total_size(ST_ct_compiler_t *cc, ST_decl_t *sd, u32 *out_size);
 static b8 ST_ct_struct_field_offset(ST_ct_compiler_t *cc, ST_decl_t *sd, ST_string_t field_name,
                                     u32 *out_offset, ST_tyexpr_t **out_te);
@@ -184,6 +191,81 @@ static void ST_ct_cfail(ST_ct_compiler_t *cc, u32 line, u32 col, const char *fmt
     va_start(ap, fmt);
     vsnprintf(cc->err_msg, sizeof(cc->err_msg), fmt, ap);
     va_end(ap);
+}
+
+static b8 ST_ct_resolve_call_args(ST_ct_compiler_t *cc, ST_expr_t *call_expr,
+                                  ST_string_t callee_name, ST_string_t *param_names,
+                                  ST_expr_t **param_defaults, u32 n_params,
+                                  b8 allow_extra_positional, ST_expr_t **out_args,
+                                  ST_expr_t **out_extra, u32 *out_n_extra, u32 max_extra) {
+    ST_forrange(0, n_params) out_args[i] = NULL;
+    if (out_n_extra)
+        *out_n_extra = 0;
+
+    u32 pos = 0;
+    ST_forrange(0, call_expr->call.args.count) {
+        ST_arg_t *arg = &call_expr->call.args.items[i];
+        u32 idx;
+        if (arg->name.len) {
+            idx = n_params;
+            for (u32 k = 0; k < n_params; k++) {
+                if (ST_string_eq(param_names[k], arg->name)) {
+                    idx = k;
+                    break;
+                }
+            }
+            if (idx == n_params) {
+                ST_ct_cfail(cc, arg->value->line, arg->value->col,
+                            "comptime: '" ST_sv_fmt "' has no parameter named '" ST_sv_fmt "'",
+                            ST_sv_args(callee_name), ST_sv_args(arg->name));
+                return 0;
+            }
+        } else {
+            idx = pos++;
+        }
+
+        if (idx >= n_params) {
+            if (allow_extra_positional && !arg->name.len) {
+                if (!out_extra || *out_n_extra >= max_extra) {
+                    ST_ct_cfail(cc, arg->value->line, arg->value->col,
+                                "comptime: '" ST_sv_fmt "' has too many arguments for a "
+                                "#comptime call",
+                                ST_sv_args(callee_name));
+                    return 0;
+                }
+                out_extra[(*out_n_extra)++] = arg->value;
+                continue;
+            }
+            ST_ct_cfail(cc, arg->value->line, arg->value->col,
+                        "comptime: '" ST_sv_fmt "' expects at most %u argument%s, got %u",
+                        ST_sv_args(callee_name), n_params, n_params == 1 ? "" : "s",
+                        call_expr->call.args.count);
+            return 0;
+        }
+
+        if (out_args[idx]) {
+            ST_ct_cfail(cc, arg->value->line, arg->value->col,
+                        "comptime: argument '" ST_sv_fmt "' given more than once in this call "
+                        "to '" ST_sv_fmt "'",
+                        ST_sv_args(param_names[idx]), ST_sv_args(callee_name));
+            return 0;
+        }
+        out_args[idx] = arg->value;
+    }
+
+    ST_forrange(0, n_params) {
+        if (out_args[i])
+            continue;
+        out_args[i] = param_defaults ? param_defaults[i] : NULL;
+        if (!out_args[i]) {
+            ST_ct_cfail(cc, call_expr->line, call_expr->col,
+                        "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it has "
+                        "no default value)",
+                        ST_sv_args(callee_name), ST_sv_args(param_names[i]));
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static i32 ST_ct_find_local(ST_ct_compiler_t *cc, ST_string_t name) {
@@ -841,28 +923,33 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                 return;
             }
             ST_string_t callee_name = e->call.callee->name;
-            ST_forrange(0, e->call.args.count) {
-                if (e->call.args.items[i].name.len) {
-                    ST_ct_cfail(cc, e->line, e->col,
-                                "comptime: named arguments aren't supported in a #comptime call "
-                                "yet");
-                    return;
-                }
-            }
 
             ST_decl_t *extern_decl = ST_ct_prog_find_extern(cc->prog_ctx, callee_name);
             if (extern_decl) {
                 u32 n_named = extern_decl->extern_fn.sig.params.count;
                 b8 is_variadic = extern_decl->extern_fn.sig.is_variadic;
-                if (!is_variadic && e->call.args.count > n_named) {
+                if (n_named > ST_CT_MAX_CALL_PARAMS) {
                     ST_ct_cfail(cc, e->line, e->col,
-                                "comptime: '" ST_sv_fmt "' expects at most %u argument%s, "
-                                "got %u",
-                                ST_sv_args(callee_name), n_named, n_named == 1 ? "" : "s",
-                                e->call.args.count);
+                                "comptime: '" ST_sv_fmt "' has too many parameters for a "
+                                "#comptime call (max %u)",
+                                ST_sv_args(callee_name), ST_CT_MAX_CALL_PARAMS);
                     return;
                 }
-                u32 n_args = e->call.args.count > n_named ? e->call.args.count : n_named;
+                ST_string_t param_names[ST_CT_MAX_CALL_PARAMS];
+                ST_expr_t *param_defaults[ST_CT_MAX_CALL_PARAMS];
+                ST_forrange(0, n_named) {
+                    param_names[i] = extern_decl->extern_fn.sig.params.items[i].name;
+                    param_defaults[i] = extern_decl->extern_fn.sig.params.items[i].def;
+                }
+                ST_expr_t *fixed_args[ST_CT_MAX_CALL_PARAMS];
+                ST_expr_t *extra_args[ST_CT_MAX_CALL_PARAMS];
+                u32 n_extra = 0;
+                if (!ST_ct_resolve_call_args(cc, e, callee_name, param_names, param_defaults,
+                                             n_named, is_variadic, fixed_args, extra_args,
+                                             &n_extra, ST_CT_MAX_CALL_PARAMS))
+                    return;
+
+                u32 n_args = n_named + n_extra;
                 if (n_args > 8) {
                     ST_ct_cfail(cc, e->line, e->col,
                                 "comptime: '" ST_sv_fmt "' has too many arguments for a "
@@ -871,20 +958,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                     return;
                 }
                 ST_forrange(0, n_args) {
-                    ST_expr_t *arg;
-                    if (i < e->call.args.count) {
-                        arg = e->call.args.items[i].value;
-                    } else {
-                        arg = extern_decl->extern_fn.sig.params.items[i].def;
-                        if (!arg) {
-                            ST_ct_cfail(cc, e->line, e->col,
-                                        "comptime: '" ST_sv_fmt "' is missing argument '"
-                                        ST_sv_fmt "' (it has no default value)",
-                                        ST_sv_args(callee_name),
-                                        ST_sv_args(extern_decl->extern_fn.sig.params.items[i].name));
-                            return;
-                        }
-                    }
+                    ST_expr_t *arg = i < n_named ? fixed_args[i] : extra_args[i - n_named];
                     ST_string_t struct_type = ST_ct_expr_struct_type(cc, arg);
                     ST_ct_compile_expr(cc, arg);
                     if (cc->failed)
@@ -976,29 +1050,27 @@ static ST_decl_t *ST_ct_compile_native_call(ST_ct_compiler_t *cc, ST_expr_t *cal
     }
 
     u32 n_params = callee_decl->fn.sig.params.count;
-    if (call_expr->call.args.count > n_params) {
+    if (n_params > ST_CT_MAX_CALL_PARAMS) {
         ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                    "comptime: '" ST_sv_fmt "' expects at most %u argument%s, got %u",
-                    ST_sv_args(callee_name), n_params, n_params == 1 ? "" : "s",
-                    call_expr->call.args.count);
+                    "comptime: '" ST_sv_fmt "' has too many parameters for a #comptime call "
+                    "(max %u)",
+                    ST_sv_args(callee_name), ST_CT_MAX_CALL_PARAMS);
         return NULL;
     }
+    ST_string_t param_names[ST_CT_MAX_CALL_PARAMS];
+    ST_expr_t *param_defaults[ST_CT_MAX_CALL_PARAMS];
+    ST_forrange(0, n_params) {
+        param_names[i] = callee_decl->fn.sig.params.items[i].name;
+        param_defaults[i] = callee_decl->fn.sig.params.items[i].def;
+    }
+    ST_expr_t *resolved_args[ST_CT_MAX_CALL_PARAMS];
+    if (!ST_ct_resolve_call_args(cc, call_expr, callee_name, param_names, param_defaults,
+                                 n_params, 0, resolved_args, NULL, NULL, 0))
+        return NULL;
 
     u32 arity = 0;
     ST_forrange(0, n_params) {
-        ST_expr_t *arg;
-        if (i < call_expr->call.args.count) {
-            arg = call_expr->call.args.items[i].value;
-        } else {
-            arg = callee_decl->fn.sig.params.items[i].def;
-            if (!arg) {
-                ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                            "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it "
-                            "has no default value)",
-                            ST_sv_args(callee_name), ST_sv_args(callee_decl->fn.sig.params.items[i].name));
-                return NULL;
-            }
-        }
+        ST_expr_t *arg = resolved_args[i];
 
         // A real (asm-backed) Storth function follows Storth's own ABI, not C's:
         // a 'string' is two eightbyte registers (ptr, len), and so is a
@@ -1395,13 +1467,6 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
         return NULL;
     }
     ST_string_t callee_name = call_expr->call.callee->name;
-    ST_forrange(0, call_expr->call.args.count) {
-        if (call_expr->call.args.items[i].name.len) {
-            ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                        "comptime: named arguments aren't supported in a #comptime call yet");
-            return NULL;
-        }
-    }
 
     b8 not_callable = 0;
     ST_decl_t *callee_decl = ST_ct_prog_find_decl(cc->prog_ctx, callee_name, &not_callable);
@@ -1422,35 +1487,27 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
         return ST_ct_compile_native_call(cc, call_expr, callee_decl);
 
     u32 n_params = callee_decl->fn.sig.params.count;
-    if (call_expr->call.args.count > n_params) {
-        ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                    "comptime: '" ST_sv_fmt "' expects at most %u argument%s, got %u",
-                    ST_sv_args(callee_name), n_params, n_params == 1 ? "" : "s",
-                    call_expr->call.args.count);
-        return NULL;
-    }
-
-    if (n_params > 64) {
+    if (n_params > ST_CT_MAX_CALL_PARAMS) {
         ST_ct_cfail(cc, call_expr->line, call_expr->col,
                     "comptime: '" ST_sv_fmt "' has too many parameters for a #comptime call "
-                    "(max 64)", ST_sv_args(callee_name));
+                    "(max %u)",
+                    ST_sv_args(callee_name), ST_CT_MAX_CALL_PARAMS);
         return NULL;
     }
+    ST_string_t param_names[ST_CT_MAX_CALL_PARAMS];
+    ST_expr_t *param_defaults[ST_CT_MAX_CALL_PARAMS];
+    ST_forrange(0, n_params) {
+        param_names[i] = callee_decl->fn.sig.params.items[i].name;
+        param_defaults[i] = callee_decl->fn.sig.params.items[i].def;
+    }
+    ST_expr_t *resolved_args[ST_CT_MAX_CALL_PARAMS];
+    if (!ST_ct_resolve_call_args(cc, call_expr, callee_name, param_names, param_defaults,
+                                 n_params, 0, resolved_args, NULL, NULL, 0))
+        return NULL;
+
     u32 arity = 0;
     ST_forrange(0, n_params) {
-        ST_expr_t *arg;
-        if (i < call_expr->call.args.count) {
-            arg = call_expr->call.args.items[i].value;
-        } else {
-            arg = callee_decl->fn.sig.params.items[i].def;
-            if (!arg) {
-                ST_ct_cfail(cc, call_expr->line, call_expr->col,
-                            "comptime: '" ST_sv_fmt "' is missing argument '" ST_sv_fmt "' (it "
-                            "has no default value)",
-                            ST_sv_args(callee_name), ST_sv_args(callee_decl->fn.sig.params.items[i].name));
-                return NULL;
-            }
-        }
+        ST_expr_t *arg = resolved_args[i];
         ST_tyexpr_t *pte = callee_decl->fn.sig.params.items[i].te;
         ST_string_t param_struct_type = (ST_string_t){0};
         if (pte && pte->kind == ST_TE_NAME && ST_ct_prog_find_struct(cc->prog_ctx, pte->name))
@@ -1503,15 +1560,47 @@ static ST_decl_t *ST_ct_compile_plain_call(ST_ct_compiler_t *cc, ST_expr_t *call
 // Statements
 static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s);
 
+// Emits the deferred statements registered in defer scopes
+// [from_scope, cc->n_defer_scopes), most-recently-registered first: walks
+// scopes from innermost down to (and including) 'from_scope', and within
+// each scope runs its own statements in reverse declaration order.
+static void ST_ct_emit_defers_from(ST_ct_compiler_t *cc, u32 from_scope) {
+    for (u32 sc = cc->n_defer_scopes; sc > from_scope; sc--) {
+        ST_ct_defer_scope_t *ds = &cc->defer_scopes[sc - 1];
+        for (u32 k = ds->count; k > 0; k--) {
+            if (cc->failed)
+                return;
+            ST_ct_compile_stmt(cc, ds->items[k - 1]);
+        }
+    }
+}
+
 // Compiles a body as its own lexical scope: locals declared inside are
 // unreachable (and their stack slots reclaimed) once the body ends, same
 // discipline a real stack-slot compiler uses for block scope.
 static void ST_ct_compile_scoped(ST_ct_compiler_t *cc, ST_stmts_t *body) {
     u32 saved = cc->n_locals;
+
+    b8 pushed_defer_scope = cc->n_defer_scopes < ST_array_len(cc->defer_scopes);
+    if (pushed_defer_scope) {
+        cc->defer_scopes[cc->n_defer_scopes].count = 0;
+        cc->n_defer_scopes++;
+    } else {
+        ST_ct_cfail(cc, 0, 0, "comptime: scopes nested too deeply in a #comptime scope "
+                              "(defer bookkeeping)");
+    }
+
     ST_forrange(0, body->count) {
-        if (cc->failed) return;
+        if (cc->failed) break;
         ST_ct_compile_stmt(cc, body->items[i]);
     }
+
+    if (pushed_defer_scope) {
+        if (!cc->failed)
+            ST_ct_emit_defers_from(cc, cc->n_defer_scopes - 1);
+        cc->n_defer_scopes--;
+    }
+
     u32 introduced = cc->n_locals - saved;
     ST_forrange(0, introduced) ST_ct_emit_op(cc->chunk, ST_OP_POP, 0);
     cc->n_locals = saved;
@@ -1836,6 +1925,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             loop->n_break_patches = 0;
             loop->n_continue_patches = 0;
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
 
             ST_ct_compile_scoped(cc, &s->while_.body);
 
@@ -1882,6 +1972,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             loop->n_break_patches = 0;
             loop->n_continue_patches = 0;
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
 
             ST_ct_compile_scoped(cc, &s->for_range.body);
 
@@ -1982,6 +2073,7 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             }
 
             loop->body_start_locals = cc->n_locals;
+            loop->body_start_defer_scopes = cc->n_defer_scopes;
             ST_ct_compile_scoped(cc, &s->for_array.body);
 
             if (!cc->failed) {
@@ -2015,8 +2107,26 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
             ST_ct_compile_scoped(cc, &s->block);
             return;
 
+        case ST_ST_DEFER: {
+            if (cc->n_defer_scopes == 0) {
+                ST_ct_cfail(cc, s->line, s->col, "comptime: internal: 'defer' outside of any scope");
+                return;
+            }
+            ST_ct_defer_scope_t *ds = &cc->defer_scopes[cc->n_defer_scopes - 1];
+            if (ds->count >= ST_array_len(ds->items)) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: too many 'defer's in one #comptime scope");
+                return;
+            }
+            ds->items[ds->count++] = s->defer_stmt;
+            return;
+        }
+
         case ST_ST_RETURN: {
             if (s->ret.values.count == 0) {
+                ST_ct_emit_defers_from(cc, 0);
+                if (cc->failed)
+                    return;
                 ST_ct_emit_op(cc->chunk, ST_OP_HALT, s->line);
                 return;
             }
@@ -2041,6 +2151,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                         return;
                 }
             }
+            ST_ct_emit_defers_from(cc, 0);
+            if (cc->failed)
+                return;
             ST_ct_emit_op_u32(cc->chunk, ST_OP_RETURN, s->ret.values.count, s->line);
             return;
         }
@@ -2110,6 +2223,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 ST_ct_cfail(cc, s->line, s->col, "comptime: too many 'break's in one loop");
                 return;
             }
+            ST_ct_emit_defers_from(cc, loop->body_start_defer_scopes);
+            if (cc->failed)
+                return;
             ST_forrange(loop->body_start_locals, cc->n_locals)
                 ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
             loop->break_patches[loop->n_break_patches++] =
@@ -2127,6 +2243,9 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                 ST_ct_cfail(cc, s->line, s->col, "comptime: too many 'continue's in one loop");
                 return;
             }
+            ST_ct_emit_defers_from(cc, loop->body_start_defer_scopes);
+            if (cc->failed)
+                return;
             ST_forrange(loop->body_start_locals, cc->n_locals)
                 ST_ct_emit_op(cc->chunk, ST_OP_POP, s->line);
             loop->continue_patches[loop->n_continue_patches++] =
@@ -2192,11 +2311,17 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
 	    return;
 	}
 
+        case ST_ST_NESTED_FN:
+            // The fn itself gets compiled on demand, via the worklist, the first
+            // time something actually calls it (see ST_ct_prog_find_fn) -- nothing
+            // to emit at its declaration point.
+            return;
+
         default: {
             static const char *kind_names[] = {
-                "expr", "decl", "assign", "multi_bind", "if", "while", "for_range",
+                "expr", "decl", "assign", "multi_bind", "if", "switch", "while", "for_range",
                 "for_array", "return", "block", "defer", "break", "continue", "label",
-                "godown", "asm", "comptime_block", "pack_expand",
+                "godown", "asm", "comptime_block", "pack_expand", "nested_fn",
             };
             const char *nm = (s->kind >= 0 &&
                               (u32)s->kind < sizeof(kind_names) / sizeof(kind_names[0]))
