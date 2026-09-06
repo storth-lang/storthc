@@ -384,7 +384,8 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_
     return inst;
 }
 
-ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, u32 line, u32 col) {
+ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, ST_string_t name, u32 line,
+                          u32 col) {
     ST_assert(fn->entry != NULL);
     ST_ir_inst_t *inst = ST_ir_emit(fn->entry, ST_IR_ALLOCA, ST_ty_ptr(ctx, p), line, col);
     u32 size = p->size;
@@ -394,6 +395,7 @@ ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, u32 lin
         size = (size + 7u) & ~7u;
     inst->alloca_.size = size;
     inst->alloca_.align = p->align;
+    inst->alloca_.name = name;
     return inst;
 }
 

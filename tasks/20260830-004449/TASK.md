@@ -1,14 +1,9 @@
-# Const_fold_for_::_
+# Const fold for ::
 
-- ID: 20260830-004449
 
-## PRIORITY: 100
-
-## STATUS: OPEN
-
-## TAGS: semantic, parser
-
-## NOTES:
+- PRIORITY: 100
+- STATUS: OPEN
+- TAGS: semantic, parser
 
 ```rs
 pub fn main() -> i32 {

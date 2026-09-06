@@ -64,6 +64,232 @@ u32 ST_dbg_add_row(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t label, u3
     return info->n_rows++;
 }
 
+static void ST_dbg_vars_reserve(ST_arena_t *arena, ST_dbg_fn_t *fn) {
+    if (fn->n_vars < fn->vars_cap)
+        return;
+    u32 new_cap = fn->vars_cap ? fn->vars_cap * 2 : 8;
+    ST_dbg_var_t *new_vars = ST_arena_push(arena, sizeof(*new_vars) * new_cap);
+    if (fn->n_vars)
+        memcpy(new_vars, fn->vars, sizeof(*new_vars) * fn->n_vars);
+    fn->vars = new_vars;
+    fn->vars_cap = new_cap;
+}
+
+void ST_dbg_add_var(ST_arena_t *arena, ST_dbg_info_t *info, u32 fn_idx, ST_string_t name,
+                    ST_ty_t *ty, i32 frame_off, b8 is_param) {
+    if (fn_idx >= info->n_fns || !name.len)
+        return;
+    ST_dbg_fn_t *fn = &info->fns[fn_idx];
+    ST_dbg_vars_reserve(arena, fn);
+    fn->vars[fn->n_vars].name = name;
+    fn->vars[fn->n_vars].ty = ty;
+    fn->vars[fn->n_vars].frame_off = frame_off;
+    fn->vars[fn->n_vars].is_param = is_param;
+    fn->n_vars++;
+}
+
+#define ST_DBG_MAX_TYS 256
+
+typedef struct {
+    ST_ty_t *items[ST_DBG_MAX_TYS];
+    u32 count;
+} ST_dbg_tys_t;
+
+static u32 ST_dbg_ty_lookup(ST_dbg_tys_t *tys, ST_ty_t *ty) {
+    for (u32 i = 0; i < tys->count; i++)
+        if (tys->items[i] == ty)
+            return i;
+    return (u32)-1;
+}
+
+static u32 ST_dbg_collect_ty(ST_dbg_tys_t *tys, ST_ty_t *ty) {
+    if (!ty || tys->count >= ST_DBG_MAX_TYS)
+        return (u32)-1;
+    u32 existing = ST_dbg_ty_lookup(tys, ty);
+    if (existing != (u32)-1)
+        return existing;
+
+    u32 idx = tys->count++;
+    tys->items[idx] = ty;
+
+    if (ty->kind == ST_TY_PTR) {
+        ST_dbg_collect_ty(tys, ty->inner);
+    } else if (ty->kind == ST_TY_STRUCT) {
+        for (u32 i = 0; i < ty->fields.count; i++)
+            ST_dbg_collect_ty(tys, ty->fields.items[i].ty);
+    } else if (ty->kind == ST_TY_SLICE || ty->kind == ST_TY_DYN_ARRAY) {
+        ST_dbg_collect_ty(tys, ty->inner);
+    }
+
+    return idx;
+}
+
+static void ST_dwarf_emit_shared_tys(FILE *out) {
+    fputs("Ldbgty_u8:\n", out);
+    fputs("    db 0x03\n", out);
+    fputs("    db \"u8\", 0\n", out);
+    fputs("    db 0x07\n", out);
+    fputs("    db 1\n", out);
+
+    fputs("Ldbgty_u8ptr:\n", out);
+    fputs("    db 0x04\n", out);
+    fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+    fputs("    db 8\n", out);
+
+    fputs("Ldbgty_len64:\n", out);
+    fputs("    db 0x03\n", out);
+    fputs("    db \"u64\", 0\n", out);
+    fputs("    db 0x07\n", out);
+    fputs("    db 8\n", out);
+}
+
+static void ST_dwarf_emit_slice_like(FILE *out, ST_dbg_tys_t *tys, u32 idx, ST_ty_t *inner) {
+    u32 inner_idx = inner ? ST_dbg_ty_lookup(tys, inner) : (u32)-1;
+    fprintf(out, "Ldbgty_%u_p:\n", idx);
+    fputs("    db 0x04\n", out);
+    if (inner_idx != (u32)-1)
+        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", inner_idx);
+    else
+        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+    fputs("    db 8\n", out);
+
+    fprintf(out, "Ldbgty_%u:\n", idx);
+    fputs("    db 0x05\n", out);
+    fputs("    dd 16\n", out);
+    fputs("    db 0x06\n", out);
+    fputs("    db \"data\", 0\n", out);
+    fprintf(out, "    dd Ldbgty_%u_p - Ldbg_info\n", idx);
+    fputs("    dd 0\n", out);
+    fputs("    db 0x06\n", out);
+    fputs("    db \"len\", 0\n", out);
+    fputs("    dd Ldbgty_len64 - Ldbg_info\n", out);
+    fputs("    dd 8\n", out);
+    fputs("    db 0x00\n", out);
+}
+
+static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
+    ST_dwarf_emit_shared_tys(out);
+
+    for (u32 i = 0; i < tys->count; i++) {
+        ST_ty_t *ty = tys->items[i];
+        switch (ty->kind) {
+            case ST_TY_BOOL:
+            case ST_TY_CHAR:
+            case ST_TY_FLOAT:
+            case ST_TY_INT: {
+                char name[16];
+                u32 sz = ty->size ? ty->size : (ty->kind == ST_TY_FLOAT ? 8u : 4u);
+                u8 enc;
+                if (ty->kind == ST_TY_BOOL) {
+                    snprintf(name, sizeof(name), "bool");
+                    enc = 2;
+                } else if (ty->kind == ST_TY_CHAR) {
+                    snprintf(name, sizeof(name), "char");
+                    enc = 8;
+                } else if (ty->kind == ST_TY_FLOAT) {
+                    snprintf(name, sizeof(name), "f%u", sz * 8);
+                    enc = 4;
+                } else {
+                    snprintf(name, sizeof(name), "%c%u", ty->is_signed ? 'i' : 'u', sz * 8);
+                    enc = ty->is_signed ? 5 : 7;
+                }
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x03\n", out);
+                fprintf(out, "    db \"%s\", 0\n", name);
+                fprintf(out, "    db %u\n", enc);
+                fprintf(out, "    db %u\n", sz);
+            } break;
+            case ST_TY_PTR: {
+                u32 inner_idx = ty->inner ? ST_dbg_ty_lookup(tys, ty->inner) : (u32)-1;
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x04\n", out);
+                if (inner_idx != (u32)-1)
+                    fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", inner_idx);
+                else
+                    fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+                fputs("    db 8\n", out);
+            } break;
+            case ST_TY_STRUCT: {
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x05\n", out);
+                fprintf(out, "    dd %u\n", ty->size);
+                for (u32 fi = 0; fi < ty->fields.count; fi++) {
+                    ST_ty_field_t *f = &ty->fields.items[fi];
+                    u32 fidx = ST_dbg_ty_lookup(tys, f->ty);
+                    fputs("    db 0x06\n", out);
+                    fprintf(out, "    db \"%.*s\", 0\n", (int)f->name.len, f->name.data);
+                    if (fidx != (u32)-1)
+                        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", fidx);
+                    else
+                        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+                    fprintf(out, "    dd %u\n", f->offset);
+                }
+                fputs("    db 0x00\n", out);
+            } break;
+            case ST_TY_SLICE:
+            case ST_TY_DYN_ARRAY: {
+                ST_dwarf_emit_slice_like(out, tys, i, ty->inner);
+            } break;
+            case ST_TY_STRING: {
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x05\n", out);
+                fputs("    dd 16\n", out);
+                fputs("    db 0x06\n", out);
+                fputs("    db \"data\", 0\n", out);
+                fputs("    dd Ldbgty_u8ptr - Ldbg_info\n", out);
+                fputs("    dd 0\n", out);
+                fputs("    db 0x06\n", out);
+                fputs("    db \"len\", 0\n", out);
+                fputs("    dd Ldbgty_len64 - Ldbg_info\n", out);
+                fputs("    dd 8\n", out);
+                fputs("    db 0x00\n", out);
+            } break;
+            default: {
+                u32 sz = ty->size ? ty->size : 8;
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x03\n", out);
+                fputs("    db \"?\", 0\n", out);
+                fputs("    db 0x07\n", out);
+                fprintf(out, "    db %u\n", sz);
+            } break;
+        }
+    }
+}
+
+static void ST_dwarf_write_sleb128(FILE *out, i64 v);
+
+static u32 ST_sleb128_len(i64 v) {
+    u32 n = 0;
+    b8 more = 1;
+    while (more) {
+        u8 b = (u8)(v & 0x7f);
+        v >>= 7;
+        b8 sign_bit_set = (b & 0x40) != 0;
+        if ((v == 0 && !sign_bit_set) || (v == -1 && sign_bit_set))
+            more = 0;
+        n++;
+    }
+    return n;
+}
+
+static void ST_dwarf_write_fbreg_loc(FILE *out, i32 offset) {
+    u32 len = 1 + ST_sleb128_len((i64)offset);
+    fprintf(out, "    db %u\n", len);
+    fputs("    db 0x91\n", out);
+    ST_dwarf_write_sleb128(out, (i64)offset);
+}
+
+static void ST_dwarf_emit_var_die(FILE *out, ST_dbg_tys_t *tys, ST_dbg_var_t *v) {
+    fprintf(out, "    db 0x%02x\n", v->is_param ? 0x07 : 0x08);
+    fprintf(out, "    db \"%.*s\", 0\n", (int)v->name.len, v->name.data);
+    u32 idx = ST_dbg_ty_lookup(tys, v->ty);
+    if (idx != (u32)-1)
+        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", idx);
+    else
+        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+    ST_dwarf_write_fbreg_loc(out, v->frame_off);
+}
+
 u32 ST_dbg_intern_file(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t file) {
     for (u32 i = 0; i < info->n_files; i++)
         if (ST_string_eq(info->files[i], file))
@@ -110,6 +336,10 @@ static void ST_dwarf_write_sleb128(FILE *out, i64 v) {
     fputc('\n', out);
 }
 
+static b8 ST_path_is_absolute(ST_string_t s) {
+    return s.len > 0 && s.data[0] == '/';
+}
+
 static void ST_dwarf_write_str_label(FILE *out, ST_string_t s) {
 
     fputs("    db ", out);
@@ -145,6 +375,33 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     fputs("    db 0x3a, 0x0b\n", out);
     fputs("    db 0x3b, 0x06\n", out);
     fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x03, 0x24, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x3e, 0x0b\n", out);
+    fputs("    db 0x0b, 0x0b\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x04, 0x0f, 0x00\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x0b, 0x0b\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x05, 0x13, 0x01\n", out);
+    fputs("    db 0x0b, 0x06\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x06, 0x0d, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x38, 0x06\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x07, 0x05, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x02, 0x0a\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x08, 0x34, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x02, 0x0a\n", out);
+    fputs("    db 0x00, 0x00\n", out);
     fputs("    db 0x00\n", out);
     fputc('\n', out);
 
@@ -172,6 +429,12 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     }
     fputs("    dd 0\n", out);
 
+    ST_dbg_tys_t tys = {0};
+    for (u32 fi = 0; fi < info->n_fns; fi++)
+        for (u32 vi = 0; vi < info->fns[fi].n_vars; vi++)
+            ST_dbg_collect_ty(&tys, info->fns[fi].vars[vi].ty);
+    ST_dwarf_emit_types(out, &tys);
+
     for (u32 i = 0; i < info->n_fns; i++) {
         ST_dbg_fn_t *f = &info->fns[i];
         fputs("    db 0x02\n", out);
@@ -182,6 +445,8 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
         fputs("    db 0x01\n", out);
         fprintf(out, "    db %u\n", f->decl_file_idx);
         fprintf(out, "    dd %u\n", f->decl_line);
+        for (u32 vi = 0; vi < f->n_vars; vi++)
+            ST_dwarf_emit_var_die(out, &tys, &f->vars[vi]);
         fputs("    db 0x00\n", out);
     }
     fputs("    db 0x00\n", out);
@@ -205,15 +470,16 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     fputs("    db 0,1,1,1,1,0,0,0,1,0,0,1\n", out);
     fputs("    db 1\n", out);
     fputs("    db 0x01, 0x08\n", out);
-    fputs("    db 1\n", out);
+    fputs("    db 2\n", out);
     fprintf(out, "    db \"%s\", 0\n", comp_dir);
+    fputs("    db 0\n", out);
     fputs("    db 2\n", out);
     fputs("    db 0x01, 0x08\n", out);
     fputs("    db 0x02, 0x0f\n", out);
     ST_dwarf_write_uleb128(out, info->n_files);
     for (u32 i = 0; i < info->n_files; i++) {
         ST_dwarf_write_str_label(out, info->files[i]);
-        fputs("    db 0\n", out);
+        fputs(ST_path_is_absolute(info->files[i]) ? "    db 1\n" : "    db 0\n", out);
     }
     fputs("Ldbg_line_prog:\n", out);
 

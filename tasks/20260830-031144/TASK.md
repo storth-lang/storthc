@@ -1,14 +1,8 @@
-# Double_passing_error
+# Double passing error
 
-- ID: 20260830-031144
-
-## PRIORITY: 100
-
-## STATUS: CLOSED
-
-## TAGS: error, build, parser
-
-## NOTES:
+-PRIORITY: 100
+-STATUS: CLOSED
+-TAGS: error, build, parser
 
 This error was found by CodeVoid basically double passing the array to the function errors with error code 127.
 

@@ -150,6 +150,7 @@ struct ST_ir_inst_t {
         struct {
             u32 size, align;
             u32 frame_off;
+            ST_string_t name;
         } alloca_;
         struct {
             ST_ir_inst_t *addr;
@@ -374,7 +375,8 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_
 
 // @note: ST_ir_alloca is for allocating some object in the ir. If we did 'x := 0' we
 // did allocate some memory for x we will use this function to allocate such addressses.
-ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, u32 line, u32 col);
+ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, ST_string_t name, u32 line,
+                          u32 col);
 
 // @note: ST_ir_load will load an address from that block if we obviously now
 // tried to access 'x := 0' with 'p := &x' we effectly will use ir_load to get

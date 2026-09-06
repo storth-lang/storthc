@@ -929,6 +929,13 @@ static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena,
                 ST_dbg_add_row(arena, dbg, qualified, dbg->fns[fn_idx].decl_file_idx, in->line,
                               in->col, fn_idx);
             }
+            if (dbg) {
+                if (in->kind == ST_IR_PARAM)
+                    ST_dbg_add_var(arena, dbg, fn_idx, in->params.name, in->ty, ST_slot(in), 1);
+                else if (in->kind == ST_IR_ALLOCA)
+                    ST_dbg_add_var(arena, dbg, fn_idx, in->alloca_.name, in->ty->inner,
+                                  -(i32)in->alloca_.frame_off, 0);
+            }
             ST_generate_inst(out, &ctx, in);
         }
         ST_generate_term(out, &ctx, b);

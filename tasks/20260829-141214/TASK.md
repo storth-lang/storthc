@@ -1,14 +1,8 @@
-# pointer_arithmetic_with_+=_not_supported
+# pointer arithmetic with += not supported
 
-- ID: 20260829-141214
-
-## PRIORITY: 30
-
-## STATUS: OPEN
-
-## TAGS: semantic
-
-## NOTES:
+-PRIORITY: 30
+-STATUS: OPEN
+-TAGS: semantic
 
 if we have an array and we want to increment the pointer by some value n.
 ```rs

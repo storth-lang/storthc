@@ -142,5 +142,29 @@ pub fn realloc(ptr: *void, new_size: i64) -> (*void, memoryError) {
 	return new_raw, memoryError.None;
 }
 
+fn memmove(dst: *u8, src: *u8, n: u64) -> *u8 {
+    if (dst as u64) == (src as u64) {
+        return dst;
+    }
+
+    if (src as u64) < (dst as u64) {
+        if (dst as u64) < (src as u64) + n {
+            i : u64 : n;
+            while i > 0 {
+                i = i - 1;
+                dst[i] = src[i];
+            }
+            return dst;
+        }
+    }
+
+    i : u64 : 0;
+    while i < n {
+        defer i += 1;
+        dst[i] = src[i];
+    }
+    return dst;
+}
+
 #import "error";
 #import "os";

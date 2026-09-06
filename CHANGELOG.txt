@@ -325,3 +325,11 @@ above and it's easy to lose track of:
 - Comptime has if switch statment and also not only that but also it now can do field access on
   arbitrary struct. Comptime has named parameter the previous bug of which we can not have as the
   address is not lowered.
+
+06:10:2026
+
+## Changes
+
+- The changes right now are simple we migrated to task directory to use tatr plus we just fixed a
+  couple of debug info errors however multireturning of floats is still broken and returning multiple
+  stuff with in a structure variant does not also work.
