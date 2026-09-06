@@ -1,6 +1,6 @@
 # float multireturn is broken
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
 - TAGS:
 

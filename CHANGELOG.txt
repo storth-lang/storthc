@@ -333,3 +333,6 @@ above and it's easy to lose track of:
 - The changes right now are simple we migrated to task directory to use tatr plus we just fixed a
   couple of debug info errors however multireturning of floats is still broken and returning multiple
   stuff with in a structure variant does not also work.
+
+- We had a bug of returning multiple floats from a function right now it works with 2 floats.
+  So if you have fn foo() -> (f32, f32) {} and bind it with x, y := foo(); it will work correctly.
