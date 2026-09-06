@@ -65,6 +65,8 @@ typedef enum {
     ST_OP_TRUE,
     ST_OP_FALSE,
     ST_OP_POP,
+    ST_OP_DUP,
+    ST_OP_NIP,
 
     ST_OP_ADD, ST_OP_SUB, ST_OP_MUL, ST_OP_DIV, ST_OP_MOD, ST_OP_NEG,
     ST_OP_EQ, ST_OP_NEQ, ST_OP_LT, ST_OP_LE, ST_OP_GT, ST_OP_GE,
@@ -92,6 +94,7 @@ typedef enum {
     ST_OP_LOAD_LIB,      // pop string path -> push ptr (dlopen handle); an empty string means
                          // dlopen(NULL)
     ST_OP_BIND_SYM,      // pop arity int, pop name string, pop handle ptr -> push native (or nil)
+    ST_OP_BIND_DATA_SYM,
     ST_OP_CALL_NATIVE,   // pop native fn; pop n_args values (arg0 pushed first) -> push i64
                          // result. Args are used as-is except ST_CT_STRING, which is rejected
     ST_OP_NATIVE_ARG,    // pop one value; if it's ST_CT_STRING, push a ST_CT_PTR to a fresh

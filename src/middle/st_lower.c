@@ -3528,7 +3528,15 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
             ST_lower_register_fn(&c, d->name, &d->fn.sig, d->is_pub, d->fn.is_prototype);
         else if (d->kind == ST_DE_EXTERN_FN)
             ST_lower_register_fn(&c, d->name, &d->extern_fn.sig, d->is_pub, 1);
-        else if (d->kind == ST_DE_GLOBAL) {
+        else if (d->kind == ST_DE_EXTERN_VAR) {
+            ST_sym_t *sym = ST_ht_get(&sema->globals, (ST_ht_generic_t){.tag = d->name.data,
+                                                                        .size = d->name.len})
+                                .tag;
+            ST_ty_t *ty = sym ? sym->t : NULL;
+            if (!ty)
+                continue;
+            ST_ir_module_add_extern_global(out, d->name, ty);
+        } else if (d->kind == ST_DE_GLOBAL) {
             ST_sym_t *sym = ST_ht_get(&sema->globals, (ST_ht_generic_t){.tag = d->name.data,
                                                                         .size = d->name.len})
                                 .tag;

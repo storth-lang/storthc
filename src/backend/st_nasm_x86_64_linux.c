@@ -174,8 +174,15 @@ static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
 static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
     if (!m->globals.count)
         return;
+    ST_forrange(0, m->globals.count) {
+        ST_ir_global_var_t *g = &m->globals.items[i];
+        if (g->is_extern)
+            fprintf(out, "extern " ST_sv_fmt "\n", ST_sv_args(g->name));
+    }
     b8 any_init = 0, any_uninit = 0;
     ST_forrange(0, m->globals.count) {
+        if (m->globals.items[i].is_extern)
+            continue;
         if (m->globals.items[i].has_init || m->globals.items[i].field_inits.count)
             any_init = 1;
         else
@@ -185,6 +192,8 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
         fprintf(out, "\nsection .data\n");
         ST_forrange(0, m->globals.count) {
             ST_ir_global_var_t *g = &m->globals.items[i];
+            if (g->is_extern)
+                continue;
             if (!g->has_init && !g->field_inits.count)
                 continue;
             u32 align = g->ty && g->ty->align ? g->ty->align : 8;
@@ -204,6 +213,8 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
         fprintf(out, "\nsection .bss\n");
         ST_forrange(0, m->globals.count) {
             ST_ir_global_var_t *g = &m->globals.items[i];
+            if (g->is_extern)
+                continue;
             if (g->has_init || g->field_inits.count)
                 continue;
             u32 size = g->ty && g->ty->size ? g->ty->size : 8;

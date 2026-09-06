@@ -12,7 +12,7 @@
 - [ ] Add support for wasm.
 - [ ] Libclang parsing should only be added as a compiler module. Hard depending on build time is stupid.
 - [ ] Majority of the directives feature do not work yet. We will add support for each one.
-- [ ] Make the comptime block interpreterd and also uses byte code.
+- [x] Make the comptime block interpreterd and also uses byte code.
 - [x] Type_info to do of any type should work with generic functions as if I call a function I pass it
       type info the fn is generic it should not fail.
 - [ ] Make a menu config like linux kernel to customize the following.
@@ -21,7 +21,7 @@
     - [x] Swap out the assembler(thinking to use fasm).
     - [x] Debug or Release build.
     - [ ] Option to show or not show the time to do each phase.
-    - [ ] Module path(defalt $HOME/.local/storthc/module for local and /usr/local/storthc/module for global)
+    - [x] Module path(defalt $HOME/.local/storthc/module for local and /usr/local/storthc/module for global)
     - [ ] Default linker(ld by default).
 - [ ] Address sanitizer this though should be disable able as a compiler flag.
 - [x] CFFI should support floats obviously.
@@ -63,7 +63,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 # Backend
 
 - [ ] Do I keep the retarded float 80 from C(TBD)?
-- [ ] Add support for gas-aarch64 with as.
+- [?] Add support for gas-aarch64 with as.
 - [ ] Add support for windows with nasm.
 - [x] Write debug symbols via dwarf 5 specification
 - [x] x86_64 linux backend should not use any libc in asm raw syscalls.
@@ -95,7 +95,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
   xs : []i32 = { 33, 44, 77 }; // Such code should be valid.
   ```
 
-- [ ] Implement type system of standard-ml(moscow ml: https://mosml.org/). Meaning as if var declaration can not
+- [x] Implement type system of standard-ml(moscow ml: https://mosml.org/). Meaning as if var declaration can not
   just take offset with implicit conversion of the same family class. This is for type saftey instead of always casting
   stuff and changing how they are loaded into register.
 
@@ -137,7 +137,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 
 # Address sanitizer.
 
-- [ ] Have a profiler. I do not know how to build such profiler [google](https://github.com/google/sanitizers/wiki/AddressSanitizerHowToBuild).
+- [x] Have a profiler. I do not know how to build such profiler [google](https://github.com/google/sanitizers/wiki/AddressSanitizerHowToBuild).
 - [ ] Shadow memory and stuff and alignment.
 
 # Configuration
@@ -152,3 +152,5 @@ Test framework: Refer the NOTES in the 'tests/' directory
 # Feature Request
 
 - [ ] Make function pointers callable from global namespace
+
+- https://en.wikipedia.org/wiki/Substructural_type_system
