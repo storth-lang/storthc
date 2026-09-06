@@ -632,9 +632,33 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
                 fprintf(out, "    add rsp, %u\n", stack_bytes);
 
             if (rc == 2) {
-                fprintf(out, "    mov [rbp%+d], rax\n", ST_ret_buf_off(in, 0));
-                fprintf(out, "    mov [rbp%+d], rdx\n", ST_ret_buf_off(in, 1));
-                fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+		ST_ty_t *r0 = (in->call.callee && in->call.callee->ty &&
+  		               in->call.callee->ty->rets.count > 0)
+			       ? in->call.callee->ty->rets.items[0] : NULL;
+       		ST_ty_t *r1 = (in->call.callee && in->call.callee->ty &&
+  		               in->call.callee->ty->rets.count > 1)
+			       ? in->call.callee->ty->rets.items[1] : NULL;
+
+	       if (r0 && ST_ty_is_float(r0)) {
+		   if (r0->size == 4)
+                       fprintf(out, "    cvtss2sd xmm0, xmm0\n");
+                   fprintf(out, "    movsd [rbp%+d], xmm0\n", ST_ret_buf_off(in, 0));
+               } else {
+		   fprintf(out, "    mov [rbp%+d], rax\n", ST_ret_buf_off(in, 0));
+	       }
+
+	       if (r1 && ST_ty_is_float(r1)) {
+		   if (r1->size == 4)
+                       fprintf(out, "    cvtss2sd xmm1, xmm1\n");
+                   fprintf(out, "    movsd [rbp%+d], xmm1\n", ST_ret_buf_off(in, 1));
+               } else {
+		   fprintf(out, "    mov [rbp%+d], rdx\n", ST_ret_buf_off(in, 1));
+	       }
+
+	       if (r0 && ST_ty_is_float(r0))
+                   fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
+	       else
+	           fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
             } else if (rc > 2)
                 fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
             else if (rc == 1 && in->ty && ST_ty_is_float(in->ty) && in->ty->size == 4)
@@ -790,8 +814,13 @@ static void ST_generate_term(FILE *out, ST_gen_ctx_t *ctx, ST_ir_block_t *b) {
             if (t->rets.count > 2) {
                 fprintf(out, "    mov r10, [rbp%+d]\n", -(i32)ctx->hidden_ret_off);
                 ST_forrange(0, t->rets.count) {
-                    ST_load(out, "rax", t->rets.items[i]);
-                    fprintf(out, "    mov [r10+%u], rax\n", 8u * i);
+		    if (t->rets.items[i]->ty && ST_ty_is_float(t->rets.items[i]->ty)) {
+			ST_fload(out, "xmm0", t->rets.items[i]);
+			fprintf(out, "    movsd [r10+%u], xmm0\n", 8u * i);
+		    } else {
+			ST_load(out, "rax", t->rets.items[i]);
+			fprintf(out, "    mov [r10+%u], rax\n", 8u * i);
+		    }
                 }
                 fprintf(out, "    mov rax, r10\n");
             } else {
