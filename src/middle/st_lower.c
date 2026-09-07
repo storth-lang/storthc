@@ -3238,6 +3238,9 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_lower_asm_stmt(c, s);
             break;
 
+        case ST_ST_NESTED_FN:
+            break;
+
         default:
             ST_diag_error(&c->diag, s->line, s->col,
                           "internal: control flow (switch) isn't lowered yet");

@@ -2252,6 +2252,29 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
 
     } else if (is_struct_lit) {
         t = ST_infer_struct_lit(se, e, lit_tmpl->decl);
+    } else if (ST_string_eq_cstr(e->struct_lit.type_name, "string")) {
+        ST_expr_t *ptr_e = NULL, *len_e = NULL;
+        ST_forrange(0, e->struct_lit.inits.count) {
+            ST_field_init_t *fi = &e->struct_lit.inits.items[i];
+            if (ST_string_eq_cstr(fi->name, "ptr"))
+                ptr_e = fi->value;
+            else if (ST_string_eq_cstr(fi->name, "len"))
+                len_e = fi->value;
+            else
+                ST_diag_error(&se->diag, fi->line, fi->col,
+                              "'string { }' only takes 'ptr' and 'len', got '" ST_sv_fmt "'",
+                              ST_sv_args(fi->name));
+        }
+        if (!ptr_e || !len_e) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'string { }' needs both 'ptr' and 'len', e.g. "
+                          "'string { ptr = p, len = n }'");
+            return NULL;
+        }
+        e->kind = ST_EX_STR_FROM_RAW;
+        e->str_from_raw.ptr = ptr_e;
+        e->str_from_raw.len = len_e;
+        return ST_type_expr(se, e);
     } else if (e->struct_lit.type_name.len) {
         ST_sym_t *sym = ST_sym_find_in(&se->globals, e->struct_lit.type_name);
         if (!sym)
@@ -2872,20 +2895,6 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
                 return;
             }
         }
-    }
-    if (lhs->kind == ST_EX_INDEX && lhs->index.base->ty &&
-        lhs->index.base->ty->kind == ST_TY_STRING) {
-        ST_diag_error(&se->diag, s->line, s->col,
-                      "strings are immutable; cannot assign into a string");
-        return;
-    }
-    if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty &&
-        lhs->field.base->ty->kind == ST_TY_STRING) {
-        ST_diag_error(&se->diag, s->line, s->col,
-                      "'" ST_sv_fmt "' of a string is read-only; "
-                      "reassign the whole string instead",
-                      ST_sv_args(lhs->field.name));
-        return;
     }
     if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty &&
         lhs->field.base->ty->kind == ST_TY_TAG_UNION &&
