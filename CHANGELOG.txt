@@ -347,4 +347,4 @@ above and it's easy to lose track of:
 
 - Adding support for no return. And also some enum feature request Adding support for enum to be C enum.
 
-- Fixed bug of reurssion that caused stack coruption
+- Fixed bug of reurssion that caused stack coruption. Fixing infering [] with [N].
