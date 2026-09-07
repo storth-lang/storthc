@@ -978,7 +978,7 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
             b8 satisfied = 0;
             ST_forrange(0, pt->generic_constraints.count) {
                 ST_ty_t *ct = ST_resolve_tyexpr(se, pt->generic_constraints.items[i]);
-                if (ct && ST_ty_equal(ct, want)) {
+                if (ct && (ST_ty_equal(ct, want) || ST_ty_coerces(se, want, ct))) {
                     satisfied = 1;
                     break;
                 }
@@ -3004,6 +3004,16 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
     }
     u32 want = se->cur_rets ? se->cur_rets->count : 0;
     u32 got = s->ret.values.count;
+
+    if (want == 0 && got == 1 && s->ret.values.items[0]->kind == ST_EX_CALL) {
+        ST_expr_t *rv = s->ret.values.items[0];
+        ST_ty_t *t = ST_type_expr(se, rv);
+        if (!t || t == se->tys.prim[ST_tvoid])
+            return;
+        ST_diag_error(&se->diag, s->line, s->col, "this function does not return a value");
+        return;
+    }
+
     if (want != got) {
         if (want == 0)
             ST_diag_error(&se->diag, s->line, s->col, "this function does not return a value");
