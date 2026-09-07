@@ -9,6 +9,8 @@
 #include <glob.h>
 #include <unistd.h>
 
+#include <sys/resource.h>
+
 #include "backend/st_address_sanitizer.h"
 #include "backend/st_dwarf.h"
 #include "backend/st_fasm_x86_64_linux.h"
@@ -45,6 +47,23 @@
 #define STORTHC_VERSION_STRING                                                                 \
     ST_STR(STORTHC_VERSION_MAJOR) "." ST_STR(STORTHC_VERSION_MINOR) "." ST_STR(                 \
         STORTHC_VERSION_PATCH)
+
+static void ST_raise_stack_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) != 0)
+        return;
+
+#define ST_STACK_SIZE 256UL * 1024 * 1024;
+    rlim_t want = ST_STACK_SIZE;
+#undef ST_STACK_SIZE
+    if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max)
+        want = rl.rlim_max;
+    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= want)
+        return;
+
+    rl.rlim_cur = want;
+    setrlimit(RLIMIT_STACK, &rl);
+}
 
 static void st_print_version(void) {
     fprintf(stdout, "storthc %s (%s)\n", STORTHC_VERSION_STRING, STORTHC_GIT_HASH);
@@ -381,6 +400,7 @@ static void st_clean_comptime_cache(void) {
 }
 
 int main(int argc, char **argv) {
+    ST_raise_stack_limit();
     st_clean_comptime_cache();
 
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-version") == 0)) {
