@@ -69,15 +69,8 @@ typedef struct {
 
     b8 hit_comp_error;
 
-    ST_stmts_t pending_comptime_blocks; // '#comptime { }' statements: type-checked in place
-                                        // (via ST_check_comptime_block) but only actually
-                                        // compiled and run once ST_sema_check's per-decl pass
-                                        // has fully settled (see ST_sema_run_comptime_blocks),
-                                        // so any generic instantiation they trigger (e.g. a
-                                        // print() call needing a fresh print$... instance) has
-                                        // already had its own body checked/unrolled by then --
-                                        // matching how a whole '#comptime'-marked fn's body is
-                                        // only ever compiled after ST_sema_run fully returns.
+    u32 expr_depth;
+    ST_stmts_t pending_comptime_blocks;
 } ST_sema_t;
 
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string_t file,

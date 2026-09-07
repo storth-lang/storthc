@@ -941,8 +941,18 @@ static ST_expr_t *ST_parse_binary(ST_parser_t *p, u32 level) {
     return l;
 }
 
+#define ST_MAX_PARSE_DEPTH 512
+
 static ST_expr_t *ST_parse_expr(ST_parser_t *p) {
-    return ST_parse_binary(p, 0);
+    if (p->expr_depth >= ST_MAX_PARSE_DEPTH) {
+        ST_token_t *t = ST_peek(p);
+        ST_perr(p, t->line, t->col, "expression nested too deeply");
+        return NULL;
+    }
+    p->expr_depth++;
+    ST_expr_t *e = ST_parse_binary(p, 0);
+    p->expr_depth--;
+    return e;
 }
 
 static ST_expr_t *ST_parse_cond(ST_parser_t *p) {

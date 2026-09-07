@@ -154,3 +154,7 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Make function pointers callable from global namespace
 
 - https://en.wikipedia.org/wiki/Substructural_type_system
+
+- [ ] Implicits magnetic vars
+- [ ] Make sure it generates a query.
+- [ ] DSL run time programming

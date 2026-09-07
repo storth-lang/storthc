@@ -2428,9 +2428,17 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
     return t;
 }
 
+#define ST_MAX_EXPR_DEPTH 512
+
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
     if (!e)
         return NULL;
+    if (se->expr_depth >= ST_MAX_EXPR_DEPTH) {
+        ST_diag_error(&se->diag, e->line, e->col, "expression nested too deeply");
+        e->ty = NULL;
+        return NULL;
+    }
+    se->expr_depth++;
     ST_ty_t *t = NULL;
     switch (e->kind) {
         case ST_EX_INT:
@@ -2702,6 +2710,7 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             break;
     }
     e->ty = t;
+    se->expr_depth--;
     return t;
 }
 
