@@ -216,6 +216,12 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
 }
 
 static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
+    if (a->kind == ST_TY_ENUM && ST_ty_is_numeric(b))
+        return b;
+    if (b->kind == ST_TY_ENUM && ST_ty_is_numeric(a))
+        return a;
+    if (a->kind == ST_TY_ENUM && b->kind == ST_TY_ENUM)
+        return a == b ? a : NULL;
     if (!ST_ty_is_numeric(a) || !ST_ty_is_numeric(b))
         return NULL;
     if (a == b)
@@ -230,6 +236,10 @@ static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
         return a;
     ST_unused(se);
     return NULL;
+}
+
+static b8 ST_ty_is_int_like(ST_ty_t *t) {
+    return ST_ty_is_int(t) || (t && t->kind == ST_TY_ENUM);
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
@@ -1457,7 +1467,7 @@ static ST_ty_t *ST_type_unary(ST_sema_t *se, ST_expr_t *e) {
         return t;
     }
     if (ST_string_eq_cstr(op, "~")) {
-        if (!ST_ty_is_int(t)) {
+        if (!ST_ty_is_int_like(t)) {
             ST_diag_error(&se->diag, e->line, e->col, "'~' needs an integer operand, got '%s'",
                           ST_tstr(se, t));
             return NULL;
@@ -1536,7 +1546,7 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
     }
 
     if (ST_op_is(op, "&", "|") || ST_op_is(op, "^", NULL) || ST_op_is(op, "<<", ">>")) {
-        if (!ST_ty_is_int(l) || !ST_ty_is_int(r)) {
+        if (!ST_ty_is_int_like(l) || !ST_ty_is_int_like(r)) {
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' needs integer operands, got '%s' and '%s'",
                           ST_sv_args(op), ST_tstr(se, l), ST_tstr(se, r));
@@ -1554,7 +1564,7 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
         return u;
     }
 
-    if (ST_string_eq_cstr(op, "%") && (!ST_ty_is_int(l) || !ST_ty_is_int(r))) {
+    if (ST_string_eq_cstr(op, "%") && (!ST_ty_is_int_like(l) || !ST_ty_is_int_like(r))) {
         ST_diag_error(&se->diag, e->line, e->col, "'%%' needs integer operands, got '%s' and '%s'",
                       ST_tstr(se, l), ST_tstr(se, r));
         return NULL;
@@ -2900,23 +2910,13 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
 
     b8 arith = ST_op_is(op, "+=", "-=") || ST_op_is(op, "*=", "/=");
     if (arith) {
-        if (lt->kind == ST_TY_ENUM) {
-            b8 step = ST_op_is(op, "+=", "-=") && s->assign.rhs->kind == ST_EX_INT &&
-                     s->assign.rhs->ival == 1;
-            if (!step)
-                ST_diag_error(&se->diag, s->line, s->col,
-                              "'" ST_sv_fmt "' isn't supported on enum '" ST_sv_fmt "' -- use "
-                              "'++'/'--' to cycle to the next/previous variant",
-                              ST_sv_args(op), ST_sv_args(ST_decl_display_name(lt->decl)));
-            return;
-        }
         if (!ST_ty_num_unify(se, lt, rt))
             ST_diag_error(&se->diag, s->line, s->col,
                           "invalid operands to '" ST_sv_fmt "': '%s' and '%s'", ST_sv_args(op),
                           ST_tstr(se, lt), ST_tstr(se, rt));
         return;
     }
-    if (!ST_ty_is_int(lt) || !ST_ty_is_int(rt))
+    if (!ST_ty_is_int_like(lt) || !ST_ty_is_int_like(rt))
         ST_diag_error(&se->diag, s->line, s->col,
                       "'" ST_sv_fmt "' needs integer operands, got '%s' and '%s'", ST_sv_args(op),
                       ST_tstr(se, lt), ST_tstr(se, rt));
