@@ -2736,6 +2736,8 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                             ST_ir_inst_t *lp = ST_lower_field_ptr(c, addr, 8, len_ty, s->line, s->col);
                             vals[vi++] = ST_ir_load(c->cur, len_ty, lp, s->line, s->col);
                         }
+                    } else if (vty && vty->kind == ST_TY_VOID) {
+                        ST_lower_expr(c, rv);
                     } else {
                         vals[vi++] = ST_lower_expr(c, rv);
                     }
