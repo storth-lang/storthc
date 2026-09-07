@@ -216,6 +216,12 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
 }
 
 static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
+    if (a->kind == ST_TY_ENUM && ST_ty_is_numeric(b))
+        return b;
+    if (b->kind == ST_TY_ENUM && ST_ty_is_numeric(a))
+        return a;
+    if (a->kind == ST_TY_ENUM && b->kind == ST_TY_ENUM)
+        return a == b ? a : NULL;
     if (!ST_ty_is_numeric(a) || !ST_ty_is_numeric(b))
         return NULL;
     if (a == b)
@@ -230,6 +236,10 @@ static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
         return a;
     ST_unused(se);
     return NULL;
+}
+
+static b8 ST_ty_is_int_like(ST_ty_t *t) {
+    return ST_ty_is_int(t) || (t && t->kind == ST_TY_ENUM);
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
@@ -1457,7 +1467,7 @@ static ST_ty_t *ST_type_unary(ST_sema_t *se, ST_expr_t *e) {
         return t;
     }
     if (ST_string_eq_cstr(op, "~")) {
-        if (!ST_ty_is_int(t)) {
+        if (!ST_ty_is_int_like(t)) {
             ST_diag_error(&se->diag, e->line, e->col, "'~' needs an integer operand, got '%s'",
                           ST_tstr(se, t));
             return NULL;
@@ -1536,7 +1546,7 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
     }
 
     if (ST_op_is(op, "&", "|") || ST_op_is(op, "^", NULL) || ST_op_is(op, "<<", ">>")) {
-        if (!ST_ty_is_int(l) || !ST_ty_is_int(r)) {
+        if (!ST_ty_is_int_like(l) || !ST_ty_is_int_like(r)) {
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' needs integer operands, got '%s' and '%s'",
                           ST_sv_args(op), ST_tstr(se, l), ST_tstr(se, r));
@@ -1554,7 +1564,7 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
         return u;
     }
 
-    if (ST_string_eq_cstr(op, "%") && (!ST_ty_is_int(l) || !ST_ty_is_int(r))) {
+    if (ST_string_eq_cstr(op, "%") && (!ST_ty_is_int_like(l) || !ST_ty_is_int_like(r))) {
         ST_diag_error(&se->diag, e->line, e->col, "'%%' needs integer operands, got '%s' and '%s'",
                       ST_tstr(se, l), ST_tstr(se, r));
         return NULL;
@@ -2242,6 +2252,29 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
 
     } else if (is_struct_lit) {
         t = ST_infer_struct_lit(se, e, lit_tmpl->decl);
+    } else if (ST_string_eq_cstr(e->struct_lit.type_name, "string")) {
+        ST_expr_t *ptr_e = NULL, *len_e = NULL;
+        ST_forrange(0, e->struct_lit.inits.count) {
+            ST_field_init_t *fi = &e->struct_lit.inits.items[i];
+            if (ST_string_eq_cstr(fi->name, "ptr"))
+                ptr_e = fi->value;
+            else if (ST_string_eq_cstr(fi->name, "len"))
+                len_e = fi->value;
+            else
+                ST_diag_error(&se->diag, fi->line, fi->col,
+                              "'string { }' only takes 'ptr' and 'len', got '" ST_sv_fmt "'",
+                              ST_sv_args(fi->name));
+        }
+        if (!ptr_e || !len_e) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'string { }' needs both 'ptr' and 'len', e.g. "
+                          "'string { ptr = p, len = n }'");
+            return NULL;
+        }
+        e->kind = ST_EX_STR_FROM_RAW;
+        e->str_from_raw.ptr = ptr_e;
+        e->str_from_raw.len = len_e;
+        return ST_type_expr(se, e);
     } else if (e->struct_lit.type_name.len) {
         ST_sym_t *sym = ST_sym_find_in(&se->globals, e->struct_lit.type_name);
         if (!sym)
@@ -2863,20 +2896,6 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
             }
         }
     }
-    if (lhs->kind == ST_EX_INDEX && lhs->index.base->ty &&
-        lhs->index.base->ty->kind == ST_TY_STRING) {
-        ST_diag_error(&se->diag, s->line, s->col,
-                      "strings are immutable; cannot assign into a string");
-        return;
-    }
-    if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty &&
-        lhs->field.base->ty->kind == ST_TY_STRING) {
-        ST_diag_error(&se->diag, s->line, s->col,
-                      "'" ST_sv_fmt "' of a string is read-only; "
-                      "reassign the whole string instead",
-                      ST_sv_args(lhs->field.name));
-        return;
-    }
     if (lhs->kind == ST_EX_FIELD && lhs->field.base->ty &&
         lhs->field.base->ty->kind == ST_TY_TAG_UNION &&
         ST_string_eq_cstr(lhs->field.name, "kind")) {
@@ -2900,23 +2919,13 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
 
     b8 arith = ST_op_is(op, "+=", "-=") || ST_op_is(op, "*=", "/=");
     if (arith) {
-        if (lt->kind == ST_TY_ENUM) {
-            b8 step = ST_op_is(op, "+=", "-=") && s->assign.rhs->kind == ST_EX_INT &&
-                     s->assign.rhs->ival == 1;
-            if (!step)
-                ST_diag_error(&se->diag, s->line, s->col,
-                              "'" ST_sv_fmt "' isn't supported on enum '" ST_sv_fmt "' -- use "
-                              "'++'/'--' to cycle to the next/previous variant",
-                              ST_sv_args(op), ST_sv_args(ST_decl_display_name(lt->decl)));
-            return;
-        }
         if (!ST_ty_num_unify(se, lt, rt))
             ST_diag_error(&se->diag, s->line, s->col,
                           "invalid operands to '" ST_sv_fmt "': '%s' and '%s'", ST_sv_args(op),
                           ST_tstr(se, lt), ST_tstr(se, rt));
         return;
     }
-    if (!ST_ty_is_int(lt) || !ST_ty_is_int(rt))
+    if (!ST_ty_is_int_like(lt) || !ST_ty_is_int_like(rt))
         ST_diag_error(&se->diag, s->line, s->col,
                       "'" ST_sv_fmt "' needs integer operands, got '%s' and '%s'", ST_sv_args(op),
                       ST_tstr(se, lt), ST_tstr(se, rt));

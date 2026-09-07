@@ -1867,6 +1867,13 @@ static ST_decl_t *ST_parse_enum_decl(ST_parser_t *p, b8 is_flag, u32 line, u32 c
         v.name = ST_expect_ident(p, "a variant name");
         if (!v.name.len)
             return NULL;
+        if (ST_at_symbol(p, "=")) {
+            ST_perr_here(p,
+                        "enum variants use ':=' for an explicit value, not '=' "
+                        "(e.g. '" ST_sv_fmt " := value;')",
+                        ST_sv_args(v.name));
+            return NULL;
+        }
         if (ST_at_symbol(p, ":=")) {
             p->pos++;
             v.value = ST_parse_expr(p);
@@ -2069,6 +2076,9 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                 return 0;
             ST_da_append_arena(p->arena, &sig->rets, te);
         }
+        // 'noreturn' isn't a real type -- it's a pure control-flow annotation, so it
+        // never flows through ST_resolve_tyexpr. Pull it back out of 'rets' here and
+        // fold it into a plain flag instead (same 0-return-value shape as void).
         b8 any_noreturn = 0;
         ST_forrange(0, sig->rets.count)
             if (sig->rets.items[i]->kind == ST_TE_NAME &&
