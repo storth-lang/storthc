@@ -34,6 +34,8 @@ typedef struct {
     ST_stmts_t *cur_fn_body;
 
     ST_ht_t safe_array_roots;
+
+    u32 lower_depth; // shared guard for ST_lower_expr / ST_lower_lvalue_addr recursion
 } ST_lower_ctx_t;
 
 typedef enum {
@@ -49,11 +51,13 @@ typedef struct {
 } ST_lower_bind_t;
 
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ir_inst_t *ST_lower_asm_tokens(ST_lower_ctx_t *c, ST_token_t *tokens, u32 n_tokens,
                                          ST_ty_t *ty, u32 line, u32 col);
 static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_global_var_t *ST_lower_ensure_const_global(ST_lower_ctx_t *c, ST_sym_t *sym);
 static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e);
@@ -987,7 +991,20 @@ static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_in
     c->cur = ok_b;
 }
 
+#define ST_MAX_LOWER_DEPTH 512
+
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
+    if (c->lower_depth >= ST_MAX_LOWER_DEPTH) {
+        ST_diag_error(&c->diag, e->line, e->col, "expression nested too deeply");
+        return ST_ir_const_int(c->cur, c->sema->tys.null_ptr, 0);
+    }
+    c->lower_depth++;
+    ST_ir_inst_t *r = ST_lower_lvalue_addr_impl(c, e);
+    c->lower_depth--;
+    return r;
+}
+
+static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT: {
             ST_lower_bind_t *bind = ST_lower_scope_find(c, e->name);
@@ -1532,6 +1549,17 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
 }
 
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
+    if (c->lower_depth >= ST_MAX_LOWER_DEPTH) {
+        ST_diag_error(&c->diag, e->line, e->col, "expression nested too deeply");
+        return ST_ir_const_int(c->cur, e->ty, 0);
+    }
+    c->lower_depth++;
+    ST_ir_inst_t *r = ST_lower_expr_impl(c, e);
+    c->lower_depth--;
+    return r;
+}
+
+static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_STRUCT_LIT:
             return ST_lower_struct_addr(c, e, e->ty);
