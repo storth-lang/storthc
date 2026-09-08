@@ -314,10 +314,6 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 ST_ct_val_t b = ST_ct_pop(vm), a = ST_ct_pop(vm);
                 if ((a.kind == ST_CT_PTR || b.kind == ST_CT_PTR) &&
                     (op == ST_OP_ADD || op == ST_OP_SUB)) {
-                    // Raw pointer arithmetic (byte offsets), as used directly in
-                    // low-level code like an allocator's 'base + HDR'/'ptr - n' --
-                    // distinct from ST_OP_PTR_ADD, which is element-size-scaled
-                    // and used internally for array indexing.
                     if (a.kind == ST_CT_PTR && b.kind == ST_CT_PTR) {
                         if (op == ST_OP_SUB) {
                             ST_ct_push(vm, ST_ct_int((i64)((u8 *)a.ptr - (u8 *)b.ptr)));

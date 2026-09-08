@@ -1672,6 +1672,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             sym = NULL;
         } else {
             fnty = sym->t;
+            callee->ty = sym->t;
             if (fnty && fnty->kind == ST_TY_PTR && fnty->inner && fnty->inner->kind == ST_TY_FN)
                 fnty = fnty->inner;
             if (sym->kind == ST_SYM_VAR && fnty && fnty->kind != ST_TY_FN) {
