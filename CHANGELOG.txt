@@ -348,3 +348,8 @@ above and it's easy to lose track of:
 - Adding support for no return. And also some enum feature request Adding support for enum to be C enum.
 
 - Fixed bug of reurssion that caused stack coruption. Fixing infering [] with [N]. void return fix.
+
+08:10:2026
+
+- Inplace function declaration: making it so that function with in a templated function
+  can be known from any place as we are a two pass a compiler
