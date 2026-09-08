@@ -1,8 +1,8 @@
 # Use , instead of | and add ! for parametrization
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
-- TAGS: generics, semantic
+- TAGS: generic, semantic
 
 Current syntax
 ```rs

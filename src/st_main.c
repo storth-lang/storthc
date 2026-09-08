@@ -42,6 +42,15 @@
 #define STORTHC_GIT_HASH "unknown"
 #endif
 
+#ifndef ST_BIND_GENERATOR
+#define ST_BIND_GENERATOR 0
+#endif
+
+#if ST_BIND_GENERATOR
+#define STBIND_IMPLEMENTATION
+#include "utils/st_clang_bindgen.h"
+#endif
+
 #define ST_STR2(x) #x
 #define ST_STR(x) ST_STR2(x)
 #define STORTHC_VERSION_STRING                                                                 \
@@ -471,6 +480,18 @@ int main(int argc, char **argv) {
     cli_create_flag_bool(run, "fasm", fasm_desc, &use_fasm);
     cli_rest(run, "Extra flags passed through to 'ld' (after a lone '-')", &run_ldflags);
 
+#ifdef ST_BIND_GENERATOR
+    char *src_bind  = NULL;
+    char *out_bind  = NULL;
+    strings_t clang_flags = {0};
+
+    command_t *bind = cli_command(root, "bind", "Transpile a C file into stroth file");
+    cli_positional(bind, "source", "Storth source file", &src_bind, true);
+    cli_create_flag_string(bind, "output", "Output to storth path (.st)", &out_bind);
+    cli_alias(bind, "output", 'o');
+    cli_rest(bind, "Extra flags passed through to 'ld' (after a lone '-')", &clang_flags);
+#endif
+
     cli_status_t status = cli_parse(cli, argc, argv);
 
     b8 ok = 0;
@@ -503,10 +524,42 @@ int main(int argc, char **argv) {
         ok = st_compile(arena, src_obj, ST_STAGE_OBJ, out_obj, NULL, NULL, no_debug, use_fasm);
     else if (active == build_exe)
         ok = st_compile(arena, src_exe, ST_STAGE_EXE, out_exe, &exe_ldflags, NULL, no_debug,
-                        use_fasm);
+                         use_fasm);
     else if (active == run)
         ok = st_compile(arena, src_run, ST_STAGE_RUN, out_run, &run_ldflags, &run_exit_code,
                         no_debug, use_fasm);
+
+    else if (active == bind) {
+#if ST_BIND_GENERATOR
+	char *err = NULL;
+	char *generated = stbind_generate_string(src_bind, (const char **)clang_flags.items,
+						 (i32)clang_flags.count, &err);
+    if (!generated) {
+        fprintf(stderr, "storth bind gen: %s\n", err ? err : "unknown error");
+        free(err);
+	ok = 0;
+	goto done;
+    }
+
+    const char *out_path = out_bind ? out_bind : "a.st";
+    FILE *f = fopen(out_path, "wb");
+    if (!f) {
+        fprintf(stderr, "storth bind gen: could not open file %s for writing\n", out_path);
+        free(err);
+	ok = 0;
+	goto done;
+    }
+
+    fwrite(generated, strlen(generated), sizeof(*generated), f);
+    fclose(f);
+    free(generated);
+
+    ok = 1;
+#else
+    fprintf(stderr, "storth is not built with binding generator support\n");
+#endif
+    goto done;
+    }
     else if (active)
         cli_command_usage(active);
     else

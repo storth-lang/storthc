@@ -963,6 +963,50 @@ static ST_fn_sig_t ST_clone_fn_sig(ST_arena_t *a, ST_fn_sig_t *s) {
     return out;
 }
 
+static void ST_diagnostic_note_constraint(ST_sema_t *se, ST_tyexprs_t *constraints,
+					  u32 line, u32 col, ST_string_t pname) {
+    char pos_buf[512] = {0};
+    char neg_buf[512] = {0};
+
+    u32 pos_n = 0, neg_n = 0;
+    u32 pos_len = 0, neg_len = 0;
+
+    ST_forrange(0, constraints->count) {
+	ST_tyexpr_t *cte = constraints->items[i];
+	ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
+
+	if (!ct)
+	    continue;
+
+	const char *nm = ST_tstr(se, ct);
+	if (cte->is_negeated_constraint) {
+	    int n = snprintf(neg_buf + neg_len, sizeof(neg_buf) - neg_len, "%s%s",
+			     neg_n ? ", ": "", nm);
+	    if (n > 0) neg_len += (u32)n;
+	    neg_n++;
+	} else {
+	    int n = snprintf(pos_buf + pos_len, sizeof(pos_buf) - pos_len, "%s%s",
+			     pos_n ? ", ": "", nm);
+	    if (n > 0) pos_len += (u32)n;
+	    pos_n++;
+	}
+    }
+
+    if (pos_n && neg_n)
+	ST_diag_note(&se->diag, line, col,
+		     "valid types for '$"ST_sv_fmt"':  %s (except %s)",
+		     ST_sv_args(pname), pos_buf, neg_buf);
+    else if (pos_n)
+	ST_diag_note(&se->diag, line, col,
+		     "valid types for '$"ST_sv_fmt"':  %s",
+		     ST_sv_args(pname), pos_buf);
+    else if (neg_n)
+	ST_diag_note(&se->diag, line, col,
+		     "valid types for '$"ST_sv_fmt"':  %s",
+		     ST_sv_args(pname), neg_buf);
+
+}
+
 static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *bindings,
                           u32 arg_line, u32 arg_col) {
     if (!pt || !at)
@@ -975,19 +1019,35 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
         ST_ty_t *want = ST_ty_defaulted(se, at);
 
         if (pt->generic_constraints.count) {
-            b8 satisfied = 0;
+            b8 has_satisfied = 0, matched_satisfied = 0, excluded = 0;
             ST_forrange(0, pt->generic_constraints.count) {
-                ST_ty_t *ct = ST_resolve_tyexpr(se, pt->generic_constraints.items[i]);
-                if (ct && (ST_ty_equal(ct, want) || ST_ty_coerces(se, want, ct))) {
-                    satisfied = 1;
-                    break;
-                }
+		ST_tyexpr_t *cte = pt->generic_constraints.items[i];
+                ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
+
+		if (!ct)
+		    continue;
+		b8 matches = ST_ty_equal(ct, want) || ST_ty_coerces(se, want, ct);
+		if (cte->is_negeated_constraint) {
+		    if (matches)
+			excluded = 1;
+		} else {
+		    has_satisfied = 1;
+		    if (matches)
+			matched_satisfied = 1;
+
+		}
             }
+
+	    b8 satisfied = (!has_satisfied || matched_satisfied) && !excluded;
+
             if (!satisfied) {
                 ST_diag_error(&se->diag, arg_line, arg_col,
                               "'%s' does not satisfy the constraint on generic parameter '$"
                               ST_sv_fmt "'",
                               ST_tstr(se, want), ST_sv_args(pt->name));
+
+		ST_diagnostic_note_constraint(se, &pt->generic_constraints,
+					      pt->line, pt->col, pt->name);
                 return 0;
             }
         }

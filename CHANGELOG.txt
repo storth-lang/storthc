@@ -352,4 +352,6 @@ above and it's easy to lose track of:
 08:10:2026
 
 - Inplace function declaration: making it so that function with in a templated function
-  can be known from any place as we are a two pass a compiler
+  can be known from any place as we are a two pass a compiler.
+
+- Finally merged clang binding generator.
