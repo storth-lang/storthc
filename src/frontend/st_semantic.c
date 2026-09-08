@@ -1178,6 +1178,10 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     inst->name = mangled;
     inst->file = tmpl->file;
     inst->is_pub = tmpl->is_pub;
+    if (tmpl->fn.decl_block_id) {
+	inst->display_name = ST_decl_display_name(tmpl);
+	inst->fn.decl_block_id = tmpl->fn.decl_block_id;
+    }
     inst->fn.sig = ST_clone_fn_sig(se->arena, &tmpl->fn.sig);
     inst->fn.sig.generics = (ST_strings_t){0};
     inst->fn.is_prototype = tmpl->fn.is_prototype;
@@ -1638,6 +1642,14 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         if (sym && sym->kind == ST_SYM_FN && sym->decl &&
             !ST_string_eq(callee->name, sym->decl->name))
             callee->name = sym->decl->name;
+	if (sym && sym->kind == ST_SYM_FN && !sym->t && sym->decl &&
+	    sym->decl->kind == ST_DE_FN && sym->decl->fn.sig.generics.count) {
+	    ST_sym_t *tsym = ST_sym_find_in(&se->templates, callee->name);
+	    if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN) {
+		fn_tmpl = tsym->decl;
+		sym = NULL;
+	    }
+	}
         if (!sym) {
             ST_sym_t *tsym = ST_sym_find_in(&se->templates, callee->name);
             if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN)
@@ -2726,6 +2738,14 @@ static void ST_declare_nested_fn_sym(ST_sema_t *se, ST_decl_t *nd) {
         return;
     if (ST_sym_find_in(&se->scope->table, bare))
         return;
+    if (nd->kind == ST_DE_FN && nd->fn.sig.generics.count) {
+	ST_sym_t *tysm = ST_sym_find_in(&se->templates, nd->name);
+	if (!tysm)
+	    return;
+	ST_sym_insert(se, &se->scope->table,
+		      ST_sym_new(se, ST_SYM_FN, bare, nd, NULL, nd->line, nd->col));
+    }
+
     ST_sym_t *gsym = ST_sym_find_in(&se->globals, nd->name);
     if (!gsym)
         return;
@@ -2998,7 +3018,7 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
         se->cur_fn_decl->fn.sig.is_noreturn) {
         ST_diag_error(&se->diag, s->line, s->col,
                       "cannot 'return' from '" ST_sv_fmt "', which is declared '-> noreturn' "
-                      "-- a function that never returns can't have a return statement",
+                      "a function that never returns can't have a return statement",
                       ST_sv_args(se->cur_fn_decl->name));
         return;
     }

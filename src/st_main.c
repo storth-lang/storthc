@@ -53,9 +53,10 @@ static void ST_raise_stack_limit(void) {
     if (getrlimit(RLIMIT_STACK, &rl) != 0)
         return;
 
+#ifndef ST_STACK_SIZE
 #define ST_STACK_SIZE 256UL * 1024 * 1024;
+#endif
     rlim_t want = ST_STACK_SIZE;
-#undef ST_STACK_SIZE
     if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max)
         want = rl.rlim_max;
     if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= want)
