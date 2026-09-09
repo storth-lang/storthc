@@ -242,13 +242,49 @@ static void ST_fasm_generate_strs(FILE *out, ST_ir_module_t *m) {
     }
 }
 
+static void ST_fasm_emit_mem_arg_copy(FILE *out, ST_ir_inst_t *arg, u32 dest_off) {
+    u32 size = arg->mem_arg.agg_ty && arg->mem_arg.agg_ty->size ? arg->mem_arg.agg_ty->size : 8;
+    ST_fasm_load(out, "rcx", arg->mem_arg.addr);
+    u32 off = 0;
+    while (size - off >= 8) {
+        fprintf(out, "    mov rax, [rcx+%u]\n", off);
+        fprintf(out, "    mov [rsp+%u], rax\n", dest_off + off);
+        off += 8;
+    }
+    if (size - off >= 4) {
+        fprintf(out, "    mov eax, [rcx+%u]\n", off);
+        fprintf(out, "    mov [rsp+%u], eax\n", dest_off + off);
+        off += 4;
+    }
+    if (size - off >= 2) {
+        fprintf(out, "    movzx eax, word [rcx+%u]\n", off);
+        fprintf(out, "    mov [rsp+%u], ax\n", dest_off + off);
+        off += 2;
+    }
+    if (size - off >= 1) {
+        fprintf(out, "    movzx eax, byte [rcx+%u]\n", off);
+        fprintf(out, "    mov [rsp+%u], al\n", dest_off + off);
+        off += 1;
+    }
+}
+
 static u32 ST_fasm_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_int_regs,
                                   u32 *out_stack_bytes) {
-    u32 int_idx = reserved_int_regs, float_idx = 0, n_stack = 0;
+    u32 int_idx = reserved_int_regs, float_idx = 0, n_stack_slots = 0;
     b8 stack_arg[256];
+    u32 slots[256];
     u32 n = args->count < 256 ? args->count : 256;
     ST_forrange(0, n) {
         ST_ir_inst_t *arg = args->items[i];
+        if (arg->kind == ST_IR_MEM_ARG) {
+            u32 size =
+                arg->mem_arg.agg_ty && arg->mem_arg.agg_ty->size ? arg->mem_arg.agg_ty->size : 8;
+            slots[i] = (size + 7u) / 8u;
+            stack_arg[i] = 1;
+            n_stack_slots += slots[i];
+            continue;
+        }
+        slots[i] = 1;
         b8 is_f = arg->ty && ST_ty_is_float(arg->ty);
         if (is_f) {
             stack_arg[i] = float_idx >= ST_N_XMM_REGS;
@@ -260,10 +296,10 @@ static u32 ST_fasm_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_i
                 int_idx++;
         }
         if (stack_arg[i])
-            n_stack++;
+            n_stack_slots++;
     }
 
-    u32 stack_bytes = ((n_stack * 8) + 15) & ~15u;
+    u32 stack_bytes = ((n_stack_slots * 8) + 15) & ~15u;
     if (out_stack_bytes)
         *out_stack_bytes = stack_bytes;
     if (stack_bytes)
@@ -274,6 +310,11 @@ static u32 ST_fasm_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_i
         if (!stack_arg[i])
             continue;
         ST_ir_inst_t *arg = args->items[i];
+        if (arg->kind == ST_IR_MEM_ARG) {
+            ST_fasm_emit_mem_arg_copy(out, arg, 8u * k);
+            k += slots[i];
+            continue;
+        }
         if (arg->ty && ST_ty_is_float(arg->ty)) {
             ST_fasm_fload(out, "xmm0", arg);
             if (arg->ty->size == 4)
@@ -355,7 +396,7 @@ static void ST_fasm_fcmp(FILE *out, ST_ir_inst_t *in, ST_ir_op_t kind) {
 }
 
 static void ST_fasm_generate_inst(FILE *out, ST_fasm_ctx_t *ctx, ST_ir_inst_t *in) {
-    _Static_assert(ST_IR_COUNT == 51, "IR count exceeded");
+    _Static_assert(ST_IR_COUNT == 52, "IR count exceeded");
     if (in->removed)
         return;
     switch (in->kind) {

@@ -357,11 +357,18 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         if (ST_at_symbol(p, "(")) {
             p->pos++; // consume '('
             for (;;) {
+		b8 negated = 0;
+		if (ST_at_symbol(p, "!")) {
+		    p->pos++;
+		    negated = 1;
+		}
+
                 ST_tyexpr_t *ct = ST_parse_type(p);
                 if (!ct)
                     return NULL;
+		ct->is_negeated_constraint = negated;
                 ST_da_append_arena(p->arena, &te->generic_constraints, ct);
-                if (ST_at_symbol(p, "|")) {
+                if (ST_at_symbol(p, ",")) {
                     p->pos++;
                     continue;
                 }

@@ -52,6 +52,7 @@ struct ST_tyexpr_t {
     b8 fn_is_variadic;
     b8 fn_is_noreturn;
     b8 is_generic_param;
+    b8 is_negeated_constraint;
     ST_tyexprs_t generic_constraints; // '$T(A | B)'
     ST_tyexprs_t generic_args;
     ST_expr_t *typeof_operand;

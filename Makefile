@@ -6,9 +6,10 @@ BINDIR := bin
 
 GIT_HASH := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
-CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g -fsanitize=address
+CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g
 CFLAGS += -MMD -MP
 CFLAGS += -DSTORTHC_VERSION_MAJOR=$(VERSION_MAJOR) -DSTORTHC_VERSION_MINOR=$(VERSION_MINOR) -DSTORTHC_VERSION_PATCH=$(VERSION_PATCH) -DSTORTHC_GIT_HASH='"$(GIT_HASH)"' -DST_STACK_SIZE=$(STACK_SIZE)
+CFLAGS += -DST_BIND_GENERATOR=$(BIND_GENERATOR)
 LDLIBS := -lm
 
 TARGET := $(BINDIR)/storthc
@@ -31,6 +32,13 @@ RED    := \033[1;31m
 RESET  := \033[0m
 else
 QUIET :=
+endif
+
+ifeq ($(BIND_GENERATOR),1)
+LLVM_CONFIG ?= llvm-config
+CFLAGS   += -I$(shell $(LLVM_CONFIG) --includedir)
+LDLIBS   += -L$(shell $(LLVM_CONFIG) --libdir) -lclang \
+            -Wl,-rpath,$(shell $(LLVM_CONFIG) --libdir)
 endif
 
 .PHONY: all test clean install

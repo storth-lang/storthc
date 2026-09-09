@@ -865,7 +865,7 @@ static void ST_lower_push_struct_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out, u32 
         if (!addr)
             return;
 
-        out[(*count)++] = addr;
+        out[(*count)++] = ST_ir_mem_arg(c->cur, addr, st, e->line, e->col);
         return;
     }
     ST_ir_inst_t *addr = ST_lower_struct_addr(c, e, st);
@@ -3325,7 +3325,6 @@ static b8 ST_lower_eight_byte_is_sse(ST_ty_t *st, u32 eb) {
         return lo < st->size; // this eightbyte overlaps real (float) array data
     }
     b8 saw_field = 0, all_float = 1;
-    u32 float_count = 0;
 
     ST_forrange(0, st->fields.count) {
         ST_ty_field_t *f = &st->fields.items[i];
@@ -3333,15 +3332,10 @@ static b8 ST_lower_eight_byte_is_sse(ST_ty_t *st, u32 eb) {
         if (fend <= lo || f->offset >= hi)
             continue;
         saw_field = 1;
-        if (ST_ty_is_float(f->ty)) {
-            float_count++;
-            if (f->ty->size != 8)
-                all_float = 0;
-        } else {
-            all_float = 0;
-        }
+	if (!ST_ty_is_float(f->ty))
+	    all_float = 0;
     }
-    return saw_field && all_float && float_count > 0;
+    return saw_field && all_float;
 }
 
 static ST_ty_t *ST_lower_eight_byte_ty(ST_lower_ctx_t *c, ST_ty_t *st, u32 eb) {

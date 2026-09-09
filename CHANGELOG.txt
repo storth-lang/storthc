@@ -352,4 +352,6 @@ above and it's easy to lose track of:
 08:10:2026
 
 - Inplace function declaration: making it so that function with in a templated function
-  can be known from any place as we are a two pass a compiler
+  can be known from any place as we are a two pass a compiler.
+
+- Finally merged clang binding generator. This was shit ton of fixes but now we have full compatibility with freaking floats and also proper memory class from sysv abi as well. This will allow us to return struct of very huge size correctly. The CI stupid in the sense I did not set up proper llvm integration
