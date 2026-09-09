@@ -865,7 +865,7 @@ static void ST_lower_push_struct_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out, u32 
         if (!addr)
             return;
 
-        out[(*count)++] = addr;
+        out[(*count)++] = ST_ir_mem_arg(c->cur, addr, st, e->line, e->col);
         return;
     }
     ST_ir_inst_t *addr = ST_lower_struct_addr(c, e, st);

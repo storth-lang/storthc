@@ -30,3 +30,8 @@ Linux syscall.
 - stdlib design: https://codeberg.org/memfd/libsmh
 - Hash Table: https://arxiv.org/pdf/2501.02305
 - SSA IR paper: https://c9x.me/compile/bib/braun13cc.pdf
+
+
+## WARNING
+
+Please Do not build with any asan as the comptime hijacks the process and changes asm instruction it is pretty much fragile to asan.

@@ -180,6 +180,10 @@ static void ST_ir_replace_all_uses(ST_ir_fn_t *fn, ST_ir_inst_t *old, ST_ir_inst
                     if (inst->extract.agg == old)
                         inst->extract.agg = new_;
                     break;
+                case ST_IR_MEM_ARG:
+                    if (inst->mem_arg.addr == old)
+                        inst->mem_arg.addr = new_;
+                    break;
                 case ST_IR_PHI:
                     ST_forrange(0, inst->phi.values.count) if (inst->phi.values.items[i] == old)
                         inst->phi.values.items[i] = new_;
@@ -400,6 +404,14 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_
     return inst;
 }
 
+ST_ir_inst_t *ST_ir_mem_arg(ST_ir_block_t *b, ST_ir_inst_t *addr, ST_ty_t *agg_ty, u32 line,
+                            u32 col) {
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_MEM_ARG, NULL, line, col);
+    inst->mem_arg.addr = addr;
+    inst->mem_arg.agg_ty = agg_ty;
+    return inst;
+}
+
 ST_ir_inst_t *ST_ir_alloca(ST_ir_fn_t *fn, ST_ty_ctx_t *ctx, ST_ty_t *p, ST_string_t name, u32 line,
                           u32 col) {
     ST_assert(fn->entry != NULL);
@@ -503,7 +515,7 @@ void ST_ir_term_unreachable(ST_ir_block_t *b, u32 line, u32 col) {
 }
 
 static const char *ST_ir_op_name(ST_ir_op_t op) {
-    _Static_assert(ST_IR_COUNT == 51, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
+    _Static_assert(ST_IR_COUNT == 52, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
     switch (op) {
         case ST_IR_CONST_INT:
             return "const_int";
@@ -593,6 +605,8 @@ static const char *ST_ir_op_name(ST_ir_op_t op) {
             return "call_indirect";
         case ST_IR_EXTRACT_OP:
             return "extract";
+        case ST_IR_MEM_ARG:
+            return "mem_arg";
         case ST_IR_PHI:
             return "phi";
         case ST_IR_ALLOCA:
@@ -659,7 +673,7 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn) {
             ST_ir_dump_val(out, inst);
             fprintf(out, " = %s", ST_ir_op_name(inst->kind));
 
-            _Static_assert(ST_IR_COUNT == 51, "IR is exceeded");
+            _Static_assert(ST_IR_COUNT == 52, "IR is exceeded");
             switch (inst->kind) {
                 case ST_IR_CONST_INT:
                     fprintf(out, " %lld", (long long)inst->const_int);
@@ -687,6 +701,12 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn) {
                     fprintf(out, " ");
                     ST_ir_dump_val(out, inst->extract.agg);
                     fprintf(out, ", %u", inst->extract.index);
+                    break;
+                case ST_IR_MEM_ARG:
+                    fprintf(out, " ");
+                    ST_ir_dump_val(out, inst->mem_arg.addr);
+                    fprintf(out, ", %u bytes",
+                            inst->mem_arg.agg_ty ? inst->mem_arg.agg_ty->size : 0);
                     break;
                 case ST_IR_CALL_INDIRECT:
                     fprintf(out, " ");
