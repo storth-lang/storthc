@@ -112,6 +112,7 @@ struct ST_ir_inst_t {
     ST_ir_inst_t *prev, *next;
     ST_ir_inst_t *repl;
     b8 removed;
+    b8 force_stack_arg;
 
     union {
         i64 const_int;

@@ -642,7 +642,10 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
 
         } break;
         case ST_IR_PARAM: {
-            if (in->ty && ST_ty_is_float(in->ty)) {
+            if (in->force_stack_arg) {
+                fprintf(out, "    mov rax, [rbp+%u]\n", 16u + 8u * ctx->next_stack_arg);
+                ctx->next_stack_arg++;
+            } else if (in->ty && ST_ty_is_float(in->ty)) {
                 b8 narrow = in->ty->size == 4;
                 if (ctx->next_float_arg >= ST_N_XMM_REGS) {
                     fprintf(out, "    %s xmm0, [rbp+%u]\n", narrow ? "movss" : "movsd",

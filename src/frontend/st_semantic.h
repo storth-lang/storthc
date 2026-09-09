@@ -43,6 +43,7 @@ typedef struct {
     ST_diag_t diag;
     ST_srcmap_t *srcs;
     ST_ht_t globals;
+    ST_ht_t types;
     ST_scope_t *scope;
     ST_ht_t *labels;
     ST_ty_ctx_t tys;

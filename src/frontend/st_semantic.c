@@ -77,7 +77,11 @@ static ST_sym_t *ST_sym_find(ST_sema_t *se, ST_string_t name) {
         if (sym)
             return sym;
     }
-    return ST_sym_find_in(&se->globals, name);
+    ST_sym_t *sym =  ST_sym_find_in(&se->globals, name);
+    if (sym)
+	return sym;
+
+    return ST_sym_find_in(&se->types, name);
 }
 
 static ST_sym_t *ST_sym_new(ST_sema_t *se, ST_sym_kind_t kind, ST_string_t name, ST_decl_t *decl,
@@ -549,7 +553,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
             ST_ty_t *prim = ST_prim_by_name(se, te->name);
             if (prim)
                 return prim;
-            ST_sym_t *sym = ST_sym_find_in(&se->globals, te->name);
+            ST_sym_t *sym = ST_sym_find_in(&se->types, te->name);
             if (!sym) {
                 ST_diag_error(&se->diag, te->line, te->col, "unknown type '" ST_sv_fmt "'",
                               ST_sv_args(te->name));
@@ -623,7 +627,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
         case ST_TE_GENERIC_INST: {
             ST_sym_t *tmpl = ST_sym_find_in(&se->templates, te->name);
             if (!tmpl) {
-                if (ST_sym_find_in(&se->globals, te->name)) {
+                if (ST_sym_find_in(&se->types, te->name)) {
                     ST_diag_error(&se->diag, te->line, te->col,
                                   "'" ST_sv_fmt "' is not a generic type", ST_sv_args(te->name));
                 } else
@@ -2349,7 +2353,7 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         e->str_from_raw.len = len_e;
         return ST_type_expr(se, e);
     } else if (e->struct_lit.type_name.len) {
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, e->struct_lit.type_name);
+        ST_sym_t *sym = ST_sym_find_in(&se->types, e->struct_lit.type_name);
         if (!sym)
             ST_diag_error(&se->diag, e->line, e->col,
                           "unknown type '" ST_sv_fmt "' in struct literal",
@@ -4213,7 +4217,8 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
                 continue;
             }
         }
-        ST_sym_t *prev = ST_sym_find_in(&se->globals, d->name);
+        ST_ht_t *tbl = ST_decl_sym_kind(d) == ST_SYM_TYPE ? &se->types : &se->globals;
+        ST_sym_t *prev = ST_sym_find_in(tbl, d->name);
         if (prev) {
             b8 prev_proto =
                 prev->decl && prev->decl->kind == ST_DE_FN && prev->decl->fn.is_prototype;
@@ -4256,7 +4261,7 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
             ST_diag_restore_file(se, save_diag_file, save_diag_src);
             continue;
         }
-        ST_sym_insert(se, &se->globals,
+        ST_sym_insert(se, tbl,
                       ST_sym_new(se, ST_decl_sym_kind(d), d->name, d, NULL, d->line, d->col));
         ST_diag_restore_file(se, save_diag_file, save_diag_src);
     }
@@ -4361,7 +4366,8 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, d->name);
+	ST_ht_t *tbl = ST_decl_sym_kind(d) == ST_SYM_TYPE ? &se->types : &se->globals;
+        ST_sym_t *sym = ST_sym_find_in(tbl, d->name);
         if (!sym || sym->decl != d)
             continue;
         ST_string_t save_diag_file, save_diag_src;
@@ -4394,7 +4400,8 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, d->name);
+	ST_ht_t *tbl = ST_decl_sym_kind(d) == ST_SYM_TYPE ? &se->types : &se->globals;
+        ST_sym_t *sym = ST_sym_find_in(tbl, d->name);
         if (!sym || sym->decl != d)
             continue;
         ST_string_t save_diag_file, save_diag_src;
@@ -4811,7 +4818,7 @@ static void ST_sema_synth_type_info(ST_sema_t *se) {
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "size", "u32"));
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "align", "u32"));
 
-    ST_sym_insert(se, &se->globals, ST_sym_new(se, ST_SYM_TYPE, d->name, d, NULL, 0, 0));
+    ST_sym_insert(se, &se->types, ST_sym_new(se, ST_SYM_TYPE, d->name, d, NULL, 0, 0));
     se->type_info_ty = ST_ty_for_decls(&se->tys, d);
     ST_complete_ty(se, se->type_info_ty);
 }
@@ -4879,6 +4886,7 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
     se->diag.file = file;
     se->diag.max_errors = ST_SEMA_MAX_ERRORS;
     ST_ht_init(arena, &se->globals, 64);
+    ST_ht_init(arena, &se->types, 32);
     ST_ht_init(arena, &se->templates, 16);
     ST_ht_init(arena, &se->instantiations, 16);
     ST_ht_init(arena, &se->fn_instantiations, 16);
