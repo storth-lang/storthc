@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "st_load.h"
+#include "../utils/platform/st_platform.h"
 
 typedef struct {
     ST_arena_t *arena;
@@ -17,7 +18,7 @@ static char *ST_str_cstr(ST_arena_t *a, ST_string_t s) {
 
 static ST_string_t ST_dirname_sv(ST_string_t path) {
     u32 i = path.len;
-    while (i > 0 && path.data[i - 1] != '/')
+    while (i > 0 && path.data[i - 1] != '/' && path.data[i - 1] != '\\')
         i--;
     if (i == 0)
         return ST_cstr_to_str(".");
@@ -25,7 +26,7 @@ static ST_string_t ST_dirname_sv(ST_string_t path) {
 }
 
 static ST_string_t ST_join_dir(ST_arena_t *a, ST_string_t dir, ST_string_t rel) {
-    if (rel.len && rel.data[0] == '/')
+    if (rel.len && ST_path_is_absolute((const char *)rel.data))
         return rel;
     u32 total = dir.len + 1 + rel.len;
     u8 *buf = ST_arena_push(a, total + 1);

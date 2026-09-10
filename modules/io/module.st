@@ -1,1 +1,1 @@
-#load "print.st";
+#import "os"

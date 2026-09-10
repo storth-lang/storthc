@@ -1,20 +1,33 @@
-STDOUT :: #comptime 1;
-STDERR :: #comptime 2;
+LINUX_STDOUT :: #comptime 1;
+LINUX_STDERR :: #comptime 2;
 
-pub fn io_write_byte(fd: i32, b: i8) {
-    #asm {
-        xor rbx, rbx
-        mov bl, b
-        dec rsp
-        mov [rsp], bl
-        mov rax, 1
-        mov rdi, fd
-        mov rsi, rsp
-        mov rdx, 1
-        syscall
-        inc rsp
+WIN_STDOUT :: #comptime -11;
+WIN_STDERR :: #comptime -12;
+
+#import "os";
+
+pub fn io_write_bytes(fd: i32, b: i8) {
+    #if OS {
+        case WINDOWS { sys_write(WIN_STDOUT, b); }
+        case WIN32   { sys_write(WIN_STDOUT, b); }
+        case LINUX   { sys_write(fd, b); }
     }
 }
+
+// pub fn io_write_byte(fd: i32, b: i8) {
+//     #asm {
+//         xor rbx, rbx
+//         mov bl, b
+//         dec rsp
+//         mov [rsp], bl
+//         mov rax, 1
+//         mov rdi, fd
+//         mov rsi, rsp
+//         mov rdx, 1
+//         syscall
+//         inc rsp
+//     }
+// }
 
 fn io_write_int(fd: i32, n: i64) {
     if n < 0 {

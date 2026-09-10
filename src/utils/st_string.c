@@ -1,4 +1,6 @@
+#ifndef _WIN32
 #define _XOPEN_SOURCE 700
+#endif
 
 #include "st_string.h"
 #include <string.h>
@@ -89,7 +91,11 @@ ST_string_t ST_abs_path(ST_arena_t *arena, const char *path) {
         };
     }
     char buf[4096];
+#ifdef _WIN32
+    const char *resolved = _fullpath(buf, path, sizeof(buf)) ? buf : path;
+#else
     const char *resolved = realpath(path, buf) ? buf : path;
+#endif
     u32 len = (u32)strlen(resolved);
     ST_string_t sv = {
         .data = ST_arena_push(arena, len),

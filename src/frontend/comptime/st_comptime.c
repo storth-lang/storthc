@@ -1,6 +1,6 @@
 #include "st_comptime.h"
 
-#include <dlfcn.h>
+#include "../../utils/platform/st_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,14 +180,14 @@ void ST_ct_emit_pack_struct(ST_ct_chunk_t *c, const u32 *field_sizes, u32 n_fiel
 }
 
 void *ST_ct_lib_load(const char *path) {
-    return dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    return ST_load_dynlib(path);
 }
 
 ST_ct_native_t ST_ct_lib_bind(void *handle, const char *sym, u32 n_args) {
     ST_ct_native_t n = {0};
     if (!handle)
         return n;
-    n.fn = dlsym(handle, sym);
+    n.fn = ST_load_dynlib_fn(handle, sym);
     n.n_args = n_args;
     return n;
 }
@@ -599,7 +599,7 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 u32 n = name.str.len < sizeof(buf) - 1 ? name.str.len : (u32)sizeof(buf) - 1;
                 memcpy(buf, name.str.data, n);
                 buf[n] = 0;
-                void *addr = dlsym(handle.ptr, buf);
+                void *addr = ST_load_dynlib_fn(handle.ptr, buf);
                 ST_ct_push(vm, addr ? ST_ct_ptr(addr) : ST_ct_nil());
                 break;
             }

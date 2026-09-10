@@ -14,7 +14,7 @@ LDLIBS := -lm
 
 TARGET := $(BINDIR)/storthc
 
-SRC := $(shell find $(SRCROOT) -name '*.c')
+SRC := $(shell find $(SRCROOT) -name '*.c' ! -name '*win32*')
 OBJ := $(patsubst $(SRCROOT)/%.c,$(OBJROOT)/%.o,$(SRC))
 DEP := $(OBJ:.o=.d)
 

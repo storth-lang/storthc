@@ -3,9 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
+#include "../utils/platform/st_platform.h"
 #include "../utils/st_string.h"
+
 #include "st_lexer.h"
 #include "st_load.h"
 #include "st_parser.h"
@@ -19,7 +20,7 @@ static char *ST_mod_cstr(ST_arena_t *a, ST_string_t s) {
 
 static ST_string_t ST_mod_dirname(ST_string_t path) {
     u32 i = path.len;
-    while (i > 0 && path.data[i - 1] != '/')
+    while (i > 0 && path.data[i - 1] != '/' && path.data[i - 1] != '\\')
         i--;
     if (i == 0)
         return ST_cstr_to_str(".");
@@ -27,6 +28,12 @@ static ST_string_t ST_mod_dirname(ST_string_t path) {
 }
 
 static ST_string_t ST_mod_join(ST_arena_t *a, const char *dir, ST_string_t rel) {
+    if (rel.len && ST_path_is_absolute((const char *)rel.data)) {
+        u8 *buf = ST_arena_push(a, rel.len + 1);
+        memcpy(buf, rel.data, rel.len);
+        buf[rel.len] = 0;
+        return (ST_string_t){.data = buf, .len = rel.len};
+    }
     u32 dlen = (u32)strlen(dir);
     u32 total = dlen + 1 + rel.len;
     u8 *buf = ST_arena_push(a, total + 1);
@@ -55,11 +62,12 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     }
 
     ST_string_t candidate = ST_mod_join(arena, ST_mod_cstr(arena, importer_dir), rel);
-    if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+    if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
         return 1;
     }
 
+    #ifndef _WIN32 // Enviroment varable are stinky unix problem.
     const char *env = getenv("STORTHC_MODULE_PATH");
     if (env && *env) {
         candidate = ST_mod_join(arena, env, rel);
@@ -70,8 +78,6 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     }
 
     candidate = ST_mod_join(arena, "/usr/local/storthc/modules", (ST_string_t){0});
-    // ST_mod_join expects a single 'rel' path; build the final candidate by
-    // hand here since 'name' still needs '/module.st' appended.
     {
         const char *base = "/usr/local/storthc/modules";
         u32 blen = (u32)strlen(base);
@@ -88,10 +94,13 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
         buf[n] = 0;
         candidate = (ST_string_t){.data = buf, .len = n};
     }
-    if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+    #endif
+
+    if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
         return 1;
     }
+
 
     return 0;
 }

@@ -156,6 +156,31 @@ static void ST_perr_here(ST_parser_t *p, const char *fmt, ...) {
         ST_perr(p, ST_cur_line(p), ST_cur_col(p), "%s", buf);
 }
 
+// @note: a non-fatal, advisory diagnostic -- unlike ST_perr_tok, this never
+// increments p->n_errors (so it can never fail the build on its own) and
+// is silently skipped during speculative/backtracking parses, same as
+// errors are. Used for deprecation notices etc. where the code is still
+// valid and should keep compiling. Prints the same source-line-plus-caret
+// snippet ST_perr_tok does, so the warning shows the actual expression
+// being flagged, not just a bare line:col.
+static void ST_pwarn_tok(ST_parser_t *p, ST_token_t *t, const char *fmt, ...) {
+    if (p->suppress_errors)
+        return;
+    ST_string_t src = p->srcs ? ST_srcmap_get(p->srcs, t->file) : (ST_string_t){0};
+    if (!src.data)
+        src = p->src;
+    fprintf(stderr,
+            ST_COLOR_BOLD ST_sv_fmt ":%u:%u: " ST_COLOR_YELLOW
+                                    "warning: " ST_COLOR_RESET ST_COLOR_BOLD,
+            ST_sv_args(t->file), t->line, t->col);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, ST_COLOR_RESET "\n");
+    ST_snippet_src(src, t->line, t->col);
+}
+
 static void ST_sync_stmt(ST_parser_t *p) {
     i32 depth = 0;
     while (p->pos < p->n_tokens) {
@@ -907,20 +932,87 @@ static const char *ST_match_binop(ST_parser_t *p, u32 level) {
     return NULL;
 }
 
+// @note: slices raw source text between two token boundaries -- token
+// .text spans point directly into the (arena-owned) source buffer, so a
+// span from 'from's start to 'to_excl's start is just pointer
+// subtraction; 'to_excl' NULL means "to end of source". Trims trailing
+// whitespace, since the end boundary lands at the start of whatever
+// comes right after (a space, a newline, etc.), not at the span's last
+// real character. Used to show the actual expression/type text in the
+// '#as' deprecation warning instead of a generic placeholder.
+static ST_string_t ST_span_between(ST_token_t *from, ST_token_t *to_excl, ST_string_t src) {
+    if (!from || !from->text.data)
+        return (ST_string_t){0};
+    u8 *start = from->text.data;
+    u8 *end = (to_excl && to_excl->text.data) ? to_excl->text.data : (src.data + src.len);
+    if (end < start)
+        return (ST_string_t){0};
+    u32 len = (u32)(end - start);
+    while (len > 0 && ST_iswhitespace((char)start[len - 1]))
+        len--;
+    return (ST_string_t){.data = start, .len = len};
+}
+
+// @note: 'cast(Type) expr' is prefix -- checked first, before ever calling
+// ST_parse_unary, since 'cast' is a keyword ST_parse_primary doesn't
+// otherwise handle. The postfix '#as' loop still runs afterward so the
+// two forms compose, e.g. 'cast(u32) x #as u64'. '#as' itself is
+// deprecated: every use warns (non-fatally) to prefer 'cast(Type) expr'.
 static ST_expr_t *ST_parse_cast_expr(ST_parser_t *p) {
-    ST_expr_t *e = ST_parse_unary(p);
-    if (!e)
-        return NULL;
-    while (ST_at_symbol(p, "#as")) {
+    ST_token_t *e_start = ST_peek(p);
+    ST_expr_t *e;
+    if (ST_at_keyword(p, "cast")) {
         ST_token_t *t = ST_peek(p);
         p->pos++;
+        if (!ST_expect_sym(p, "("))
+            return NULL;
+
+        ST_tyexpr_t *to = ST_parse_type(p);
+        if (!to)
+            return NULL;
+
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+
+        ST_expr_t *op = ST_parse_cast_expr(p);
+        if (!op)
+            return NULL;
+
+        ST_expr_t *c = ST_expr_new(p->arena, ST_EX_CAST, t->line, t->col);
+        c->cast.operand = op;
+        c->cast.to = to;
+        e = c;
+    } else {
+        e = ST_parse_unary(p);
+        if (!e)
+            return NULL;
+    }
+
+    while (ST_at_symbol(p, "#as")) {
+        ST_token_t *t = ST_peek(p);
+        ST_string_t warn_src = p->srcs ? ST_srcmap_get(p->srcs, t->file) : (ST_string_t){0};
+        if (!warn_src.data)
+            warn_src = p->src;
+        ST_string_t operand_src = ST_span_between(e_start, t, warn_src);
+        p->pos++;
+        u32 type_start_pos = p->pos;
+        ST_tyexpr_t *to = ST_parse_type(p);
+        if (!to)
+            return NULL;
+        ST_string_t type_src =
+            ST_span_between(ST_tok_at(p, type_start_pos), ST_peek(p), warn_src);
+        if (operand_src.len && type_src.len)
+            ST_pwarn_tok(p, t,
+                        "'#as' is deprecated, use 'cast(" ST_sv_fmt ") " ST_sv_fmt "' instead",
+                        ST_sv_args(type_src), ST_sv_args(operand_src));
+        else
+            ST_pwarn_tok(p, t, "'#as' is deprecated, use 'cast(Type) expr' instead");
         ST_expr_t *c = ST_expr_new(p->arena, ST_EX_CAST, t->line, t->col);
         c->cast.operand = e;
-        c->cast.to = ST_parse_type(p);
-        if (!c->cast.to)
-            return NULL;
+        c->cast.to = to;
         e = c;
     }
+
     return e;
 }
 

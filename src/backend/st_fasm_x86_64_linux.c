@@ -1,4 +1,4 @@
-#include "st_fasm_x86_64_linux.h"
+#include "st_fasm.h"
 #include <stdio.h>
 #include <string.h>
 
