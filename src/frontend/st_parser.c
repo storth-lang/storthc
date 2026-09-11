@@ -542,6 +542,27 @@ static b8 ST_parse_call_args(ST_parser_t *p, ST_args_t *out) {
     return ST_expect_sym(p, ")");
 }
 
+static ST_string_t ST_mangle_trait_impl_name(ST_arena_t *a, ST_string_t trait_name,
+                                             ST_tyexprs_t *args, u32 impl_id) {
+    ST_string_t suffix = (args->count && args->items[0]->kind == ST_TE_NAME)
+                             ? args->items[0]->name
+                             : ST_cstr_to_str("anon");
+    char idbuf[16];
+    u32 idlen = (u32)snprintf(idbuf, sizeof(idbuf), "%u", impl_id);
+    u32 total = trait_name.len + 1 + suffix.len + 1 + idlen;
+    u8 *buf = ST_arena_push(a, total);
+    u32 off = 0;
+    memcpy(buf + off, trait_name.data, trait_name.len);
+    off += trait_name.len;
+    buf[off++] = '$';
+    memcpy(buf + off, suffix.data, suffix.len);
+    off += suffix.len;
+    buf[off++] = '$';
+    memcpy(buf + off, idbuf, idlen);
+    off += idlen;
+    return (ST_string_t){.data = buf, .len = off};
+}
+
 static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
     ST_token_t *t = ST_peek(p);
     if (!t) {
@@ -779,9 +800,30 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             }
             p->suppress_errors--;
             if (ok && gargs.count && ST_at_symbol(p, ")") && ST_tok_is_symbol(ST_peek2(p), "{")) {
+                u32 save_pos2 = p->pos, save_err2 = p->n_errors, save_nested = p->nested_fns.count;
                 p->pos++; // )
-                p->pos++; // }
-                return ST_parse_struct_lit(p, t->text, gargs, t->line, t->col);
+                p->pos++; // {
+                p->suppress_errors++;
+                ST_expr_t *lit = ST_parse_struct_lit(p, t->text, gargs, t->line, t->col);
+                p->suppress_errors--;
+                if (lit)
+                    return lit;
+                p->pos = save_pos2;
+                p->n_errors = save_err2;
+                p->nested_fns.count = save_nested;
+                p->pos += 2; // ) {
+                ST_expr_t *ti = ST_expr_new(p->arena, ST_EX_TRAIT_IMPL, t->line, t->col);
+                ti->trait_impl.trait_name = t->text;
+                ti->trait_impl.trait_args = gargs;
+                ST_string_t synth = ST_mangle_trait_impl_name(p->arena, t->text, &gargs, ++p->next_trait_impl_id);
+                ST_da_append_arena(p->arena, &p->fn_name_stack, synth);
+                b8 body_ok = ST_parse_body(p, &ti->trait_impl.body);
+                p->fn_name_stack.count--;
+                if (!body_ok)
+                    return NULL;
+                if (!ST_expect_sym(p, "}"))
+                    return NULL;
+                return ti;
             }
             p->pos = save_pos;
             p->n_errors = save_err;
@@ -2026,6 +2068,75 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
     return d;
 }
 
+static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
+    ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TRAIT, line, col);
+    d->name = ST_expect_ident(p, "a trait name");
+    if (!d->name.len)
+        return NULL;
+    if (!ST_parse_generic_list(p, &d->trait_.generics))
+        return NULL;
+    if (!ST_expect_sym(p, "{"))
+        return NULL;
+    while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
+        if (ST_at_symbol(p, ";")) {
+            p->pos++;
+            continue;
+        }
+        ST_token_t *mt = ST_peek(p);
+        if (ST_tok_is_ident(mt) && ST_tok_is_symbol(ST_peek2(p), ":=")) {
+            if (d->trait_.self_alias.len) {
+                ST_perr_here(p, "trait '" ST_sv_fmt "' already has a self alias '" ST_sv_fmt "'",
+                             ST_sv_args(d->name), ST_sv_args(d->trait_.self_alias));
+                return NULL;
+            }
+            d->trait_.self_alias = mt->text;
+            p->pos += 2;
+            if (!ST_expect_sym(p, "$"))
+                return NULL;
+            ST_string_t gname = ST_expect_ident(p, "a generic parameter after '$'");
+            if (!gname.len)
+                return NULL;
+            b8 known = 0;
+            ST_forrange(0, d->trait_.generics.count)
+                if (ST_string_eq(d->trait_.generics.items[i], gname))
+                    known = 1;
+            if (!known) {
+                ST_perr_here(p, "'$" ST_sv_fmt "' is not one of trait '" ST_sv_fmt "'s generic parameters",
+                             ST_sv_args(gname), ST_sv_args(d->name));
+                return NULL;
+            }
+            if (!ST_expect_semi(p))
+                return NULL;
+            continue;
+        }
+        if (!ST_tok_is_keyword(mt, "fn")) {
+            ST_perr_here(p,
+                        "expected a method signature ('fn name(...) -> ret;') inside trait '" ST_sv_fmt "'",
+                        ST_sv_args(d->name));
+            return NULL;
+        }
+        p->pos++;
+        ST_trait_method_t m = {.line = mt->line, .col = mt->col};
+        m.name = ST_expect_ident(p, "a method name");
+        if (!m.name.len)
+            return NULL;
+        if (!ST_parse_fn_sig(p, &m.sig, 0))
+            return NULL;
+        if (!m.sig.has_ret_ann) {
+            ST_perr(p, m.line, m.col,
+                    "trait method '" ST_sv_fmt "' needs a return annotation (`-> void` if none)",
+                    ST_sv_args(m.name));
+            return NULL;
+        }
+        if (!ST_expect_semi(p))
+            return NULL;
+        ST_da_append_arena(p->arena, &d->trait_.methods, m);
+    }
+    if (!ST_expect_sym(p, "}"))
+        return NULL;
+    return d;
+}
+
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
     if (!ST_expect_sym(p, "("))
         return 0;
@@ -2228,6 +2339,65 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         }
     }
 
+    ST_where_clauses_t wheres = {0};
+    while (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "where")) {
+        p->pos++;
+        ST_where_clause_t w = {.line = t->line, .col = t->col};
+        w.witness_name = ST_expect_ident(p, "a witness name after 'where'");
+        if (!w.witness_name.len)
+            return NULL;
+        if (!ST_expect_sym(p, ":"))
+            return NULL;
+        w.trait_name = ST_expect_ident(p, "a trait name after ':'");
+        if (!w.trait_name.len)
+            return NULL;
+        if (!ST_expect_sym(p, "("))
+            return NULL;
+        while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
+            if (ST_at_symbol(p, ",")) {
+                p->pos++;
+                continue;
+            }
+            ST_tyexpr_t *arg = ST_parse_type(p);
+            if (!arg)
+                return NULL;
+            ST_da_append_arena(p->arena, &w.trait_args, arg);
+        }
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+        ST_da_append_arena(p->arena, &wheres, w);
+        t = ST_peek(p);
+        if (!t) {
+            ST_perr_here(p, "expected 'fn' after a 'where' clause");
+            return NULL;
+        }
+    }
+    if (wheres.count) {
+        if (!ST_tok_is_keyword(t, "fn")) {
+            ST_perr_here(p, "'where' clauses are only allowed directly before a function declaration");
+            return NULL;
+        }
+        ST_decl_t *d = ST_parse_fn_decl(p, is_pub);
+        if (d) {
+            d->fn.sig.wheres = wheres;
+            // Each 'where name : Trait($T)' becomes sugar for a real trailing
+            // parameter 'name: Trait($T)':
+            ST_forrange(0, wheres.count) {
+                ST_where_clause_t *w = &wheres.items[i];
+                ST_param_t wp = {0};
+                wp.name = w->witness_name;
+                wp.line = w->line;
+                wp.col = w->col;
+                ST_tyexpr_t *wte = ST_tyexpr_new(p->arena, ST_TE_GENERIC_INST, w->line, w->col);
+                wte->name = w->trait_name;
+                wte->generic_args = w->trait_args;
+                wp.te = wte;
+                ST_da_append_arena(p->arena, &d->fn.sig.params, wp);
+            }
+        }
+        return d;
+    }
+
     if (ST_tok_is_keyword(t, "struct")) {
         p->pos++;
         ST_string_t name = ST_expect_ident(p, "a struct name");
@@ -2266,6 +2436,15 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         if (!ST_expect_semi(p))
             return NULL;
+        return d;
+    }
+
+    if ((ST_tok_is_keyword(t, "trait") || (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "trait"))) &&
+        ST_tok_is_ident(ST_peek2(p))) {
+        p->pos++;
+        ST_decl_t *d = ST_parse_trait_decl(p, t->line, t->col);
+        if (d)
+            d->is_pub = is_pub;
         return d;
     }
 

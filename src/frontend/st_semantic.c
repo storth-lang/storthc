@@ -92,6 +92,36 @@ static ST_sym_t *ST_sym_new(ST_sema_t *se, ST_sym_kind_t kind, ST_string_t name,
     return sym;
 }
 
+typedef struct {
+    ST_sym_t **items;
+    u32 count, capacity;
+} ST_syms_t;
+
+static void ST_overload_register(ST_sema_t *se, ST_string_t name, ST_sym_t *sym) {
+    ST_ht_generic_t key = ST_name_key(name);
+    ST_syms_t *list = (ST_syms_t *)ST_ht_get(&se->overloads, key).tag;
+    if (!list) {
+        list = ST_arena_push_zeroed(se->arena, sizeof(*list));
+        ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
+        hk->tag = name.data;
+        hk->size = name.len;
+        ST_ht_set(&se->overloads, hk, (ST_ht_generic_t){.tag = list, .size = 0});
+    }
+    ST_da_append_arena(se->arena, list, sym);
+}
+
+static ST_syms_t *ST_overload_find(ST_sema_t *se, ST_string_t name) {
+    return (ST_syms_t *)ST_ht_get(&se->overloads, ST_name_key(name)).tag;
+}
+
+// @note: the various prog->decls passes (ST_sema_types, ST_sema_check,
+// ST_sema_default_types) each need 'the symbol for exactly this decl', not
+// just 'a symbol with this name'
+ST_sym_t *ST_sym_for_decl(ST_sema_t *se, ST_decl_t *d) {
+    ST_unused(se);
+    return (ST_sym_t *)d->sema_sym;
+}
+
 static void ST_scope_push(ST_sema_t *se) {
     ST_scope_t *s = ST_arena_push_zeroed(se->arena, sizeof(*s));
     ST_ht_init(se->arena, &s->table, 8);
@@ -106,19 +136,19 @@ static void ST_scope_pop(ST_sema_t *se) {
 static const char *ST_sym_kind_str(ST_sym_kind_t kind) {
     switch (kind) {
         case ST_SYM_VAR:
-            return "variable";
+        return "variable";
         case ST_SYM_FN:
-            return "function";
+        return "function";
         case ST_SYM_TYPE:
-            return "type";
+        return "type";
         case ST_SYM_CONST:
-            return "constant";
+        return "constant";
         case ST_SYM_EXTERN_VAR:
-            return "extern variable";
+        return "extern variable";
         case ST_SYM_GLOBAL:
-            return "global variable";
+        return "global variable";
         case ST_SYM_MODULE:
-            return "module";
+        return "module";
     }
     return "symbol";
 }
@@ -162,7 +192,7 @@ static const char *ST_tstr(ST_sema_t *se, ST_ty_t *t) {
 
 static ST_ty_t *ST_prim_by_name(ST_sema_t *se, ST_string_t name) {
     ST_forrange(
-        0, ST_TYPE_COUNT) if (ST_string_eq_cstr(name, ST_type_names[i])) return se->tys.prim[i];
+                0, ST_TYPE_COUNT) if (ST_string_eq_cstr(name, ST_type_names[i])) return se->tys.prim[i];
     return NULL;
 }
 
@@ -249,7 +279,10 @@ static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
 static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t target,
                                    ST_expr_t *replacement); // used by ST_type_expr's
-                                   // ST_EX_PACK_FOLD case, defined later in this file
+// ST_EX_PACK_FOLD case, defined later in this file
+static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t target,
+                                   ST_expr_t *replacement); // used by ST_instantiate_fn_ex's
+// 'where' clause witness substitution, defined later in this file
 static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig);
 static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 
@@ -331,11 +364,11 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_INT:
         case ST_EX_CHAR:
         case ST_EX_BOOL:
-            *out = e->ival;
-            return 1;
+        *out = e->ival;
+        return 1;
         case ST_EX_NULL:
-            *out = 0;
-            return 1;
+        *out = 0;
+        return 1;
         case ST_EX_IDENT: {
             ST_sym_t *sym = ST_sym_find(se, e->name);
             if (!sym || sym->kind != ST_SYM_CONST || !sym->decl)
@@ -364,9 +397,9 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
             return 0;
         }
         case ST_EX_BINARY:
-            return ST_const_eval_bin(se, e, out);
+        return ST_const_eval_bin(se, e, out);
         case ST_EX_CAST:
-            return ST_const_eval(se, e->cast.operand, out);
+        return ST_const_eval(se, e->cast.operand, out);
         case ST_EX_SIZEOF: {
             ST_ty_t *t;
             if (e->tyop.te) {
@@ -426,10 +459,10 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_ASM:
         case ST_EX_STR_FROM_RAW:
         case ST_EX_PACK_FOLD:
-            return 0;
+        return 0;
         case ST_EX_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
     return 0;
 }
@@ -528,6 +561,267 @@ static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t a
     return t;
 }
 
+static void ST_mark_trait_self_ty(ST_tyexpr_t *te, ST_string_t alias, ST_string_t generic_name) {
+    if (!te)
+        return;
+    if (te->kind == ST_TE_NAME) {
+        if (!te->is_generic_param && ST_string_eq(te->name, alias)) {
+            te->is_generic_param = 1;
+            te->name = generic_name;
+        }
+        return;
+    }
+    ST_mark_trait_self_ty(te->inner, alias, generic_name);
+    for (u32 i = 0; i < te->fn_params.count; i++)
+        ST_mark_trait_self_ty(te->fn_params.items[i], alias, generic_name);
+    for (u32 i = 0; i < te->fn_rets.count; i++)
+        ST_mark_trait_self_ty(te->fn_rets.items[i], alias, generic_name);
+    for (u32 i = 0; i < te->generic_args.count; i++)
+        ST_mark_trait_self_ty(te->generic_args.items[i], alias, generic_name);
+}
+
+static void ST_normalize_trait_self_alias(ST_decl_t *trait) {
+    if (!trait->trait_.self_alias.len || !trait->trait_.generics.count)
+        return;
+    ST_string_t alias = trait->trait_.self_alias;
+    ST_string_t generic_name = trait->trait_.generics.items[0];
+    for (u32 i = 0; i < trait->trait_.methods.count; i++) {
+        ST_fn_sig_t *sig = &trait->trait_.methods.items[i].sig;
+        for (u32 j = 0; j < sig->params.count; j++)
+            ST_mark_trait_self_ty(sig->params.items[j].te, alias, generic_name);
+        for (u32 j = 0; j < sig->rets.count; j++)
+            ST_mark_trait_self_ty(sig->rets.items[j], alias, generic_name);
+    }
+}
+
+static ST_ty_t *ST_instantiate_trait_witness(ST_sema_t *se, ST_decl_t *trait, ST_tys_t args,
+                                             u32 line, u32 col) {
+    if (args.count != trait->trait_.generics.count) {
+        ST_diag_error(&se->diag, line, col,
+                      "trait '" ST_sv_fmt "' expects %u type argument(s), got %u",
+                      ST_sv_args(trait->name), trait->trait_.generics.count, args.count);
+        return NULL;
+    }
+    for (u32 k = 0; k < args.count; k++)
+        if (!args.items[k])
+            return NULL;
+
+    ST_normalize_trait_self_alias(trait);
+
+    ST_string_t mangled = ST_ty_mangle_instance_name(se->arena, trait->name, &args);
+    ST_ht_generic_t key = {.tag = mangled.data, .size = mangled.len};
+    ST_ht_generic_t existing = ST_ht_get(&se->trait_witnesses, key);
+    if (existing.tag)
+        return (ST_ty_t *)existing.tag;
+
+    ST_decl_t *id = ST_decl_new(se->arena, ST_DE_STRUCT, line, col);
+    id->name = mangled;
+    id->file = trait->file;
+    id->is_pub = trait->is_pub;
+    {
+        char buf[512];
+        int n = snprintf(buf, sizeof(buf), "%.*s(", (int)trait->name.len, trait->name.data);
+        for (u32 k = 0; k < args.count; k++) {
+            if (n < (int)sizeof(buf))
+                n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%s", k ? ", " : "",
+                              ST_ty_cstr(se->arena, args.items[k]));
+        }
+        if (n < (int)sizeof(buf))
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, ")");
+        if (n > (int)sizeof(buf))
+            n = (int)sizeof(buf);
+        u8 *copy = ST_arena_push(se->arena, (u32)n);
+        memcpy(copy, buf, (size_t)n);
+        id->display_name = (ST_string_t){.data = copy, .len = (u32)n};
+    }
+
+    for (u32 k = 0; k < trait->trait_.methods.count; k++) {
+        ST_trait_method_t *m = &trait->trait_.methods.items[k];
+        ST_tyexpr_t *fnte = ST_tyexpr_new(se->arena, ST_TE_FN, m->line, m->col);
+        fnte->fn_is_variadic = m->sig.is_variadic;
+        fnte->fn_is_noreturn = m->sig.is_noreturn;
+        for (u32 p = 0; p < m->sig.params.count; p++)
+            ST_da_append_arena(se->arena, &fnte->fn_params, m->sig.params.items[p].te);
+        for (u32 r = 0; r < m->sig.rets.count; r++)
+            ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[r]);
+
+        ST_field_spec_t f = {0};
+        f.name = m->name;
+        f.te = fnte;
+        f.line = m->line;
+        f.col = m->col;
+        ST_da_append_arena(se->arena, &id->struct_.fields, f);
+    }
+
+    ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
+    t->is_trait_witness = 1;
+    ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
+    hk->tag = mangled.data;
+    hk->size = mangled.len;
+    ST_ht_set(&se->trait_witnesses, hk, (ST_ht_generic_t){.tag = t, .size = 0});
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, id);
+
+    ST_ht_t bindings;
+    ST_ht_init(se->arena, &bindings, 8);
+    for (u32 k = 0; k < args.count; k++) {
+        ST_string_t *pname = trait->trait_.generics.items + k;
+        ST_ht_generic_t *bk = ST_arena_push(se->arena, sizeof(*bk));
+        bk->tag = pname->data;
+        bk->size = pname->len;
+        ST_ht_set(&bindings, bk, (ST_ht_generic_t){.tag = args.items[k], .size = 0});
+    }
+
+    ST_ht_t *save = se->generic_bindings;
+    b8 save_s = se->stamp_tyexprs;
+    se->generic_bindings = &bindings;
+    se->stamp_tyexprs = 0;
+
+    ST_complete_ty(se, t);
+
+    se->stamp_tyexprs = save_s;
+    se->generic_bindings = save;
+
+    return t;
+}
+
+static i32 ST_trait_method_index(ST_decl_t *trait, ST_string_t name) {
+    for (u32 i = 0; i < trait->trait_.methods.count; i++)
+        if (ST_string_eq(trait->trait_.methods.items[i].name, name))
+            return (i32)i;
+    return -1;
+}
+
+// @note: resolves a 'where name : Trait(...)' witness for one call site.
+// Checks the *caller's currently active scope* first (innermost block out
+// to the enclosing function's params), so an ordinary local shadows a
+// same-named global exactly like any other identifier would -- this is
+// what lets 'main' declare its own witness and have calls made from
+// inside 'main' pick it up automatically. Only once no local matches does
+// it fall back to the overload table (multiple top-level witnesses of the
+// same name, different types) and finally a plain single global/const.
+static ST_sym_t *ST_find_witness(ST_sema_t *se, ST_string_t name, ST_ty_t *want_ty) {
+    for (ST_scope_t *s = se->scope; s; s = s->parent) {
+        ST_sym_t *sym = ST_sym_find_in(&s->table, name);
+        if (sym && sym->t && ST_ty_equal(sym->t, want_ty))
+            return sym;
+    }
+    ST_syms_t *ovl = ST_overload_find(se, name);
+    if (ovl) {
+        for (u32 i = 0; i < ovl->count; i++) {
+            ST_sym_t *cand = ovl->items[i];
+            if ((cand->kind == ST_SYM_GLOBAL || cand->kind == ST_SYM_CONST) && cand->t &&
+                ST_ty_equal(cand->t, want_ty))
+                return cand;
+        }
+    }
+    ST_sym_t *single = ST_sym_find_in(&se->globals, name);
+    if (single && (single->kind == ST_SYM_GLOBAL || single->kind == ST_SYM_CONST) &&
+        single->t && ST_ty_equal(single->t, want_ty))
+        return single;
+    return NULL;
+}
+
+static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
+    ST_sym_t *tsym = ST_sym_find(se, e->trait_impl.trait_name);
+    if (!tsym || tsym->kind != ST_SYM_TYPE || !tsym->decl || tsym->decl->kind != ST_DE_TRAIT) {
+        ST_diag_error(&se->diag, e->line, e->col, "'" ST_sv_fmt "' is not a known trait",
+                      ST_sv_args(e->trait_impl.trait_name));
+        return NULL;
+    }
+    ST_decl_t *trait = tsym->decl;
+
+    ST_tys_t args = {0};
+    b8 args_ok = 1;
+    for (u32 i = 0; i < e->trait_impl.trait_args.count; i++) {
+        ST_ty_t *at = ST_resolve_tyexpr(se, e->trait_impl.trait_args.items[i]);
+        if (!at)
+            args_ok = 0;
+        ST_da_append_arena(se->arena, &args, at);
+    }
+    if (!args_ok)
+        return NULL;
+
+    ST_ty_t *witness_ty = ST_instantiate_trait_witness(se, trait, args, e->line, e->col);
+    if (!witness_ty)
+        return NULL;
+
+    u32 n_methods = trait->trait_.methods.count;
+    b8 *supplied = ST_arena_push_zeroed(se->arena, n_methods ? n_methods : 1);
+    ST_field_inits_t inits = {0};
+
+    for (u32 i = 0; i < e->trait_impl.body.count; i++) {
+        ST_stmt_t *s = e->trait_impl.body.items[i];
+        if (s->kind == ST_ST_NESTED_FN) {
+            ST_decl_t *nd = s->nested_fn;
+            ST_string_t bare = nd->display_name.len ? nd->display_name : nd->name;
+            i32 idx = ST_trait_method_index(trait, bare);
+            if (idx < 0) {
+                ST_diag_error(&se->diag, nd->line, nd->col,
+                              "'" ST_sv_fmt "' is not a method of trait '" ST_sv_fmt "'",
+                              ST_sv_args(bare), ST_sv_args(trait->name));
+                continue;
+            }
+            ST_expr_t *ref = ST_expr_new(se->arena, ST_EX_IDENT, nd->line, nd->col);
+            ref->name = nd->name;
+            ST_ty_t *rt = ST_type_expr(se, ref);
+            ST_ty_t *field_ty =
+                (u32)idx < witness_ty->fields.count ? witness_ty->fields.items[idx].ty : NULL;
+            if (rt && field_ty && !ST_ty_coerces(se, rt, field_ty))
+                ST_diag_error(&se->diag, nd->line, nd->col,
+                              "'" ST_sv_fmt "' expects '%s', got '%s'",
+                              ST_sv_args(bare), ST_tstr(se, field_ty), ST_tstr(se, rt));
+            ST_field_init_t fi = {.name = bare, .value = ref, .line = nd->line, .col = nd->col};
+            ST_da_append_arena(se->arena, &inits, fi);
+            supplied[idx] = 1;
+            continue;
+        }
+        if (s->kind == ST_ST_ASSIGN && s->assign.lhs && s->assign.lhs->kind == ST_EX_FIELD &&
+            ST_string_eq_cstr(s->assign.op, "=")) {
+            ST_string_t field = s->assign.lhs->field.name;
+            i32 idx = ST_trait_method_index(trait, field);
+            if (idx < 0) {
+                ST_diag_error(&se->diag, s->line, s->col,
+                              "'" ST_sv_fmt "' is not a method of trait '" ST_sv_fmt "'",
+                              ST_sv_args(field), ST_sv_args(trait->name));
+                continue;
+            }
+            ST_ty_t *field_ty =
+                (u32)idx < witness_ty->fields.count ? witness_ty->fields.items[idx].ty : NULL;
+            ST_ty_t *vt = ST_type_expr(se, s->assign.rhs);
+            if (vt && field_ty && !ST_ty_coerces(se, vt, field_ty))
+                ST_diag_error(&se->diag, s->line, s->col,
+                              "'" ST_sv_fmt "' expects '%s', got '%s'",
+                              ST_sv_args(field), ST_tstr(se, field_ty), ST_tstr(se, vt));
+            ST_field_init_t fi = {.name = field, .value = s->assign.rhs, .line = s->line, .col = s->col};
+            ST_da_append_arena(se->arena, &inits, fi);
+            supplied[idx] = 1;
+            continue;
+        }
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "a trait impl body may only contain method definitions ('fn name(...) "
+                      "{ ... }') or '<name>.<method> = <existing fn>;' overrides");
+    }
+
+    for (u32 i = 0; i < n_methods; i++) {
+        if (!supplied[i])
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'" ST_sv_fmt "(%s)' is missing an implementation for method '"
+                          ST_sv_fmt "'",
+                          ST_sv_args(trait->name),
+                          ST_tstr(se, args.count ? args.items[0] : NULL),
+                          ST_sv_args(trait->trait_.methods.items[i].name));
+    }
+
+    e->kind = ST_EX_STRUCT_LIT;
+    e->struct_lit.type_name = witness_ty->decl ? witness_ty->decl->name : trait->name;
+    e->struct_lit.generic_args = (ST_tyexprs_t){0};
+    e->struct_lit.inits = inits;
+    e->struct_lit.is_bracket_lit = 0;
+
+    return witness_ty;
+}
+
 static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
     if (!te)
         return NULL;
@@ -619,11 +913,26 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
             return t;
         }
         case ST_TE_TYPEOF:
-            return ST_type_expr(se, te->typeof_operand);
+        return ST_type_expr(se, te->typeof_operand);
         case ST_TE_GENERIC_INST: {
             ST_sym_t *tmpl = ST_sym_find_in(&se->templates, te->name);
             if (!tmpl) {
-                if (ST_sym_find_in(&se->globals, te->name)) {
+                ST_sym_t *gsym = ST_sym_find_in(&se->globals, te->name);
+                if (gsym && gsym->kind == ST_SYM_TYPE && gsym->decl &&
+                    gsym->decl->kind == ST_DE_TRAIT) {
+                    ST_tys_t targs = {0};
+                    b8 tok = 1;
+                    ST_forrange(0, te->generic_args.count) {
+                        ST_ty_t *at = ST_resolve_tyexpr(se, te->generic_args.items[i]);
+                        if (!at)
+                            tok = 0;
+                        ST_da_append_arena(se->arena, &targs, at);
+                    }
+                    if (!tok)
+                        return NULL;
+                    return ST_instantiate_trait_witness(se, gsym->decl, targs, te->line, te->col);
+                }
+                if (gsym) {
                     ST_diag_error(&se->diag, te->line, te->col,
                                   "'" ST_sv_fmt "' is not a generic type", ST_sv_args(te->name));
                 } else
@@ -711,7 +1020,7 @@ static ST_tyexpr_t *ST_clone_tyexpr(ST_arena_t *a, ST_tyexpr_t *te) {
     n->generic_constraints = (ST_tyexprs_t){0};
     ST_forrange(0, te->generic_constraints.count)
         ST_da_append_arena(a, &n->generic_constraints,
-                          ST_clone_tyexpr(a, te->generic_constraints.items[i]));
+                           ST_clone_tyexpr(a, te->generic_constraints.items[i]));
 
     return n;
 }
@@ -723,32 +1032,32 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
     *n = *e;
     n->ty = NULL;
     switch(e->kind) {
-    case ST_EX_INT:
-    case ST_EX_FLOAT:
-    case ST_EX_STR:
-    case ST_EX_CHAR:
-    case ST_EX_BOOL:
-    case ST_EX_NULL:
-    case ST_EX_IDENT:
-    case ST_EX_ASM:
-    case ST_EX_PACK_FOLD: // just two ST_string_t fields, already shallow-copied by '*n = *e;'
+        case ST_EX_INT:
+        case ST_EX_FLOAT:
+        case ST_EX_STR:
+        case ST_EX_CHAR:
+        case ST_EX_BOOL:
+        case ST_EX_NULL:
+        case ST_EX_IDENT:
+        case ST_EX_ASM:
+        case ST_EX_PACK_FOLD: // just two ST_string_t fields, already shallow-copied by '*n = *e;'
         break;
 
-    case ST_EX_STR_FROM_RAW:
+        case ST_EX_STR_FROM_RAW:
         n->str_from_raw.ptr = ST_clone_expr(a, e->str_from_raw.ptr);
         n->str_from_raw.len = ST_clone_expr(a, e->str_from_raw.len);
         break;
 
-    case ST_EX_UNARY:
+        case ST_EX_UNARY:
         n->unary.operand = ST_clone_expr(a, e->unary.operand);
         break;
 
-    case ST_EX_BINARY:
+        case ST_EX_BINARY:
         n->bin.l = ST_clone_expr(a, e->bin.l);
         n->bin.r = ST_clone_expr(a, e->bin.r);
         break;
 
-    case ST_EX_CALL:
+        case ST_EX_CALL:
         n->call.callee = ST_clone_expr(a, e->call.callee);
         n->call.args = (ST_args_t){0};
         ST_forrange(0, e->call.args.count) {
@@ -758,21 +1067,21 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
         }
         break;
 
-    case ST_EX_FIELD:
+        case ST_EX_FIELD:
         n->field.base = ST_clone_expr(a, e->field.base);
         break;
 
-    case ST_EX_INDEX:
+        case ST_EX_INDEX:
         n->index.base = ST_clone_expr(a, e->index.base);
         n->index.index = ST_clone_expr(a, e->index.index);
         break;
 
-    case ST_EX_CAST:
+        case ST_EX_CAST:
         n->cast.operand = ST_clone_expr(a, e->cast.operand);
         n->cast.to = ST_clone_tyexpr(a, e->cast.to);
         break;
 
-    case ST_EX_STRUCT_LIT:
+        case ST_EX_STRUCT_LIT:
         n->struct_lit.generic_args = (ST_tyexprs_t){0};
         ST_forrange(0, e->struct_lit.generic_args.count)
             ST_da_append_arena(a, &n->struct_lit.generic_args,
@@ -785,25 +1094,25 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
             ST_da_append_arena(a, &n->struct_lit.inits, fi);
         }
         break;
-    case ST_EX_ARRAY_NEW:
+        case ST_EX_ARRAY_NEW:
         n->array_new.te = ST_clone_tyexpr(a, e->array_new.te);
         break;
 
-    case ST_EX_SIZEOF:
-    case ST_EX_TYPEOF:
-    case ST_EX_TYPEINFO:
-    case ST_EX_KIND:
-    case ST_EX_CSTR:
-    case ST_EX_FIELDS:
+        case ST_EX_SIZEOF:
+        case ST_EX_TYPEOF:
+        case ST_EX_TYPEINFO:
+        case ST_EX_KIND:
+        case ST_EX_CSTR:
+        case ST_EX_FIELDS:
         n->tyop.te = ST_clone_tyexpr(a, e->tyop.te);
         n->tyop.operand = ST_clone_expr(a, e->tyop.operand);
         break;
-    case ST_EX_COMP_ERROR:
+        case ST_EX_COMP_ERROR:
         n->comp_error.args = (ST_exprs_t){0};
         ST_forrange(0, e->comp_error.args.count)
             ST_da_append_arena(a, &n->comp_error.args, ST_clone_expr(a, e->comp_error.args.items[i]));
         break;
-    case ST_EX_COUNT:
+        case ST_EX_COUNT:
         ST_assert(0);
         break;
     }
@@ -825,28 +1134,28 @@ static ST_stmt_t *ST_clone_stmt(ST_arena_t *a, ST_stmt_t *s) {
     *n = *s;
     switch (s->kind) {
 
-    case ST_ST_EXPR:
+        case ST_ST_EXPR:
         n->expr = ST_clone_expr(a, s->expr);
         break;
 
-    case ST_ST_PACK_EXPAND:
+        case ST_ST_PACK_EXPAND:
         n->expr = ST_clone_expr(a, s->expr);
         break;
 
-    case ST_ST_DECL:
+        case ST_ST_DECL:
         n->decl.name = s->decl.name;
         n->decl.te = ST_clone_tyexpr(a, s->decl.te);
         n->decl.init = ST_clone_expr(a, s->decl.init);
         n->decl.is_static = s->decl.is_static;
         break;
 
-    case ST_ST_ASSIGN:
+        case ST_ST_ASSIGN:
         n->assign.lhs = ST_clone_expr(a, s->assign.lhs);
         n->assign.op = s->assign.op;
         n->assign.rhs = ST_clone_expr(a, s->assign.rhs);
         break;
 
-    case ST_ST_MULTI_BIND:
+        case ST_ST_MULTI_BIND:
         n->multi.n_names = s->multi.n_names;
         n->multi.names =
             s->multi.n_names ? ST_arena_push(a, sizeof(*n->multi.names) * s->multi.n_names) : NULL;
@@ -858,32 +1167,32 @@ static ST_stmt_t *ST_clone_stmt(ST_arena_t *a, ST_stmt_t *s) {
                                ST_clone_expr(a, s->multi.values.items[i]));
         break;
 
-    case ST_ST_IF:
+        case ST_ST_IF:
         n->if_.cond = ST_clone_expr(a, s->if_.cond);
         n->if_.then_body = ST_clone_body(a, &s->if_.then_body);
         n->if_.else_stmt = ST_clone_stmt(a, s->if_.else_stmt);
         break;
 
-    case ST_ST_SWITCH:
+        case ST_ST_SWITCH:
         n->switch_.cond = ST_clone_expr(a, s->switch_.cond);
         n->switch_.cases = (ST_cases_t){0};
         ST_forrange(0, s->switch_.cases.count) {
             ST_case_t *c = &s->switch_.cases.items[i];
             ST_case_t nc = { .line = c->line, .col = c->col};
             for (u32 k = 0; k < c->values.count; k++)
-            ST_da_append_arena(a, &nc.values,
-                               ST_clone_expr(a, c->values.items[k]));
+                ST_da_append_arena(a, &nc.values,
+                                   ST_clone_expr(a, c->values.items[k]));
             nc.body = ST_clone_body(a, &c->body);
             ST_da_append_arena(a, &n->switch_.cases, nc);
         }
         break;
 
-    case ST_ST_WHILE:
+        case ST_ST_WHILE:
         n->while_.cond = ST_clone_expr(a, s->while_.cond);
         n->while_.body = ST_clone_body(a, &s->while_.body);
         break;
 
-    case ST_ST_FOR_RANGE:
+        case ST_ST_FOR_RANGE:
         n->for_range.iter = s->for_range.iter;
         n->for_range.lo = ST_clone_expr(a, s->for_range.lo);
         n->for_range.hi = ST_clone_expr(a, s->for_range.hi);
@@ -892,52 +1201,52 @@ static ST_stmt_t *ST_clone_stmt(ST_arena_t *a, ST_stmt_t *s) {
         n->for_range.body = ST_clone_body(a, &s->for_range.body);
         break;
 
-    case ST_ST_FOR_ARRAY:
+        case ST_ST_FOR_ARRAY:
         n->for_array.iter = s->for_array.iter;
         n->for_array.target = ST_clone_expr(a, s->for_array.target);
         n->for_array.body = ST_clone_body(a, &s->for_array.body);
         break;
 
-    case ST_ST_RETURN:
+        case ST_ST_RETURN:
         n->ret.values = (ST_exprs_t){0};
         ST_forrange(0, s->ret.values.count)
             ST_da_append_arena(a, &n->ret.values,
                                ST_clone_expr(a, s->ret.values.items[i]));
         break;
 
-    case ST_ST_BLOCK:
+        case ST_ST_BLOCK:
         n->block = ST_clone_body(a, &s->block);
         break;
 
-    case ST_ST_COMPTIME_BLOCK:
+        case ST_ST_COMPTIME_BLOCK:
         n->block = ST_clone_body(a, &s->block);
         break;
 
-    case ST_ST_DEFER:
+        case ST_ST_DEFER:
         n->defer_stmt = ST_clone_stmt(a, s->defer_stmt);
         break;
 
-    case ST_ST_ASM:
+        case ST_ST_ASM:
         n->asm_.n_tokens = s->asm_.n_tokens;
         n->asm_.tokens =
             s->asm_.n_tokens ? ST_arena_push(a, sizeof(*n->asm_.tokens) * s->asm_.n_tokens) : NULL;
         ST_forrange(0, s->asm_.n_tokens) n->asm_.tokens[i] = s->asm_.tokens[i];
         break;
 
-    case ST_ST_LABEL:
-    case ST_ST_GODOWN:
+        case ST_ST_LABEL:
+        case ST_ST_GODOWN:
         n->label = s->label;
         break;
 
-    case ST_ST_BREAK:
-    case ST_ST_CONTINUE:
+        case ST_ST_BREAK:
+        case ST_ST_CONTINUE:
         break;
 
-    case ST_ST_NESTED_FN:
+        case ST_ST_NESTED_FN:
         n->nested_fn = s->nested_fn;
         break;
 
-    case ST_ST_COUNT:
+        case ST_ST_COUNT:
         ST_assert(0);
         break;
 
@@ -964,7 +1273,7 @@ static ST_fn_sig_t ST_clone_fn_sig(ST_arena_t *a, ST_fn_sig_t *s) {
 }
 
 static void ST_diagnostic_note_constraint(ST_sema_t *se, ST_tyexprs_t *constraints,
-					  u32 line, u32 col, ST_string_t pname) {
+                                          u32 line, u32 col, ST_string_t pname) {
     char pos_buf[512] = {0};
     char neg_buf[512] = {0};
 
@@ -972,38 +1281,38 @@ static void ST_diagnostic_note_constraint(ST_sema_t *se, ST_tyexprs_t *constrain
     u32 pos_len = 0, neg_len = 0;
 
     ST_forrange(0, constraints->count) {
-	ST_tyexpr_t *cte = constraints->items[i];
-	ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
+        ST_tyexpr_t *cte = constraints->items[i];
+        ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
 
-	if (!ct)
-	    continue;
+        if (!ct)
+            continue;
 
-	const char *nm = ST_tstr(se, ct);
-	if (cte->is_negeated_constraint) {
-	    int n = snprintf(neg_buf + neg_len, sizeof(neg_buf) - neg_len, "%s%s",
-			     neg_n ? ", ": "", nm);
-	    if (n > 0) neg_len += (u32)n;
-	    neg_n++;
-	} else {
-	    int n = snprintf(pos_buf + pos_len, sizeof(pos_buf) - pos_len, "%s%s",
-			     pos_n ? ", ": "", nm);
-	    if (n > 0) pos_len += (u32)n;
-	    pos_n++;
-	}
+        const char *nm = ST_tstr(se, ct);
+        if (cte->is_negeated_constraint) {
+            int n = snprintf(neg_buf + neg_len, sizeof(neg_buf) - neg_len, "%s%s",
+                             neg_n ? ", ": "", nm);
+            if (n > 0) neg_len += (u32)n;
+            neg_n++;
+        } else {
+            int n = snprintf(pos_buf + pos_len, sizeof(pos_buf) - pos_len, "%s%s",
+                             pos_n ? ", ": "", nm);
+            if (n > 0) pos_len += (u32)n;
+            pos_n++;
+        }
     }
 
     if (pos_n && neg_n)
-	ST_diag_note(&se->diag, line, col,
-		     "valid types for '$"ST_sv_fmt"':  %s (except %s)",
-		     ST_sv_args(pname), pos_buf, neg_buf);
+        ST_diag_note(&se->diag, line, col,
+                     "valid types for '$"ST_sv_fmt"':  %s (except %s)",
+                     ST_sv_args(pname), pos_buf, neg_buf);
     else if (pos_n)
-	ST_diag_note(&se->diag, line, col,
-		     "valid types for '$"ST_sv_fmt"':  %s",
-		     ST_sv_args(pname), pos_buf);
+        ST_diag_note(&se->diag, line, col,
+                     "valid types for '$"ST_sv_fmt"':  %s",
+                     ST_sv_args(pname), pos_buf);
     else if (neg_n)
-	ST_diag_note(&se->diag, line, col,
-		     "valid types for '$"ST_sv_fmt"':  %s",
-		     ST_sv_args(pname), neg_buf);
+        ST_diag_note(&se->diag, line, col,
+                     "valid types for '$"ST_sv_fmt"':  %s",
+                     ST_sv_args(pname), neg_buf);
 
 }
 
@@ -1013,122 +1322,122 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
         return 1;
 
     switch(pt->kind) {
-    case ST_TE_NAME: {
-        if (!pt->is_generic_param)
-            return 1;
-        ST_ty_t *want = ST_ty_defaulted(se, at);
-
-        if (pt->generic_constraints.count) {
-            b8 has_satisfied = 0, matched_satisfied = 0, excluded = 0;
-            ST_forrange(0, pt->generic_constraints.count) {
-		ST_tyexpr_t *cte = pt->generic_constraints.items[i];
-                ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
-
-		if (!ct)
-		    continue;
-		b8 matches = ST_ty_equal(ct, want) || ST_ty_coerces(se, want, ct);
-		if (cte->is_negeated_constraint) {
-		    if (matches)
-			excluded = 1;
-		} else {
-		    has_satisfied = 1;
-		    if (matches)
-			matched_satisfied = 1;
-
-		}
-            }
-
-	    b8 satisfied = (!has_satisfied || matched_satisfied) && !excluded;
-
-            if (!satisfied) {
-                ST_diag_error(&se->diag, arg_line, arg_col,
-                              "'%s' does not satisfy the constraint on generic parameter '$"
-                              ST_sv_fmt "'",
-                              ST_tstr(se, want), ST_sv_args(pt->name));
-
-		ST_diagnostic_note_constraint(se, &pt->generic_constraints,
-					      pt->line, pt->col, pt->name);
-                return 0;
-            }
-        }
-
-        ST_ht_generic_t k = { .tag = pt->name.data, .size = pt->name.len };
-        ST_ht_generic_t found = ST_ht_get(bindings, k);
-        ST_ty_t *bound = (ST_ty_t *)found.tag;
-        if (bound) {
-            if (bound == want || ST_ty_equal(bound, want))
+        case ST_TE_NAME: {
+            if (!pt->is_generic_param)
                 return 1;
-            ST_diag_error(&se->diag, arg_line, arg_col,
-                          "generic parameter '$" ST_sv_fmt "' was already inferred as '%s' "
-                          "from an earlier argument, but this one has type '%s'",
-                          ST_sv_args(pt->name), ST_tstr(se, bound), ST_tstr(se, want));
-            return 0;
+            ST_ty_t *want = ST_ty_defaulted(se, at);
+
+            if (pt->generic_constraints.count) {
+                b8 has_satisfied = 0, matched_satisfied = 0, excluded = 0;
+                ST_forrange(0, pt->generic_constraints.count) {
+                    ST_tyexpr_t *cte = pt->generic_constraints.items[i];
+                    ST_ty_t *ct = ST_resolve_tyexpr(se, cte);
+
+                    if (!ct)
+                        continue;
+                    b8 matches = ST_ty_equal(ct, want) || ST_ty_coerces(se, want, ct);
+                    if (cte->is_negeated_constraint) {
+                        if (matches)
+                            excluded = 1;
+                    } else {
+                        has_satisfied = 1;
+                        if (matches)
+                            matched_satisfied = 1;
+
+                    }
+                }
+
+                b8 satisfied = (!has_satisfied || matched_satisfied) && !excluded;
+
+                if (!satisfied) {
+                    ST_diag_error(&se->diag, arg_line, arg_col,
+                                  "'%s' does not satisfy the constraint on generic parameter '$"
+                                  ST_sv_fmt "'",
+                                  ST_tstr(se, want), ST_sv_args(pt->name));
+
+                    ST_diagnostic_note_constraint(se, &pt->generic_constraints,
+                                                  pt->line, pt->col, pt->name);
+                    return 0;
+                }
+            }
+
+            ST_ht_generic_t k = { .tag = pt->name.data, .size = pt->name.len };
+            ST_ht_generic_t found = ST_ht_get(bindings, k);
+            ST_ty_t *bound = (ST_ty_t *)found.tag;
+            if (bound) {
+                if (bound == want || ST_ty_equal(bound, want))
+                    return 1;
+                ST_diag_error(&se->diag, arg_line, arg_col,
+                              "generic parameter '$" ST_sv_fmt "' was already inferred as '%s' "
+                              "from an earlier argument, but this one has type '%s'",
+                              ST_sv_args(pt->name), ST_tstr(se, bound), ST_tstr(se, want));
+                return 0;
+            }
+
+            ST_ht_generic_t *bk = ST_arena_push(se->arena, sizeof(*bk));
+            bk->tag = pt->name.data;
+            bk->size = pt->name.len;
+            ST_ht_set(bindings, bk, (ST_ht_generic_t){.tag = want, .size = 0});
+            return 1;
         }
 
-        ST_ht_generic_t *bk = ST_arena_push(se->arena, sizeof(*bk));
-        bk->tag = pt->name.data;
-        bk->size = pt->name.len;
-        ST_ht_set(bindings, bk, (ST_ht_generic_t){.tag = want, .size = 0});
-        return 1;
-    }
-
-    case ST_TE_PTR: {
-        if (at->kind != ST_TY_PTR)
-            return 1;
-        return ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col);
-    }
-
-    case ST_TE_ARRAY: {
-        if (pt->is_dynamic)
-            return at->kind == ST_TY_DYN_ARRAY
-                       ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
-                       : 1;
-        if (!pt->count_expr)
-            return (at->kind == ST_TY_SLICE || at->kind == ST_TY_ARRAY)
-                       ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
-                       : 1;
-        return at->kind == ST_TY_ARRAY
-                   ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
-                   : 1;
-    }
-
-    case ST_TE_FN: {
-        if (at->kind == ST_TY_PTR && at->inner && at->inner->kind == ST_TY_FN)
-            at = at->inner;
-        if (at->kind != ST_TY_FN)
-            return 1;
-        ST_forrange(0, pt->fn_params.count) {
-            if (i >= at->params.count)
-                break;
-            if (!ST_unify_tyexpr(se, pt->fn_params.items[i], at->params.items[i], bindings,
-                                 arg_line, arg_col))
-                return 0;
+        case ST_TE_PTR: {
+            if (at->kind != ST_TY_PTR)
+                return 1;
+            return ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col);
         }
-        return 1;
-    }
 
-    case ST_TE_GENERIC_INST: {
-        if (at->kind != ST_TY_STRUCT)
-            return 1;
-        ST_inst_info_t *info = ST_inst_info_find(se, at);
-        if (!info)
-            return 1;
+        case ST_TE_ARRAY: {
+            if (pt->is_dynamic)
+                return at->kind == ST_TY_DYN_ARRAY
+                ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
+                : 1;
+            if (!pt->count_expr)
+                return (at->kind == ST_TY_SLICE || at->kind == ST_TY_ARRAY)
+                ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
+                : 1;
+            return at->kind == ST_TY_ARRAY
+                ? ST_unify_tyexpr(se, pt->inner, at->inner, bindings, arg_line, arg_col)
+                : 1;
+        }
 
-        ST_sym_t *tsym = ST_sym_find_in(&se->templates, pt->name);
-        if (!tsym || tsym->decl != info->tmpl)
+        case ST_TE_FN: {
+            if (at->kind == ST_TY_PTR && at->inner && at->inner->kind == ST_TY_FN)
+                at = at->inner;
+            if (at->kind != ST_TY_FN)
+                return 1;
+            ST_forrange(0, pt->fn_params.count) {
+                if (i >= at->params.count)
+                    break;
+                if (!ST_unify_tyexpr(se, pt->fn_params.items[i], at->params.items[i], bindings,
+                                     arg_line, arg_col))
+                    return 0;
+            }
             return 1;
+        }
 
-        if (pt->generic_args.count != info->args.count)
-            return 1;
+        case ST_TE_GENERIC_INST: {
+            if (at->kind != ST_TY_STRUCT)
+                return 1;
+            ST_inst_info_t *info = ST_inst_info_find(se, at);
+            if (!info)
+                return 1;
 
-        ST_forrange(0, pt->generic_args.count)
-            if (!ST_unify_tyexpr(se, pt->generic_args.items[i], info->args.items[i], bindings,
-                                 arg_line, arg_col))
+            ST_sym_t *tsym = ST_sym_find_in(&se->templates, pt->name);
+            if (!tsym || tsym->decl != info->tmpl)
+                return 1;
+
+            if (pt->generic_args.count != info->args.count)
+                return 1;
+
+            ST_forrange(0, pt->generic_args.count)
+                if (!ST_unify_tyexpr(se, pt->generic_args.items[i], info->args.items[i], bindings,
+                                     arg_line, arg_col))
                 return 0;
-        return 1;
-    }
+            return 1;
+        }
 
-    case ST_TE_TYPEOF:
+        case ST_TE_TYPEOF:
         return 1;
     }
 
@@ -1167,8 +1476,8 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     ST_forrange(0, tmpl->fn.sig.generics.count) {
         ST_string_t g = tmpl->fn.sig.generics.items[i];
         b8 is_pack_generic = pack_elem_te && pack_elem_te->kind == ST_TE_NAME &&
-                             pack_elem_te->is_generic_param &&
-                             ST_string_eq(pack_elem_te->name, g);
+            pack_elem_te->is_generic_param &&
+            ST_string_eq(pack_elem_te->name, g);
         if (is_pack_generic) {
             for (u32 j = 0; j < n_pack_args; j++) {
                 char buf[64];
@@ -1201,6 +1510,28 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     }
 
     ST_string_t mangled = ST_ty_mangle_instance_name(se->arena, tmpl->name, &args);
+    {
+        // Two different templates sharing a name (arity-based overloads, see
+        // ST_select_fn_template) can end up bound to identical generic type
+        // arguments -- e.g. both a 'where d : Drawable($T)' version and a
+        // plain 'd : Drawable($T)' version of 'render' instantiated with
+        // $T=Rectangle. Their mangled names would otherwise collide and the
+        // second call would wrongly reuse the first template's cached
+        // instance. Fold in the template's own (pre-witness-injection) arity
+        // whenever its name isn't unique, which is exactly what
+        // ST_select_fn_template used to tell the two apart in the first
+        // place.
+        ST_syms_t *ovl = ST_overload_find(se, tmpl->name);
+        if (ovl && ovl->count > 1) {
+            char buf[64];
+            int n = snprintf(buf, sizeof(buf), "$a%u",
+                             tmpl->fn.sig.params.count - tmpl->fn.sig.wheres.count);
+            u8 *combined = ST_arena_push(se->arena, mangled.len + (u32)n);
+            memcpy(combined, mangled.data, mangled.len);
+            memcpy(combined + mangled.len, buf, (u32)n);
+            mangled = (ST_string_t){.data = combined, .len = mangled.len + (u32)n};
+        }
+    }
     if (has_pack && args.count == 0) {
         char buf[600];
         int n = snprintf(buf, sizeof(buf), ST_sv_fmt "$0pack", ST_sv_args(mangled));
@@ -1239,13 +1570,16 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     inst->file = tmpl->file;
     inst->is_pub = tmpl->is_pub;
     if (tmpl->fn.decl_block_id) {
-	inst->display_name = ST_decl_display_name(tmpl);
-	inst->fn.decl_block_id = tmpl->fn.decl_block_id;
+        inst->display_name = ST_decl_display_name(tmpl);
+        inst->fn.decl_block_id = tmpl->fn.decl_block_id;
     }
     inst->fn.sig = ST_clone_fn_sig(se->arena, &tmpl->fn.sig);
     inst->fn.sig.generics = (ST_strings_t){0};
     inst->fn.is_prototype = tmpl->fn.is_prototype;
     inst->fn.body = ST_clone_body(se->arena, &tmpl->fn.body);
+    // 'where' clauses are now handled entirely as sugar for a trailing
+    // parameter, auto-supplied as a trailing argument at each call site
+    // (see ST_type_call) -- nothing left to do with them here.
     inst->fn.has_bound_str = has_bound_str;
     inst->fn.bound_str_param = bound_str_param;
     inst->fn.bound_str_value = bound_str_value;
@@ -1274,6 +1608,7 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     *pb = *bindings;
 
     ST_sym_t *sym = ST_sym_new(se, ST_SYM_FN, mangled, inst, NULL, tmpl->line, tmpl->col);
+    inst->sema_sym = sym;
     sym->generic_bindings = pb;
     sym->template_name = tmpl->name;
 
@@ -1421,21 +1756,21 @@ static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
         case ST_SYM_EXTERN_VAR:
         case ST_SYM_GLOBAL:
         case ST_SYM_FN:
-            return sym->t;
+        return sym->t;
         case ST_SYM_CONST:
-            return ST_ty_of_const(se, sym);
+        return ST_ty_of_const(se, sym);
         case ST_SYM_TYPE:
-            ST_diag_error(&se->diag, e->line, e->col,
-                          "'" ST_sv_fmt "' is a type, it cannot be used as a value",
-                          ST_sv_args(e->name));
-            ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
-                                 "'" ST_sv_fmt "' is declared here", ST_sv_args(e->name));
-            return NULL;
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' is a type, it cannot be used as a value",
+                      ST_sv_args(e->name));
+        ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
+                             "'" ST_sv_fmt "' is declared here", ST_sv_args(e->name));
+        return NULL;
         case ST_SYM_MODULE:
-            ST_diag_error(&se->diag, e->line, e->col,
-                          "'" ST_sv_fmt "' is a module, access members with '" ST_sv_fmt ".member'",
-                          ST_sv_args(e->name), ST_sv_args(e->name));
-            return NULL;
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' is a module, access members with '" ST_sv_fmt ".member'",
+                      ST_sv_args(e->name), ST_sv_args(e->name));
+        return NULL;
     }
     return NULL;
 }
@@ -1448,28 +1783,28 @@ static const char *ST_expr_kind_desc(ST_expr_t *e) {
         case ST_EX_CHAR:
         case ST_EX_BOOL:
         case ST_EX_NULL:
-            return "a literal";
+        return "a literal";
         case ST_EX_CALL:
-            return "a call result";
+        return "a call result";
         case ST_EX_BINARY:
-            return "a binary expression";
+        return "a binary expression";
         case ST_EX_UNARY:
-            return "a unary expression";
+        return "a unary expression";
         case ST_EX_CAST:
-            return "a cast";
+        return "a cast";
         case ST_EX_STRUCT_LIT:
-            return "a struct literal";
+        return "a struct literal";
         case ST_EX_ARRAY_NEW:
-            return "an array literal";
+        return "an array literal";
         case ST_EX_SIZEOF:
         case ST_EX_TYPEOF:
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
-            return "a compile-time type query";
+        return "a compile-time type query";
         case ST_EX_PACK_FOLD:
-            return "a pack-fold expression";
+        return "a pack-fold expression";
         default:
-            return "a temporary value";
+        return "a temporary value";
     }
 }
 
@@ -1485,26 +1820,26 @@ static b8 ST_expr_is_addressable(ST_sema_t *se, ST_expr_t *e) {
                 case ST_SYM_GLOBAL:
                 case ST_SYM_FN:
                 case ST_SYM_CONST:
-                    return 1;
+                return 1;
                 case ST_SYM_TYPE:
                 case ST_SYM_MODULE:
-                    return 0;
+                return 0;
             }
             return 0;
         }
         case ST_EX_UNARY:
-            return ST_string_eq_cstr(e->unary.op, "*");
+        return ST_string_eq_cstr(e->unary.op, "*");
         case ST_EX_FIELD:
-            if (e->field.base && e->field.base->kind == ST_EX_IDENT) {
-                ST_sym_t *bs = ST_sym_find(se, e->field.base->name);
-                if (bs && bs->kind == ST_SYM_TYPE)
-                    return 0;
-            }
-            return 1;
+        if (e->field.base && e->field.base->kind == ST_EX_IDENT) {
+            ST_sym_t *bs = ST_sym_find(se, e->field.base->name);
+            if (bs && bs->kind == ST_SYM_TYPE)
+                return 0;
+        }
+        return 1;
         case ST_EX_INDEX:
-            return 1;
+        return 1;
         default:
-            return 0;
+        return 0;
     }
 }
 
@@ -1690,6 +2025,106 @@ static void ST_stringify_type_arg(ST_sema_t *se, ST_expr_t *av, ST_ty_t *ty) {
     av->ty = se->tys.prim[ST_tstring];
 }
 
+static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *callee,
+                                    ST_sym_t **out_sym, ST_ty_t **out_fnty) {
+    ST_syms_t *ovl = ST_overload_find(se, callee->name);
+    if (!ovl || ovl->count < 2)
+        return 0;
+    {
+        u32 n_nongeneric = 0;
+        for (u32 k = 0; k < ovl->count; k++) {
+            ST_sym_t *cand = ovl->items[k];
+            if (cand->kind == ST_SYM_FN && cand->decl && cand->decl->kind == ST_DE_FN &&
+                !cand->decl->fn.sig.generics.count)
+                n_nongeneric++;
+        }
+        if (n_nongeneric < 2)
+            return 0;
+    }
+
+    u32 n_args = e->call.args.count;
+    ST_ty_t **arg_tys = ST_arena_push_zeroed(se->arena, sizeof(*arg_tys) * (n_args ? n_args : 1));
+    for (u32 k = 0; k < n_args; k++)
+        arg_tys[k] = ST_type_expr(se, e->call.args.items[k].value);
+
+    ST_sym_t *best = NULL;
+    b8 ambiguous = 0;
+    for (u32 k = 0; k < ovl->count; k++) {
+        ST_sym_t *cand = ovl->items[k];
+        if (cand->kind != ST_SYM_FN || !cand->decl || cand->decl->kind != ST_DE_FN)
+            continue;
+        if (cand->decl->fn.sig.generics.count)
+            continue; // generic overloads are resolved via se->templates, not here
+        if (!cand->t)
+            continue;
+        u32 n_params = cand->t->params.count;
+        if (n_args != n_params && !cand->t->is_variadic && !cand->t->has_any_pack)
+            continue;
+        if (n_args < n_params && !cand->t->is_variadic && !cand->t->has_any_pack)
+            continue;
+        b8 ok = 1;
+        for (u32 p = 0; p < n_args && p < n_params; p++) {
+            if (arg_tys[p] && cand->t->params.items[p] &&
+                !ST_ty_coerces(se, arg_tys[p], cand->t->params.items[p])) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        if (best) {
+            ambiguous = 1;
+            continue;
+        }
+        best = cand;
+    }
+
+    if (ambiguous) {
+        ST_diag_error(&se->diag, callee->line, callee->col,
+                      "call to '" ST_sv_fmt "' is ambiguous between multiple overloads",
+                      ST_sv_args(callee->name));
+        *out_sym = NULL;
+        *out_fnty = NULL;
+        return 1;
+    }
+    if (!best) {
+        ST_diag_error(&se->diag, callee->line, callee->col,
+                      "no overload of '" ST_sv_fmt "' matches these argument types",
+                      ST_sv_args(callee->name));
+        *out_sym = NULL;
+        *out_fnty = NULL;
+        return 1;
+    }
+    callee->name = best->decl->name;
+    callee->ty = best->t;
+    *out_sym = best;
+    *out_fnty = best->t;
+    return 1;
+}
+
+static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, u32 n_args) {
+    ST_syms_t *ovl = ST_overload_find(se, name);
+    if (!ovl || !ovl->count) {
+        ST_sym_t *tsym = ST_sym_find_in(&se->templates, name);
+        return (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN) ? tsym->decl : NULL;
+    }
+    ST_decl_t *fallback = NULL;
+    for (u32 i = 0; i < ovl->count; i++) {
+        ST_sym_t *cand = ovl->items[i];
+        if (cand->kind != ST_SYM_FN || !cand->decl || cand->decl->kind != ST_DE_FN ||
+            !cand->decl->fn.sig.generics.count)
+            continue;
+        ST_fn_sig_t *sig = &cand->decl->fn.sig;
+        if (!fallback)
+            fallback = cand->decl;
+        u32 required = sig->params.count - sig->wheres.count;
+        b8 accepts_more = sig->has_any_pack || sig->has_generic_pack || sig->is_variadic;
+        if (n_args == required || (accepts_more && n_args >= required))
+            return cand->decl;
+    }
+    return fallback;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expr_t *callee = e->call.callee;
     ST_sym_t *sym = NULL;
@@ -1697,24 +2132,26 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
 
     ST_decl_t *fn_tmpl = NULL;
 
-    if (callee && callee->kind == ST_EX_IDENT) {
+    if (callee && callee->kind == ST_EX_IDENT &&
+        ST_type_call_try_overload(se, e, callee, &sym, &fnty)) {
+    } else if (callee && callee->kind == ST_EX_IDENT) {
         sym = ST_sym_find(se, callee->name);
         if (sym && sym->kind == ST_SYM_FN && sym->decl &&
             !ST_string_eq(callee->name, sym->decl->name))
             callee->name = sym->decl->name;
-	if (sym && sym->kind == ST_SYM_FN && !sym->t && sym->decl &&
-	    sym->decl->kind == ST_DE_FN && sym->decl->fn.sig.generics.count) {
-	    ST_sym_t *tsym = ST_sym_find_in(&se->templates, callee->name);
-	    if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN) {
-		fn_tmpl = tsym->decl;
-		sym = NULL;
-	    }
-	}
+        if (sym && sym->kind == ST_SYM_FN && !sym->t && sym->decl &&
+            sym->decl->kind == ST_DE_FN && sym->decl->fn.sig.generics.count) {
+            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e->call.args.count);
+            if (tdecl) {
+                fn_tmpl = tdecl;
+                sym = NULL;
+            }
+        }
         if (!sym) {
-            ST_sym_t *tsym = ST_sym_find_in(&se->templates, callee->name);
-            if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN)
-                fn_tmpl = tsym->decl;
-            else if (tsym)
+            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e->call.args.count);
+            if (tdecl)
+                fn_tmpl = tdecl;
+            else if (ST_sym_find_in(&se->templates, callee->name))
                 ST_diag_error(&se->diag, callee->line, callee->col,
                               "'" ST_sv_fmt "' is a generic type, it cannot be called",
                               ST_sv_args(callee->name));
@@ -1762,17 +2199,17 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 continue;
             }
         }
-	ST_ty_t *pt = (fnty && i < fnty->params.count) ? fnty->params.items[i] : NULL;
-	ST_ty_t *at;
-	if (av->kind == ST_EX_STRUCT_LIT && av->struct_lit.is_bracket_lit) {
-	    at = ST_type_struct_lit(se, av, pt);
-	    av->ty = at;
-	} else {
-	    at = ST_type_expr(se, av);
-	}
+        ST_ty_t *pt = (fnty && i < fnty->params.count) ? fnty->params.items[i] : NULL;
+        ST_ty_t *at;
+        if (av->kind == ST_EX_STRUCT_LIT && av->struct_lit.is_bracket_lit) {
+            at = ST_type_struct_lit(se, av, pt);
+            av->ty = at;
+        } else {
+            at = ST_type_expr(se, av);
+        }
         if (at && at->kind == ST_TY_TYPEID) {
             ST_ty_t *named = av->kind == ST_EX_TYPEOF && av->tyop.operand ? av->tyop.operand->ty
-                                                                          : NULL;
+                : NULL;
             if (named)
                 ST_stringify_type_arg(se, av, named);
         }
@@ -1799,9 +2236,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             if (arg->name.len) {
                 for (u32 k = 0; k < tsig->params.count; k++)
                     if (ST_string_eq(tsig->params.items[k].name, arg->name)) {
-                        idx = k;
-                        break;
-                    }
+                    idx = k;
+                    break;
+                }
                 if (pack_idx >= 0 && (i32)idx >= pack_idx) {
                     ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                                   "cannot pass a named argument into '" ST_sv_fmt "...' pack "
@@ -1828,14 +2265,14 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 if (arg->value->ty)
                     if (!ST_unify_tyexpr(se, indexed, arg->value->ty, &bindings, arg->value->line,
                                          arg->value->col))
-                        unify_ok = 0;
+                    unify_ok = 0;
                 continue;
             }
 
             if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty)
                 if (!ST_unify_tyexpr(se, tsig->params.items[idx].te, arg->value->ty, &bindings,
                                      arg->value->line, arg->value->col))
-                    unify_ok = 0;
+                unify_ok = 0;
 
             if (!has_bound_str && idx < tsig->params.count && tsig->params.items[idx].te &&
                 !tsig->params.items[idx].te->is_generic_param) {
@@ -1854,6 +2291,71 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                     }
                 }
             }
+        }
+        if (unify_ok && tsig->wheres.count) {
+            ST_ht_t *save_gb = se->generic_bindings;
+            se->generic_bindings = &bindings;
+            for (u32 wi = 0; wi < tsig->wheres.count; wi++) {
+                ST_where_clause_t *w = &tsig->wheres.items[wi];
+                ST_sym_t *tsym = ST_sym_find_in(&se->globals, w->trait_name);
+                if (!tsym || tsym->kind != ST_SYM_TYPE || !tsym->decl ||
+                    tsym->decl->kind != ST_DE_TRAIT) {
+                    ST_diag_error(&se->diag, w->line, w->col,
+                                  "'" ST_sv_fmt "' is not a known trait",
+                                  ST_sv_args(w->trait_name));
+                    unify_ok = 0;
+                    continue;
+                }
+                ST_decl_t *trait = tsym->decl;
+                ST_tys_t wargs = {0};
+                b8 wargs_ok = 1;
+                for (u32 ai = 0; ai < w->trait_args.count; ai++) {
+                    ST_ty_t *at = ST_resolve_tyexpr(se, w->trait_args.items[ai]);
+                    if (!at)
+                        wargs_ok = 0;
+                    ST_da_append_arena(se->arena, &wargs, at);
+                }
+                if (!wargs_ok) {
+                    unify_ok = 0;
+                    continue;
+                }
+                ST_ty_t *want_ty =
+                    ST_instantiate_trait_witness(se, trait, wargs, w->line, w->col);
+                if (!want_ty) {
+                    unify_ok = 0;
+                    continue;
+                }
+                ST_sym_t *match = ST_find_witness(se, w->witness_name, want_ty);
+                if (!match) {
+                    ST_diag_error(&se->diag, e->line, e->col,
+                                  "no implementation of '" ST_sv_fmt "(%s)' found for '"
+                                  ST_sv_fmt "'",
+                                  ST_sv_args(trait->name),
+                                  ST_tstr(se, wargs.count ? wargs.items[0] : NULL),
+                                  ST_sv_args(w->witness_name));
+                    unify_ok = 0;
+                    continue;
+                }
+                ST_string_t inject_name = match->name;
+                if (match->kind == ST_SYM_CONST && match->t && match->t->is_trait_witness) {
+                    char buf[300];
+                    int n = snprintf(buf, sizeof(buf), ST_sv_fmt "$witness%u",
+                                     ST_sv_args(match->name), ++se->n_witness_aliases);
+                    u8 *nb = ST_arena_push(se->arena, (u32)n);
+                    memcpy(nb, buf, (u32)n);
+                    inject_name = (ST_string_t){.data = nb, .len = (u32)n};
+                    ST_sym_t *alias = ST_sym_new(se, ST_SYM_CONST, inject_name, match->decl,
+                                                 match->t, match->line, match->col);
+                    ST_sym_insert(se, &se->globals, alias);
+                }
+                ST_expr_t *wval = ST_expr_new(se->arena, ST_EX_IDENT, e->line, e->col);
+                wval->name = inject_name;
+                wval->ty = match->t;
+                ST_arg_t warg = {0};
+                warg.value = wval;
+                ST_da_append_arena(se->arena, &e->call.args, warg);
+            }
+            se->generic_bindings = save_gb;
         }
         if (!unify_ok)
             return NULL;
@@ -1889,9 +2391,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             if (arg->name.len) {
                 for (u32 k = 0; k < sig->params.count; k++)
                     if (ST_string_eq(sig->params.items[k].name, arg->name)) {
-                        idx = k;
-                        break;
-                    }
+                    idx = k;
+                    break;
+                }
                 if (idx == sig->params.count) {
                     ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                                   "'" ST_sv_fmt "' has no parameter named '" ST_sv_fmt "'",
@@ -2118,7 +2620,7 @@ static ST_ty_t *ST_type_cast(ST_sema_t *se, ST_expr_t *e) {
         return to;
 
     b8 from_num = ST_ty_is_numeric(from) || from->kind == ST_TY_CHAR || from->kind == ST_TY_ENUM ||
-                  from->kind == ST_TY_BOOL;
+        from->kind == ST_TY_BOOL;
     b8 to_num = ST_ty_is_numeric(to) || to->kind == ST_TY_CHAR || to->kind == ST_TY_ENUM;
     if (from_num && to_num)
         return to;
@@ -2149,9 +2651,9 @@ static ST_ty_t *ST_infer_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) 
         if (fi->name.len) {
             for (u32 k = 0; k < td->struct_.fields.count; ++k)
                 if (ST_string_eq(td->struct_.fields.items[i].name, fi->name)) {
-                    fs = &td->struct_.fields.items[i];
-                    break;
-                }
+                fs = &td->struct_.fields.items[i];
+                break;
+            }
         } else if (i < td->struct_.fields.count)
             fs = &td->struct_.fields.items[i];
         if (fs && fs->te)
@@ -2207,9 +2709,9 @@ static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
     ST_variant_spec_t *variant = NULL;
     ST_forrange(0, ut->decl->tag_union.variants.count)
         if (ST_string_eq(ut->decl->tag_union.variants.items[i].name, vname)) {
-            variant = &ut->decl->tag_union.variants.items[i];
-            break;
-        }
+        variant = &ut->decl->tag_union.variants.items[i];
+        break;
+    }
     if (!variant) {
         ST_diag_error(&se->diag, tag_fi->value->line, tag_fi->value->col,
                       "'" ST_sv_fmt "' has no variant '" ST_sv_fmt "'", ST_sv_args(uname),
@@ -2371,7 +2873,7 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                expect->decl->struct_.generics.count) {
         t = ST_infer_struct_lit(se, e, expect->decl);
     } else if (expect && (expect->kind == ST_TY_STRUCT || expect->kind == ST_TY_ARRAY ||
-                         expect->kind == ST_TY_SLICE || expect->kind == ST_TY_DYN_ARRAY))
+                          expect->kind == ST_TY_SLICE || expect->kind == ST_TY_DYN_ARRAY))
         t = expect;
     else
         ST_diag_error(&se->diag, e->line, e->col,
@@ -2432,9 +2934,9 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         if (t && fi->name.len) {
             for (u32 k = 0; k < t->fields.count; k++)
                 if (ST_string_eq(t->fields.items[k].name, fi->name)) {
-                    ft = t->fields.items[k].ty;
-                    break;
-                }
+                ft = t->fields.items[k].ty;
+                break;
+            }
             if (!ft) {
                 if (t->decl) {
                     ST_diag_error(&se->diag, fi->line, fi->col,
@@ -2515,32 +3017,32 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
     ST_ty_t *t = NULL;
     switch (e->kind) {
         case ST_EX_INT:
-            t = se->tys.untyped_int;
-            break;
+        t = se->tys.untyped_int;
+        break;
         case ST_EX_FLOAT:
-            t = se->tys.untyped_float;
-            break;
+        t = se->tys.untyped_float;
+        break;
         case ST_EX_STR:
-            t = se->tys.prim[ST_tstring];
-            break;
+        t = se->tys.prim[ST_tstring];
+        break;
         case ST_EX_CHAR:
-            t = se->tys.prim[ST_tchar];
-            break;
+        t = se->tys.prim[ST_tchar];
+        break;
         case ST_EX_BOOL:
-            t = se->tys.prim[ST_tbool];
-            break;
+        t = se->tys.prim[ST_tbool];
+        break;
         case ST_EX_NULL:
-            t = se->tys.null_ptr;
-            break;
+        t = se->tys.null_ptr;
+        break;
         case ST_EX_IDENT:
-            t = ST_type_ident(se, e);
-            break;
+        t = ST_type_ident(se, e);
+        break;
         case ST_EX_UNARY:
-            t = ST_type_unary(se, e);
-            break;
+        t = ST_type_unary(se, e);
+        break;
         case ST_EX_BINARY:
-            t = ST_type_binary(se, e);
-            break;
+        t = ST_type_binary(se, e);
+        break;
         case ST_EX_CALL: {
             ST_tys_t *rets = ST_type_call(se, e);
             if (!rets)
@@ -2556,24 +3058,24 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             break;
         }
         case ST_EX_FIELD:
-            t = ST_type_field(se, e);
-            break;
+        t = ST_type_field(se, e);
+        break;
         case ST_EX_INDEX:
-            t = ST_type_index(se, e);
-            break;
+        t = ST_type_index(se, e);
+        break;
         case ST_EX_CAST:
-            t = ST_type_cast(se, e);
-            break;
+        t = ST_type_cast(se, e);
+        break;
         case ST_EX_STRUCT_LIT:
-            t = ST_type_struct_lit(se, e, NULL);
-            break;
+        t = ST_type_struct_lit(se, e, NULL);
+        break;
         case ST_EX_ARRAY_NEW:
-            t = ST_resolve_tyexpr(se, e->array_new.te);
-            break;
+        t = ST_resolve_tyexpr(se, e->array_new.te);
+        break;
         case ST_EX_SIZEOF: {
             ST_sym_t *tsym = e->tyop.operand && e->tyop.operand->kind == ST_EX_IDENT
-                                 ? ST_sym_find(se, e->tyop.operand->name)
-                                 : NULL;
+                ? ST_sym_find(se, e->tyop.operand->name)
+                : NULL;
             if (e->tyop.te) {
                 ST_ty_t *st = ST_resolve_tyexpr(se, e->tyop.te);
                 if (st)
@@ -2585,7 +3087,7 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
                     e->tyop.operand->ty = st;
                 }
             } else if (e->tyop.operand->kind == ST_EX_UNARY &&
-                      ST_string_eq_cstr(e->tyop.operand->unary.op, "*")) {
+                       ST_string_eq_cstr(e->tyop.operand->unary.op, "*")) {
                 ST_ty_t *pt = ST_type_expr(se, e->tyop.operand->unary.operand);
                 if (pt && ST_ty_is_ptr(pt)) {
                     ST_ty_t *ot = pt->inner;
@@ -2603,9 +3105,9 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             break;
         }
         case ST_EX_TYPEOF:
-            ST_type_expr(se, e->tyop.operand);
-            t = se->tys.typeid_ty;
-            break;
+        ST_type_expr(se, e->tyop.operand);
+        t = se->tys.typeid_ty;
+        break;
         case ST_EX_TYPEINFO: {
             ST_ty_t *ot;
             if (e->tyop.te) {
@@ -2618,15 +3120,15 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             break;
         }
         case ST_EX_KIND:
-            ST_type_expr(se, e->tyop.operand);
-            t = se->tys.prim[ST_tu64];
-            break;
+        ST_type_expr(se, e->tyop.operand);
+        t = se->tys.prim[ST_tu64];
+        break;
         case ST_EX_FIELDS:
-            ST_type_expr(se, e->tyop.operand);
-            ST_diag_error(&se->diag, e->line, e->col,
-                          "'fields(...)' is only valid as the target of a comptime '#for'");
-            t = se->tys.prim[ST_tvoid];
-            break;
+        ST_type_expr(se, e->tyop.operand);
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'fields(...)' is only valid as the target of a comptime '#for'");
+        t = se->tys.prim[ST_tvoid];
+        break;
         case ST_EX_CSTR: {
             ST_ty_t *ot = ST_type_expr(se, e->tyop.operand);
             if (ot && ot->kind != ST_TY_STRING)
@@ -2648,8 +3150,8 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             break;
         }
         case ST_EX_ASM:
-            t = se->tys.untyped_int;
-            break;
+        t = se->tys.untyped_int;
+        break;
         case ST_EX_COMP_ERROR: {
             ST_exprs_t msg_args = e->comp_error.args;
             b8 at_caller = 0;
@@ -2778,9 +3280,12 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
             t = ST_type_expr(se, e);
             break;
         }
+        case ST_EX_TRAIT_IMPL:
+        t = ST_type_trait_impl(se, e);
+        break;
         case ST_EX_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
     e->ty = t;
     se->expr_depth--;
@@ -2800,11 +3305,11 @@ static void ST_declare_nested_fn_sym(ST_sema_t *se, ST_decl_t *nd) {
     if (ST_sym_find_in(&se->scope->table, bare))
         return;
     if (nd->kind == ST_DE_FN && nd->fn.sig.generics.count) {
-	ST_sym_t *tysm = ST_sym_find_in(&se->templates, nd->name);
-	if (!tysm)
-	    return;
-	ST_sym_insert(se, &se->scope->table,
-		      ST_sym_new(se, ST_SYM_FN, bare, nd, NULL, nd->line, nd->col));
+        ST_sym_t *tysm = ST_sym_find_in(&se->templates, nd->name);
+        if (!tysm)
+            return;
+        ST_sym_insert(se, &se->scope->table,
+                      ST_sym_new(se, ST_SYM_FN, bare, nd, NULL, nd->line, nd->col));
     }
 
     ST_sym_t *gsym = ST_sym_find_in(&se->globals, nd->name);
@@ -2842,22 +3347,22 @@ static void ST_check_cond(ST_sema_t *se, ST_expr_t *cond, const char *what) {
 
 static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
     b8 infer_count = s->decl.te && s->decl.te->kind == ST_TE_ARRAY && !s->decl.te->is_dynamic &&
-                     !s->decl.te->count_expr;
+        !s->decl.te->count_expr;
     ST_ty_t *dt = NULL;
     if (s->decl.te && !infer_count)
         dt = ST_resolve_tyexpr(se, s->decl.te);
     b8 dt_is_generic_struct = dt && dt->kind == ST_TY_STRUCT && dt->decl &&
-                              dt->decl->struct_.generics.count > 0;
+        dt->decl->struct_.generics.count > 0;
     b8 infers_from_lit = dt_is_generic_struct && s->decl.init &&
-                         s->decl.init->kind == ST_EX_STRUCT_LIT &&
-                         !s->decl.init->struct_lit.type_name.len;
+        s->decl.init->kind == ST_EX_STRUCT_LIT &&
+        !s->decl.init->struct_lit.type_name.len;
     if (dt && !infers_from_lit)
         ST_complete_ty(se, dt);
     if (infer_count) {
         ST_ty_t *ety = ST_resolve_tyexpr(se, s->decl.te->inner);
         b8 has_lit = s->decl.init && s->decl.init->kind == ST_EX_STRUCT_LIT &&
-                     !s->decl.init->struct_lit.type_name.len &&
-                     !s->decl.init->struct_lit.is_bracket_lit;
+            !s->decl.init->struct_lit.type_name.len &&
+            !s->decl.init->struct_lit.is_bracket_lit;
         if (ety && has_lit) {
             ST_complete_ty(se, ety);
             dt = ST_ty_array(&se->tys, ety, s->decl.init->struct_lit.inits.count);
@@ -3023,7 +3528,7 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
 
 static void ST_check_multi(ST_sema_t *se, ST_stmt_t *s) {
     b8 from_call = s->multi.n_names > 1 && s->multi.values.count == 1 &&
-                   s->multi.values.items[0]->kind == ST_EX_CALL;
+        s->multi.values.items[0]->kind == ST_EX_CALL;
 
     ST_ty_t *tys[16] = {0};
     u32 n_tys = 0;
@@ -3126,28 +3631,28 @@ static void ST_stamp_kind_operands(ST_sema_t *se, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_KIND:
         case ST_EX_FIELDS:
-            ST_type_expr(se, e->tyop.operand);
-            return;
+        ST_type_expr(se, e->tyop.operand);
+        return;
         case ST_EX_UNARY:
-            ST_stamp_kind_operands(se, e->unary.operand);
-            return;
+        ST_stamp_kind_operands(se, e->unary.operand);
+        return;
         case ST_EX_BINARY:
-            ST_stamp_kind_operands(se, e->bin.l);
-            ST_stamp_kind_operands(se, e->bin.r);
-            return;
+        ST_stamp_kind_operands(se, e->bin.l);
+        ST_stamp_kind_operands(se, e->bin.r);
+        return;
         case ST_EX_FIELD:
-            ST_stamp_kind_operands(se, e->field.base);
-            return;
+        ST_stamp_kind_operands(se, e->field.base);
+        return;
         case ST_EX_INDEX:
-            ST_stamp_kind_operands(se, e->index.base);
-            ST_stamp_kind_operands(se, e->index.index);
-            return;
+        ST_stamp_kind_operands(se, e->index.base);
+        ST_stamp_kind_operands(se, e->index.index);
+        return;
         case ST_EX_COMP_ERROR:
-            ST_forrange(0, e->comp_error.args.count)
-                ST_stamp_kind_operands(se, e->comp_error.args.items[i]);
-            return;
+        ST_forrange(0, e->comp_error.args.count)
+            ST_stamp_kind_operands(se, e->comp_error.args.items[i]);
+        return;
         default:
-            return;
+        return;
     }
 }
 
@@ -3224,9 +3729,9 @@ static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s) {
                 case ST_CT_INT: hit = v.i == scrutinee.i; break;
                 case ST_CT_BOOL: hit = v.b == scrutinee.b; break;
                 case ST_CT_STRING:
-                    hit = v.str.len == scrutinee.str.len &&
-                          memcmp(v.str.data, scrutinee.str.data, v.str.len) == 0;
-                    break;
+                hit = v.str.len == scrutinee.str.len &&
+                    memcmp(v.str.data, scrutinee.str.data, v.str.len) == 0;
+                break;
                 default: hit = 0; break;
             }
         }
@@ -3264,10 +3769,6 @@ static void ST_sema_run_comptime_blocks(ST_sema_t *se) {
         entry->fn.sig.is_comptime = 1;
         entry->fn.body = s->block;
 
-        // Rewrite 's' to an empty block *before* compiling/running it: compiling
-        // (or running) this block can itself trigger a native/asm call, which
-        // needs to lower the *whole* program for real (see
-        // ST_ct_ensure_native_module)
         ST_rewrite_as_block(s, (ST_stmts_t){0});
 
         ST_ct_chunk_t chunk;
@@ -3306,15 +3807,15 @@ static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t targ
         return;
     switch (e->kind) {
         case ST_EX_IDENT:
-            if (target.len && ST_string_eq(e->name, target)) {
-                ST_ty_t *save_ty = e->ty;
-                u32 save_line = e->line, save_col = e->col;
-                *e = *replacement;
-                e->ty = save_ty;
-                e->line = save_line;
-                e->col = save_col;
-            }
-            return;
+        if (target.len && ST_string_eq(e->name, target)) {
+            ST_ty_t *save_ty = e->ty;
+            u32 save_line = e->line, save_col = e->col;
+            *e = *replacement;
+            e->ty = save_ty;
+            e->line = save_line;
+            e->col = save_col;
+        }
+        return;
         case ST_EX_INDEX: {
             ST_ast_substitute_expr(se, e->index.base, target, replacement);
             ST_ast_substitute_expr(se, e->index.index, target, replacement);
@@ -3331,43 +3832,43 @@ static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t targ
             return;
         }
         case ST_EX_FIELD:
-            ST_ast_substitute_expr(se, e->field.base, target, replacement);
-            if (se->has_pack && e->field.base->kind == ST_EX_IDENT &&
-                ST_string_eq(e->field.base->name, se->cur_pack_name) &&
-                ST_string_eq_cstr(e->field.name, "count")) {
-                e->kind = ST_EX_INT;
-                e->ival = (i64)se->cur_pack_count;
-            }
-            return;
+        ST_ast_substitute_expr(se, e->field.base, target, replacement);
+        if (se->has_pack && e->field.base->kind == ST_EX_IDENT &&
+            ST_string_eq(e->field.base->name, se->cur_pack_name) &&
+            ST_string_eq_cstr(e->field.name, "count")) {
+            e->kind = ST_EX_INT;
+            e->ival = (i64)se->cur_pack_count;
+        }
+        return;
         case ST_EX_UNARY:
-            ST_ast_substitute_expr(se, e->unary.operand, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, e->unary.operand, target, replacement);
+        return;
         case ST_EX_SIZEOF:
         case ST_EX_TYPEOF:
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
         case ST_EX_CSTR:
         case ST_EX_FIELDS:
-            ST_ast_substitute_expr(se, e->tyop.operand, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, e->tyop.operand, target, replacement);
+        return;
         case ST_EX_BINARY:
-            ST_ast_substitute_expr(se, e->bin.l, target, replacement);
-            ST_ast_substitute_expr(se, e->bin.r, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, e->bin.l, target, replacement);
+        ST_ast_substitute_expr(se, e->bin.r, target, replacement);
+        return;
         case ST_EX_CALL:
-            ST_ast_substitute_expr(se, e->call.callee, target, replacement);
-            ST_forrange(0, e->call.args.count)
-                ST_ast_substitute_expr(se, e->call.args.items[i].value, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, e->call.callee, target, replacement);
+        ST_forrange(0, e->call.args.count)
+            ST_ast_substitute_expr(se, e->call.args.items[i].value, target, replacement);
+        return;
         case ST_EX_CAST:
-            ST_ast_substitute_expr(se, e->cast.operand, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, e->cast.operand, target, replacement);
+        return;
         case ST_EX_COMP_ERROR:
-            ST_forrange(0, e->comp_error.args.count)
-                ST_ast_substitute_expr(se, e->comp_error.args.items[i], target, replacement);
-            return;
+        ST_forrange(0, e->comp_error.args.count)
+            ST_ast_substitute_expr(se, e->comp_error.args.items[i], target, replacement);
+        return;
         default:
-            return;
+        return;
     }
 }
 
@@ -3377,71 +3878,71 @@ static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t targ
         return;
     switch (s->kind) {
         case ST_ST_EXPR:
-            ST_ast_substitute_expr(se, s->expr, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->expr, target, replacement);
+        return;
         case ST_ST_PACK_EXPAND:
-            ST_ast_substitute_expr(se, s->expr, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->expr, target, replacement);
+        return;
         case ST_ST_DECL:
-            ST_ast_substitute_expr(se, s->decl.init, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->decl.init, target, replacement);
+        return;
         case ST_ST_ASSIGN:
-            ST_ast_substitute_expr(se, s->assign.lhs, target, replacement);
-            ST_ast_substitute_expr(se, s->assign.rhs, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->assign.lhs, target, replacement);
+        ST_ast_substitute_expr(se, s->assign.rhs, target, replacement);
+        return;
         case ST_ST_IF:
-            ST_ast_substitute_expr(se, s->if_.cond, target, replacement);
-            ST_forrange(0, s->if_.then_body.count)
-                ST_ast_substitute_stmt(se, s->if_.then_body.items[i], target, replacement);
-            ST_ast_substitute_stmt(se, s->if_.else_stmt, target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->if_.cond, target, replacement);
+        ST_forrange(0, s->if_.then_body.count)
+            ST_ast_substitute_stmt(se, s->if_.then_body.items[i], target, replacement);
+        ST_ast_substitute_stmt(se, s->if_.else_stmt, target, replacement);
+        return;
         case ST_ST_SWITCH:
-            ST_ast_substitute_expr(se, s->switch_.cond, target, replacement);
-            ST_forrange(0, s->switch_.cases.count) {
-                ST_case_t *c = &s->switch_.cases.items[i];
-                for (u32 k = 0; k < c->values.count; k++)
-                    ST_ast_substitute_expr(se, c->values.items[k], target, replacement);
-                for (u32 k = 0; k < c->body.count; k++)
-                    ST_ast_substitute_stmt(se, c->body.items[k], target, replacement);
-            }
-            return;
+        ST_ast_substitute_expr(se, s->switch_.cond, target, replacement);
+        ST_forrange(0, s->switch_.cases.count) {
+            ST_case_t *c = &s->switch_.cases.items[i];
+            for (u32 k = 0; k < c->values.count; k++)
+                ST_ast_substitute_expr(se, c->values.items[k], target, replacement);
+            for (u32 k = 0; k < c->body.count; k++)
+                ST_ast_substitute_stmt(se, c->body.items[k], target, replacement);
+        }
+        return;
         case ST_ST_WHILE:
-            ST_ast_substitute_expr(se, s->while_.cond, target, replacement);
-            ST_forrange(0, s->while_.body.count)
-                ST_ast_substitute_stmt(se, s->while_.body.items[i], target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->while_.cond, target, replacement);
+        ST_forrange(0, s->while_.body.count)
+            ST_ast_substitute_stmt(se, s->while_.body.items[i], target, replacement);
+        return;
         case ST_ST_FOR_RANGE:
-            ST_ast_substitute_expr(se, s->for_range.lo, target, replacement);
-            ST_ast_substitute_expr(se, s->for_range.hi, target, replacement);
-            ST_forrange(0, s->for_range.body.count)
-                ST_ast_substitute_stmt(se, s->for_range.body.items[i], target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->for_range.lo, target, replacement);
+        ST_ast_substitute_expr(se, s->for_range.hi, target, replacement);
+        ST_forrange(0, s->for_range.body.count)
+            ST_ast_substitute_stmt(se, s->for_range.body.items[i], target, replacement);
+        return;
         case ST_ST_FOR_ARRAY:
-            ST_ast_substitute_expr(se, s->for_array.target, target, replacement);
-            ST_forrange(0, s->for_array.body.count)
-                ST_ast_substitute_stmt(se, s->for_array.body.items[i], target, replacement);
-            return;
+        ST_ast_substitute_expr(se, s->for_array.target, target, replacement);
+        ST_forrange(0, s->for_array.body.count)
+            ST_ast_substitute_stmt(se, s->for_array.body.items[i], target, replacement);
+        return;
         case ST_ST_RETURN:
-            ST_forrange(0, s->ret.values.count)
-                ST_ast_substitute_expr(se, s->ret.values.items[i], target, replacement);
-            return;
+        ST_forrange(0, s->ret.values.count)
+            ST_ast_substitute_expr(se, s->ret.values.items[i], target, replacement);
+        return;
         case ST_ST_BLOCK:
-            ST_forrange(0, s->block.count)
-                ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
-            return;
+        ST_forrange(0, s->block.count)
+            ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
+        return;
         case ST_ST_COMPTIME_BLOCK:
-            ST_forrange(0, s->block.count)
-                ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
-            return;
+        ST_forrange(0, s->block.count)
+            ST_ast_substitute_stmt(se, s->block.items[i], target, replacement);
+        return;
         case ST_ST_DEFER:
-            ST_ast_substitute_stmt(se, s->defer_stmt, target, replacement);
-            return;
+        ST_ast_substitute_stmt(se, s->defer_stmt, target, replacement);
+        return;
         case ST_ST_MULTI_BIND:
-            ST_forrange(0, s->multi.values.count)
-                ST_ast_substitute_expr(se, s->multi.values.items[i], target, replacement);
-            return;
+        ST_forrange(0, s->multi.values.count)
+            ST_ast_substitute_expr(se, s->multi.values.items[i], target, replacement);
+        return;
         default:
-            return;
+        return;
     }
 }
 
@@ -3491,7 +3992,7 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
                     ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, access);
                 if (s->for_array.spec_iter.len)
                     ST_forrange(0, copy.count)
-                        ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &idx_lit);
+                    ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &idx_lit);
                 if (se->has_pack) {
                     ST_string_t no_target = {0};
                     ST_forrange(0, copy.count)
@@ -3547,7 +4048,7 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
             ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, access);
         if (s->for_array.spec_iter.len)
             ST_forrange(0, copy.count)
-                ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &idx_lit);
+            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &idx_lit);
         if (se->has_pack) {
             ST_string_t no_target = {0};
             ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
@@ -3583,7 +4084,7 @@ static void ST_check_comptime_for_pack(ST_sema_t *se, ST_stmt_t *s) {
             ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, access);
         if (s->for_array.spec_iter.len)
             ST_forrange(0, copy.count)
-                ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
+            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
         ST_string_t no_target = {0};
         ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
         ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
@@ -3597,41 +4098,41 @@ static b8 ST_expr_contains_ident(ST_expr_t *e, ST_string_t name) {
         return 0;
     switch (e->kind) {
         case ST_EX_IDENT:
-            return name.len && ST_string_eq(e->name, name);
+        return name.len && ST_string_eq(e->name, name);
         case ST_EX_INDEX:
-            return ST_expr_contains_ident(e->index.base, name) ||
-                   ST_expr_contains_ident(e->index.index, name);
+        return ST_expr_contains_ident(e->index.base, name) ||
+            ST_expr_contains_ident(e->index.index, name);
         case ST_EX_FIELD:
-            return ST_expr_contains_ident(e->field.base, name);
+        return ST_expr_contains_ident(e->field.base, name);
         case ST_EX_UNARY:
-            return ST_expr_contains_ident(e->unary.operand, name);
+        return ST_expr_contains_ident(e->unary.operand, name);
         case ST_EX_SIZEOF:
         case ST_EX_TYPEOF:
         case ST_EX_TYPEINFO:
         case ST_EX_KIND:
         case ST_EX_CSTR:
         case ST_EX_FIELDS:
-            return ST_expr_contains_ident(e->tyop.operand, name);
+        return ST_expr_contains_ident(e->tyop.operand, name);
         case ST_EX_BINARY:
-            return ST_expr_contains_ident(e->bin.l, name) ||
-                   ST_expr_contains_ident(e->bin.r, name);
+        return ST_expr_contains_ident(e->bin.l, name) ||
+            ST_expr_contains_ident(e->bin.r, name);
         case ST_EX_CALL: {
             if (ST_expr_contains_ident(e->call.callee, name))
                 return 1;
             ST_forrange(0, e->call.args.count)
                 if (ST_expr_contains_ident(e->call.args.items[i].value, name))
-                    return 1;
+                return 1;
             return 0;
         }
         case ST_EX_CAST:
-            return ST_expr_contains_ident(e->cast.operand, name);
+        return ST_expr_contains_ident(e->cast.operand, name);
         case ST_EX_COMP_ERROR:
-            ST_forrange(0, e->comp_error.args.count)
-                if (ST_expr_contains_ident(e->comp_error.args.items[i], name))
-                    return 1;
-            return 0;
+        ST_forrange(0, e->comp_error.args.count)
+            if (ST_expr_contains_ident(e->comp_error.args.items[i], name))
+            return 1;
+        return 0;
         default:
-            return 0;
+        return 0;
     }
 }
 
@@ -3708,7 +4209,7 @@ static void ST_check_comptime_for_array(ST_sema_t *se, ST_stmt_t *s) {
         ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, &ch_lit);
         if (s->for_array.spec_iter.len)
             ST_forrange(0, copy.count)
-                ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
+            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
         if (se->has_pack) {
             ST_string_t no_target = {0};
             ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
@@ -3778,32 +4279,32 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
         return;
     switch (s->kind) {
         case ST_ST_EXPR:
-            if (s->expr && s->expr->kind == ST_EX_CALL)
-                ST_type_call(se, s->expr);
-            else
-                ST_type_expr(se, s->expr);
-            break;
+        if (s->expr && s->expr->kind == ST_EX_CALL)
+            ST_type_call(se, s->expr);
+        else
+            ST_type_expr(se, s->expr);
+        break;
         case ST_ST_PACK_EXPAND:
-            ST_check_pack_expand(se, s);
-            break;
+        ST_check_pack_expand(se, s);
+        break;
         case ST_ST_DECL:
-            ST_check_decl_stmt(se, s);
-            break;
+        ST_check_decl_stmt(se, s);
+        break;
         case ST_ST_ASSIGN:
-            ST_check_assign(se, s);
-            break;
+        ST_check_assign(se, s);
+        break;
         case ST_ST_MULTI_BIND:
-            ST_check_multi(se, s);
-            break;
+        ST_check_multi(se, s);
+        break;
         case ST_ST_IF:
-            if (s->if_.is_comptime) {
-                ST_check_comptime_if(se, s);
-                break;
-            }
-            ST_check_cond(se, s->if_.cond, "'if'");
-            ST_check_body(se, &s->if_.then_body);
-            ST_check_stmt(se, s->if_.else_stmt);
+        if (s->if_.is_comptime) {
+            ST_check_comptime_if(se, s);
             break;
+        }
+        ST_check_cond(se, s->if_.cond, "'if'");
+        ST_check_body(se, &s->if_.then_body);
+        ST_check_stmt(se, s->if_.else_stmt);
+        break;
         case ST_ST_SWITCH: {
             if (s->switch_.is_comptime) {
                 ST_check_comptime_switch(se, s);
@@ -3829,9 +4330,9 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                     b8 found = 0;
                     ST_forrange(0, ct->decl->tag_union.variants.count)
                         if (ST_string_eq(ct->decl->tag_union.variants.items[i].name, vname)) {
-                            found = 1;
-                            break;
-                        }
+                        found = 1;
+                        break;
+                    }
                     if (!found) {
                         ST_diag_error(&se->diag, c->values.items[0]->line,
                                       c->values.items[0]->col,
@@ -3848,8 +4349,8 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 break;
             }
             ST_sym_t *cond_sym = s->switch_.cond->kind == ST_EX_IDENT
-                                     ? ST_sym_find(se, s->switch_.cond->name)
-                                     : NULL;
+                ? ST_sym_find(se, s->switch_.cond->name)
+                : NULL;
             ST_tyexprs_t *constraints = cond_sym ? cond_sym->generic_constraints : NULL;
 
             ST_forrange(0, s->switch_.cases.count) {
@@ -3882,9 +4383,9 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         }
         case ST_ST_WHILE:
-            ST_check_cond(se, s->while_.cond, "'while'");
-            ST_check_body(se, &s->while_.body);
-            break;
+        ST_check_cond(se, s->while_.cond, "'while'");
+        ST_check_body(se, &s->while_.body);
+        break;
         case ST_ST_FOR_RANGE: {
             if (s->for_range.is_comptime) {
                 ST_check_comptime_for(se, s);
@@ -3929,7 +4430,7 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
         }
         case ST_ST_FOR_ARRAY: {
             b8 targets_pack = se->has_pack && s->for_array.target->kind == ST_EX_IDENT &&
-                              ST_string_eq(s->for_array.target->name, se->cur_pack_name);
+                ST_string_eq(s->for_array.target->name, se->cur_pack_name);
             b8 targets_fields = s->for_array.target->kind == ST_EX_FIELDS;
             if (s->for_array.is_comptime || targets_pack || targets_fields) {
                 if (targets_fields)
@@ -3974,35 +4475,35 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             break;
         }
         case ST_ST_RETURN:
-            ST_check_return(se, s);
-            break;
+        ST_check_return(se, s);
+        break;
         case ST_ST_BLOCK:
-            ST_check_body(se, &s->block);
-            break;
+        ST_check_body(se, &s->block);
+        break;
         case ST_ST_DEFER:
-            ST_check_stmt(se, s->defer_stmt);
-            break;
+        ST_check_stmt(se, s->defer_stmt);
+        break;
         case ST_ST_BREAK:
         case ST_ST_CONTINUE:
-            break;
+        break;
         case ST_ST_LABEL:
-            break;
+        break;
         case ST_ST_GODOWN:
-            if (!ST_sym_find_in(se->labels, s->label))
-                ST_diag_error(&se->diag, s->line, s->col, "goto to unknown label '" ST_sv_fmt "'",
-                              ST_sv_args(s->label));
-            break;
+        if (!ST_sym_find_in(se->labels, s->label))
+            ST_diag_error(&se->diag, s->line, s->col, "goto to unknown label '" ST_sv_fmt "'",
+                          ST_sv_args(s->label));
+        break;
         case ST_ST_ASM:
-            break;
+        break;
         case ST_ST_COMPTIME_BLOCK:
-            ST_check_comptime_block(se, s);
-            break;
+        ST_check_comptime_block(se, s);
+        break;
         case ST_ST_NESTED_FN:
-            ST_declare_nested_fn_sym(se, s->nested_fn);
-            break;
+        ST_declare_nested_fn_sym(se, s->nested_fn);
+        break;
         case ST_ST_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
 }
 
@@ -4025,28 +4526,28 @@ static void ST_collect_labels(ST_sema_t *se, ST_ht_t *labels, ST_stmts_t *body) 
                 break;
             }
             case ST_ST_IF:
-                ST_collect_labels(se, labels, &s->if_.then_body);
-                if (s->if_.else_stmt) {
-                    ST_stmts_t one = {.items = &s->if_.else_stmt, .count = 1};
-                    ST_collect_labels(se, labels, &one);
-                }
-                break;
+            ST_collect_labels(se, labels, &s->if_.then_body);
+            if (s->if_.else_stmt) {
+                ST_stmts_t one = {.items = &s->if_.else_stmt, .count = 1};
+                ST_collect_labels(se, labels, &one);
+            }
+            break;
             case ST_ST_SWITCH:
-                for (u32 k = 0; k < s->switch_.cases.count; k++)
-                    ST_collect_labels(se, labels, &s->switch_.cases.items[k].body);
-                break;
+            for (u32 k = 0; k < s->switch_.cases.count; k++)
+                ST_collect_labels(se, labels, &s->switch_.cases.items[k].body);
+            break;
             case ST_ST_WHILE:
-                ST_collect_labels(se, labels, &s->while_.body);
-                break;
+            ST_collect_labels(se, labels, &s->while_.body);
+            break;
             case ST_ST_FOR_RANGE:
-                ST_collect_labels(se, labels, &s->for_range.body);
-                break;
+            ST_collect_labels(se, labels, &s->for_range.body);
+            break;
             case ST_ST_FOR_ARRAY:
-                ST_collect_labels(se, labels, &s->for_array.body);
-                break;
+            ST_collect_labels(se, labels, &s->for_array.body);
+            break;
             case ST_ST_BLOCK:
-                ST_collect_labels(se, labels, &s->block);
-                break;
+            ST_collect_labels(se, labels, &s->block);
+            break;
             case ST_ST_DEFER: {
                 ST_stmts_t one = {.items = &s->defer_stmt, .count = 1};
                 ST_collect_labels(se, labels, &one);
@@ -4064,10 +4565,10 @@ static void ST_collect_labels(ST_sema_t *se, ST_ht_t *labels, ST_stmts_t *body) 
             case ST_ST_GODOWN:
             case ST_ST_ASM:
             case ST_ST_NESTED_FN:
-                break;
+            break;
             case ST_ST_COUNT:
-                ST_assert(0);
-                break;
+            ST_assert(0);
+            break;
         }
     }
 }
@@ -4088,24 +4589,24 @@ static void ST_check_infinite_goto_loops(ST_sema_t *se, ST_stmts_t *body) {
 
         switch (s->kind) {
             case ST_ST_LABEL:
-                if (n_tracked < ST_MAX_TRACKED_LABELS) {
-                    tracked[n_tracked].name = s->label;
-                    tracked[n_tracked].branch_seen = 0;
-                    n_tracked++;
-                }
-                break;
+            if (n_tracked < ST_MAX_TRACKED_LABELS) {
+                tracked[n_tracked].name = s->label;
+                tracked[n_tracked].branch_seen = 0;
+                n_tracked++;
+            }
+            break;
 
             case ST_ST_GODOWN:
-                for (u32 k = 0; k < n_tracked; k++) {
-                    if (ST_string_eq(tracked[k].name, s->label) && !tracked[k].branch_seen)
-                        ST_diag_error(&se->diag, s->line, s->col,
-                                      "'goto " ST_sv_fmt "' loops back with no conditional "
-                                      "branch anywhere in between - this can never exit, "
-                                      "it's an infinite loop. Wrap it in an 'if'/'while' or "
-                                      "add a 'break'/'return' path.",
-                                      ST_sv_args(s->label));
-                }
-                break;
+            for (u32 k = 0; k < n_tracked; k++) {
+                if (ST_string_eq(tracked[k].name, s->label) && !tracked[k].branch_seen)
+                    ST_diag_error(&se->diag, s->line, s->col,
+                                  "'goto " ST_sv_fmt "' loops back with no conditional "
+                                  "branch anywhere in between - this can never exit, "
+                                  "it's an infinite loop. Wrap it in an 'if'/'while' or "
+                                  "add a 'break'/'return' path.",
+                                  ST_sv_args(s->label));
+            }
+            break;
 
             case ST_ST_IF:
             case ST_ST_WHILE:
@@ -4115,45 +4616,45 @@ static void ST_check_infinite_goto_loops(ST_sema_t *se, ST_stmts_t *body) {
             case ST_ST_RETURN:
             case ST_ST_BREAK:
             case ST_ST_CONTINUE:
-                for (u32 k = 0; k < n_tracked; k++)
-                    tracked[k].branch_seen = 1;
-                break;
+            for (u32 k = 0; k < n_tracked; k++)
+                tracked[k].branch_seen = 1;
+            break;
 
             default:
-                break;
+            break;
         }
 
         switch (s->kind) {
             case ST_ST_IF:
-                ST_check_infinite_goto_loops(se, &s->if_.then_body);
-                if (s->if_.else_stmt) {
-                    ST_stmts_t one = {.items = &s->if_.else_stmt, .count = 1};
-                    ST_check_infinite_goto_loops(se, &one);
-                }
-                break;
+            ST_check_infinite_goto_loops(se, &s->if_.then_body);
+            if (s->if_.else_stmt) {
+                ST_stmts_t one = {.items = &s->if_.else_stmt, .count = 1};
+                ST_check_infinite_goto_loops(se, &one);
+            }
+            break;
             case ST_ST_SWITCH:
-                for (u32 k = 0; k < s->switch_.cases.count; k++)
-                    ST_check_infinite_goto_loops(se, &s->switch_.cases.items[k].body);
-                break;
+            for (u32 k = 0; k < s->switch_.cases.count; k++)
+                ST_check_infinite_goto_loops(se, &s->switch_.cases.items[k].body);
+            break;
             case ST_ST_WHILE:
-                ST_check_infinite_goto_loops(se, &s->while_.body);
-                break;
+            ST_check_infinite_goto_loops(se, &s->while_.body);
+            break;
             case ST_ST_FOR_RANGE:
-                ST_check_infinite_goto_loops(se, &s->for_range.body);
-                break;
+            ST_check_infinite_goto_loops(se, &s->for_range.body);
+            break;
             case ST_ST_FOR_ARRAY:
-                ST_check_infinite_goto_loops(se, &s->for_array.body);
-                break;
+            ST_check_infinite_goto_loops(se, &s->for_array.body);
+            break;
             case ST_ST_BLOCK:
-                ST_check_infinite_goto_loops(se, &s->block);
-                break;
+            ST_check_infinite_goto_loops(se, &s->block);
+            break;
             case ST_ST_DEFER: {
                 ST_stmts_t one = {.items = &s->defer_stmt, .count = 1};
                 ST_check_infinite_goto_loops(se, &one);
                 break;
             }
             default:
-                break;
+            break;
         }
     }
 #undef ST_MAX_TRACKED_LABELS
@@ -4165,21 +4666,23 @@ static ST_sym_kind_t ST_decl_sym_kind(ST_decl_t *d) {
         case ST_DE_ENUM:
         case ST_DE_TAG_UNION:
         case ST_DE_TYPE_ALIAS:
-            return ST_SYM_TYPE;
+        return ST_SYM_TYPE;
         case ST_DE_FN:
         case ST_DE_EXTERN_FN:
-            return ST_SYM_FN;
+        return ST_SYM_FN;
         case ST_DE_CONST:
-            return ST_SYM_CONST;
+        return ST_SYM_CONST;
         case ST_DE_EXTERN_VAR:
-            return ST_SYM_EXTERN_VAR;
+        return ST_SYM_EXTERN_VAR;
         case ST_DE_GLOBAL:
-            return ST_SYM_GLOBAL;
+        return ST_SYM_GLOBAL;
         case ST_DE_IMPORT:
-            return ST_SYM_MODULE;
+        return ST_SYM_MODULE;
+        case ST_DE_TRAIT:
+        return ST_SYM_TYPE;
         case ST_DE_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
     return ST_SYM_VAR;
 }
@@ -4196,7 +4699,14 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
 
         if (is_generic_struct || is_generic_fn) {
             ST_sym_t *prev = ST_sym_find_in(&se->templates, d->name);
-            if (prev) {
+            // Generic structs still only ever get one slot (no struct
+            // overloading). A generic 'fn' template only conflicts with a
+            // *non-fn* template under the same name (e.g. a generic struct);
+            // multiple generic 'fn' templates sharing a name are legitimate
+            // arity-based overloads -- see ST_select_fn_template, which picks
+            // among them at each call site the same way ST_overload_find
+            // already does for ordinary (non-generic) fn overloads.
+            if (prev && (is_generic_struct || prev->kind != ST_SYM_FN)) {
                 ST_diag_error(&se->diag, d->line, d->col, "redefinition of '" ST_sv_fmt "'",
                               ST_sv_args(d->name));
                 ST_diag_note_in_file(se, ST_sym_file(prev), prev->line, prev->col,
@@ -4204,11 +4714,16 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
                 ST_diag_restore_file(se, save_diag_file, save_diag_src);
                 continue;
             }
-            ST_sym_insert(se, &se->templates,
-                          ST_sym_new(se, is_generic_fn ? ST_SYM_FN : ST_SYM_TYPE,
-                                     d->name, d, NULL, d->line, d->col));
-
+            ST_sym_t *tsym = ST_sym_new(se, is_generic_fn ? ST_SYM_FN : ST_SYM_TYPE,
+                                        d->name, d, NULL, d->line, d->col);
+            // se->templates only ever keeps the *first* template registered
+            // under a name (it's used as an existence/kind check elsewhere,
+            // e.g. "is there a generic thing called X"); the full candidate
+            // set for a generic fn name lives in se->overloads instead.
+            if (!prev)
+                ST_sym_insert(se, &se->templates, tsym);
             if (is_generic_fn) {
+                ST_overload_register(se, d->name, tsym);
                 ST_diag_restore_file(se, save_diag_file, save_diag_src);
                 continue;
             }
@@ -4234,7 +4749,7 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
                 if (d->kind == ST_DE_EXTERN_FN) {
                     ST_fn_sig_t *a = &prev->decl->extern_fn.sig, *b = &d->extern_fn.sig;
                     same_shape = a->params.count == b->params.count &&
-                                 a->rets.count == b->rets.count && a->is_variadic == b->is_variadic;
+                        a->rets.count == b->rets.count && a->is_variadic == b->is_variadic;
                 }
                 if (same_shape) {
                     ST_diag_restore_file(se, save_diag_file, save_diag_src);
@@ -4249,6 +4764,33 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
                 ST_diag_restore_file(se, save_diag_file, save_diag_src);
                 continue;
             }
+            b8 both_global = prev->decl && prev->decl->kind == ST_DE_GLOBAL &&
+                            d->kind == ST_DE_GLOBAL;
+            b8 both_plain_fn = both_fn && !prev_proto && !cur_proto &&
+                               !prev->decl->fn.sig.generics.count && !d->fn.sig.generics.count;
+            if (both_plain_fn || both_global) {
+                // 'd->name' is also the literal symbol name the backend emits, so a
+                // second (third, ...) decl sharing it needs a unique name of its own
+                // or codegen would emit two definitions of the same symbol. The
+                // *source* name (what callers/where-clauses actually write) stays
+                // the overload-table key; only the decl's own emitted name changes.
+                ST_string_t source_name = d->name;
+                ST_syms_t *existing_list = ST_overload_find(se, source_name);
+                u32 ovl_idx = existing_list ? existing_list->count : 1;
+                char buf[300];
+                int n = snprintf(buf, sizeof(buf), ST_sv_fmt "$ovl%u", ST_sv_args(source_name),
+                                 ovl_idx);
+                u8 *nb = ST_arena_push(se->arena, (u32)n);
+                memcpy(nb, buf, (u32)n);
+                d->name = (ST_string_t){.data = nb, .len = (u32)n};
+
+                ST_sym_t *sym =
+                    ST_sym_new(se, ST_decl_sym_kind(d), d->name, d, NULL, d->line, d->col);
+                d->sema_sym = sym;
+                ST_overload_register(se, source_name, sym);
+                ST_diag_restore_file(se, save_diag_file, save_diag_src);
+                continue;
+            }
             ST_diag_error(&se->diag, d->line, d->col, "redefinition of '" ST_sv_fmt "'",
                           ST_sv_args(d->name));
             ST_diag_note_in_file(se, ST_sym_file(prev), prev->line, prev->col,
@@ -4256,8 +4798,13 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
             ST_diag_restore_file(se, save_diag_file, save_diag_src);
             continue;
         }
-        ST_sym_insert(se, &se->globals,
-                      ST_sym_new(se, ST_decl_sym_kind(d), d->name, d, NULL, d->line, d->col));
+        {
+            ST_sym_t *sym =
+                ST_sym_new(se, ST_decl_sym_kind(d), d->name, d, NULL, d->line, d->col);
+            d->sema_sym = sym;
+            ST_sym_insert(se, &se->globals, sym);
+            ST_overload_register(se, d->name, sym);
+        }
         ST_diag_restore_file(se, save_diag_file, save_diag_src);
     }
 }
@@ -4267,13 +4814,13 @@ static void ST_check_dup_fields(ST_sema_t *se, ST_decl_t *d) {
         ST_field_spec_t *f = &d->struct_.fields.items[i];
         for (u32 k = 0; k < i; k++)
             if (ST_string_eq(d->struct_.fields.items[k].name, f->name) && f->name.len) {
-                ST_diag_error(&se->diag, f->line, f->col,
-                              "duplicate field '" ST_sv_fmt "' in struct '" ST_sv_fmt "'",
-                              ST_sv_args(f->name), ST_sv_args(d->name));
-                ST_diag_note(&se->diag, d->struct_.fields.items[k].line,
-                             d->struct_.fields.items[k].col, "previous field is here");
-                break;
-            }
+            ST_diag_error(&se->diag, f->line, f->col,
+                          "duplicate field '" ST_sv_fmt "' in struct '" ST_sv_fmt "'",
+                          ST_sv_args(f->name), ST_sv_args(d->name));
+            ST_diag_note(&se->diag, d->struct_.fields.items[k].line,
+                         d->struct_.fields.items[k].col, "previous field is here");
+            break;
+        }
     }
 }
 
@@ -4348,11 +4895,11 @@ static void ST_sema_enum_values(ST_sema_t *se, ST_decl_t *d) {
         next++;
         for (u32 k = 0; k < i; k++)
             if (vs->items[k].computed == v->computed) {
-                ST_diag_error(&se->diag, v->line, v->col,
-                              "enum variant '" ST_sv_fmt "' has the same value as '" ST_sv_fmt "'",
-                              ST_sv_args(v->name), ST_sv_args(vs->items[k].name));
-                break;
-            }
+            ST_diag_error(&se->diag, v->line, v->col,
+                          "enum variant '" ST_sv_fmt "' has the same value as '" ST_sv_fmt "'",
+                          ST_sv_args(v->name), ST_sv_args(vs->items[k].name));
+            break;
+        }
     }
 }
 
@@ -4361,20 +4908,20 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, d->name);
-        if (!sym || sym->decl != d)
+        ST_sym_t *sym = ST_sym_for_decl(se, d);
+        if (!sym)
             continue;
         ST_string_t save_diag_file, save_diag_src;
         ST_diag_switch_file(se, d->file, &save_diag_file, &save_diag_src);
         switch (d->kind) {
             case ST_DE_STRUCT:
-                ST_check_dup_fields(se, d);
-                sym->t = ST_ty_for_decls(&se->tys, d);
-                break;
+            ST_check_dup_fields(se, d);
+            sym->t = ST_ty_for_decls(&se->tys, d);
+            break;
             case ST_DE_ENUM:
             case ST_DE_TAG_UNION:
-                sym->t = ST_ty_for_decls(&se->tys, d);
-                break;
+            sym->t = ST_ty_for_decls(&se->tys, d);
+            break;
             case ST_DE_CONST:
             case ST_DE_TYPE_ALIAS:
             case ST_DE_EXTERN_FN:
@@ -4382,10 +4929,11 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
             case ST_DE_GLOBAL:
             case ST_DE_FN:
             case ST_DE_IMPORT:
-                break;
+            case ST_DE_TRAIT:
+            break;
             case ST_DE_COUNT:
-                ST_assert(0);
-                break;
+            ST_assert(0);
+            break;
         }
         ST_diag_restore_file(se, save_diag_file, save_diag_src);
     }
@@ -4394,40 +4942,40 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, d->name);
-        if (!sym || sym->decl != d)
+        ST_sym_t *sym = ST_sym_for_decl(se, d);
+        if (!sym)
             continue;
         ST_string_t save_diag_file, save_diag_src;
         ST_diag_switch_file(se, d->file, &save_diag_file, &save_diag_src);
         switch (d->kind) {
             case ST_DE_STRUCT:
-                if (d->struct_.generics.count)
-                    break;
-                ST_complete_ty(se, sym->t);
+            if (d->struct_.generics.count)
                 break;
+            ST_complete_ty(se, sym->t);
+            break;
             case ST_DE_TAG_UNION:
-                ST_complete_ty(se, sym->t);
-                break;
+            ST_complete_ty(se, sym->t);
+            break;
             case ST_DE_ENUM:
-                ST_sema_enum_values(se, d);
-                break;
+            ST_sema_enum_values(se, d);
+            break;
             case ST_DE_CONST:
-                ST_ty_of_const(se, sym);
-                break;
+            ST_ty_of_const(se, sym);
+            break;
             case ST_DE_EXTERN_VAR:
-                sym->t = ST_resolve_tyexpr(se, d->extern_var.te);
-                break;
+            sym->t = ST_resolve_tyexpr(se, d->extern_var.te);
+            break;
             case ST_DE_EXTERN_FN:
-                ST_build_fn_ty(se, sym, &d->extern_fn.sig);
-                break;
+            ST_build_fn_ty(se, sym, &d->extern_fn.sig);
+            break;
             case ST_DE_FN:
-                ST_build_fn_ty(se, sym, &d->fn.sig);
-                if (ST_string_eq_cstr(d->name, "main") && !d->is_pub)
-                    ST_diag_error(&se->diag, d->line, d->col,
-                                  "'main' must be declared 'pub': the backend only emits a "
-                                  "'global' symbol for pub functions, and a non-pub main has no "
-                                  "entry point to link against");
-                break;
+            ST_build_fn_ty(se, sym, &d->fn.sig);
+            if (ST_string_eq_cstr(d->name, "main") && !d->is_pub)
+                ST_diag_error(&se->diag, d->line, d->col,
+                              "'main' must be declared 'pub': the backend only emits a "
+                              "'global' symbol for pub functions, and a non-pub main has no "
+                              "entry point to link against");
+            break;
             case ST_DE_GLOBAL: {
                 ST_ty_t *dt = d->global_.te ? ST_resolve_tyexpr(se, d->global_.te) : NULL;
                 if (dt)
@@ -4464,10 +5012,11 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
             }
             case ST_DE_IMPORT:
             case ST_DE_TYPE_ALIAS:
-                break;
+            case ST_DE_TRAIT:
+            break;
             case ST_DE_COUNT:
-                ST_assert(0);
-                break;
+            ST_assert(0);
+            break;
         }
         ST_diag_restore_file(se, save_diag_file, save_diag_src);
     }
@@ -4571,10 +5120,10 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     se->cur_rets = fnty ? &fnty->rets : NULL;
     if (!d->fn.is_prototype)
         ST_forrange(0, d->fn.body.count) {
-            if (se->hit_comp_error)
-                break;
-            ST_check_stmt(se, d->fn.body.items[i]);
-        }
+        if (se->hit_comp_error)
+            break;
+        ST_check_stmt(se, d->fn.body.items[i]);
+    }
     se->cur_rets = NULL;
 
     ST_scope_pop(se);
@@ -4598,8 +5147,8 @@ static void ST_sema_check(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        ST_sym_t *sym = ST_sym_find_in(&se->globals, d->name);
-        if (!sym || sym->decl != d)
+        ST_sym_t *sym = ST_sym_for_decl(se, d);
+        if (!sym)
             continue;
         if (d->kind == ST_DE_FN)
             ST_check_fn_body(se, sym, d);
@@ -4617,69 +5166,69 @@ static void ST_default_stmt(ST_sema_t *se, ST_stmt_t *s) {
         return;
     switch (s->kind) {
         case ST_ST_EXPR:
-            ST_default_expr(se, s->expr);
-            break;
+        ST_default_expr(se, s->expr);
+        break;
         case ST_ST_PACK_EXPAND:
-            ST_default_expr(se, s->expr);
-            break;
+        ST_default_expr(se, s->expr);
+        break;
         case ST_ST_DECL:
-            ST_default_expr(se, s->decl.init);
-            break;
+        ST_default_expr(se, s->decl.init);
+        break;
         case ST_ST_ASSIGN:
-            ST_default_expr(se, s->assign.lhs);
-            ST_default_expr(se, s->assign.rhs);
-            break;
+        ST_default_expr(se, s->assign.lhs);
+        ST_default_expr(se, s->assign.rhs);
+        break;
         case ST_ST_MULTI_BIND:
-            ST_default_exprs(se, &s->multi.values);
-            break;
+        ST_default_exprs(se, &s->multi.values);
+        break;
         case ST_ST_IF:
-            ST_default_expr(se, s->if_.cond);
-            ST_default_body(se, &s->if_.then_body);
-            ST_default_stmt(se, s->if_.else_stmt);
-            break;
+        ST_default_expr(se, s->if_.cond);
+        ST_default_body(se, &s->if_.then_body);
+        ST_default_stmt(se, s->if_.else_stmt);
+        break;
         case ST_ST_SWITCH:
-            ST_default_expr(se, s->switch_.cond);
-            ST_forrange(0, s->switch_.cases.count) {
-                ST_case_t *c = &s->switch_.cases.items[i];
-                ST_default_exprs(se, &c->values);
-                ST_default_body(se, &c->body);
-            }
-            break;
+        ST_default_expr(se, s->switch_.cond);
+        ST_forrange(0, s->switch_.cases.count) {
+            ST_case_t *c = &s->switch_.cases.items[i];
+            ST_default_exprs(se, &c->values);
+            ST_default_body(se, &c->body);
+        }
+        break;
         case ST_ST_WHILE:
-            ST_default_expr(se, s->while_.cond);
-            ST_default_body(se, &s->while_.body);
-            break;
+        ST_default_expr(se, s->while_.cond);
+        ST_default_body(se, &s->while_.body);
+        break;
         case ST_ST_FOR_RANGE:
-            ST_default_expr(se, s->for_range.lo);
-            ST_default_expr(se, s->for_range.hi);
-            ST_default_body(se, &s->for_range.body);
-            break;
+        ST_default_expr(se, s->for_range.lo);
+        ST_default_expr(se, s->for_range.hi);
+        ST_default_body(se, &s->for_range.body);
+        break;
         case ST_ST_FOR_ARRAY:
-            ST_default_expr(se, s->for_array.target);
-            ST_default_body(se, &s->for_array.body);
-            break;
+        ST_default_expr(se, s->for_array.target);
+        ST_default_body(se, &s->for_array.body);
+        break;
         case ST_ST_RETURN:
-            ST_default_exprs(se, &s->ret.values);
-            break;
+        ST_default_exprs(se, &s->ret.values);
+        break;
         case ST_ST_BLOCK:
-            ST_default_body(se, &s->block);
-            break;
+        ST_default_body(se, &s->block);
+        break;
         case ST_ST_COMPTIME_BLOCK:
-            ST_default_body(se, &s->block);
-            break;
+        ST_default_body(se, &s->block);
+        break;
         case ST_ST_DEFER:
-            ST_default_stmt(se, s->defer_stmt);
-            break;
+        ST_default_stmt(se, s->defer_stmt);
+        break;
         case ST_ST_BREAK:
         case ST_ST_CONTINUE:
         case ST_ST_LABEL:
         case ST_ST_GODOWN:
         case ST_ST_ASM:
         case ST_ST_NESTED_FN:
-            break;
+        break;
         case ST_ST_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
 }
 
@@ -4701,58 +5250,62 @@ static void ST_default_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_IDENT:
         case ST_EX_ARRAY_NEW:
         case ST_EX_ASM:
-            break;
+        break;
         case ST_EX_SIZEOF:
-            if (!e->tyop.te)
-                ST_default_expr(se, e->tyop.operand);
-            break;
+        if (!e->tyop.te)
+            ST_default_expr(se, e->tyop.operand);
+        break;
         case ST_EX_STR_FROM_RAW:
-            ST_default_expr(se, e->str_from_raw.ptr);
-            ST_default_expr(se, e->str_from_raw.len);
-            break;
+        ST_default_expr(se, e->str_from_raw.ptr);
+        ST_default_expr(se, e->str_from_raw.len);
+        break;
         case ST_EX_UNARY:
-            ST_default_expr(se, e->unary.operand);
-            break;
+        ST_default_expr(se, e->unary.operand);
+        break;
         case ST_EX_BINARY:
-            ST_default_expr(se, e->bin.l);
-            ST_default_expr(se, e->bin.r);
-            break;
+        ST_default_expr(se, e->bin.l);
+        ST_default_expr(se, e->bin.r);
+        break;
         case ST_EX_CALL:
-            ST_default_expr(se, e->call.callee);
-            ST_forrange(0, e->call.args.count) ST_default_expr(se, e->call.args.items[i].value);
-            break;
+        ST_default_expr(se, e->call.callee);
+        ST_forrange(0, e->call.args.count) ST_default_expr(se, e->call.args.items[i].value);
+        break;
         case ST_EX_FIELD:
-            ST_default_expr(se, e->field.base);
-            break;
+        ST_default_expr(se, e->field.base);
+        break;
         case ST_EX_INDEX:
-            ST_default_expr(se, e->index.base);
-            ST_default_expr(se, e->index.index);
-            break;
+        ST_default_expr(se, e->index.base);
+        ST_default_expr(se, e->index.index);
+        break;
         case ST_EX_CAST:
-            ST_default_expr(se, e->cast.operand);
-            break;
+        ST_default_expr(se, e->cast.operand);
+        break;
         case ST_EX_STRUCT_LIT:
-            ST_forrange(0, e->struct_lit.inits.count)
-                ST_default_expr(se, e->struct_lit.inits.items[i].value);
-            break;
+        ST_forrange(0, e->struct_lit.inits.count)
+            ST_default_expr(se, e->struct_lit.inits.items[i].value);
+        break;
         case ST_EX_TYPEOF:
         case ST_EX_KIND:
         case ST_EX_CSTR:
         case ST_EX_FIELDS:
-            ST_default_expr(se, e->tyop.operand);
-            break;
+        ST_default_expr(se, e->tyop.operand);
+        break;
         case ST_EX_TYPEINFO:
-            if (!e->tyop.te)
-                ST_default_expr(se, e->tyop.operand);
-            break;
+        if (!e->tyop.te)
+            ST_default_expr(se, e->tyop.operand);
+        break;
         case ST_EX_COMP_ERROR:
-            ST_forrange(0, e->comp_error.args.count) ST_default_expr(se, e->comp_error.args.items[i]);
-            break;
+        ST_forrange(0, e->comp_error.args.count) ST_default_expr(se, e->comp_error.args.items[i]);
+        break;
         case ST_EX_PACK_FOLD:
-            break;
+        break;
+        case ST_EX_TRAIT_IMPL:
+        for (u32 i = 0; i < e->trait_impl.body.count; i++)
+            ST_default_stmt(se, e->trait_impl.body.items[i]);
+        break;
         case ST_EX_COUNT:
-            ST_assert(0);
-            break;
+        ST_assert(0);
+        break;
     }
 }
 
@@ -4762,33 +5315,34 @@ static void ST_sema_default_types(ST_sema_t *se, ST_program_t *prog) {
         if (!d)
             continue;
         if (d->kind == ST_DE_FN && d->fn.sig.generics.count)
-                continue;
+            continue;
 
         switch (d->kind) {
             case ST_DE_CONST:
-                ST_default_expr(se, d->const_.value);
-                break;
+            ST_default_expr(se, d->const_.value);
+            break;
             case ST_DE_FN:
-                ST_forrange(0, d->fn.sig.params.count)
-                    ST_default_expr(se, d->fn.sig.params.items[i].def);
-                if (!d->fn.is_prototype)
-                    ST_default_body(se, &d->fn.body);
-                break;
+            ST_forrange(0, d->fn.sig.params.count)
+                ST_default_expr(se, d->fn.sig.params.items[i].def);
+            if (!d->fn.is_prototype)
+                ST_default_body(se, &d->fn.body);
+            break;
             case ST_DE_EXTERN_FN:
-                ST_forrange(0, d->extern_fn.sig.params.count)
-                    ST_default_expr(se, d->extern_fn.sig.params.items[i].def);
+            ST_forrange(0, d->extern_fn.sig.params.count)
+                ST_default_expr(se, d->extern_fn.sig.params.items[i].def);
             case ST_DE_STRUCT:
             case ST_DE_ENUM:
             case ST_DE_TAG_UNION:
             case ST_DE_EXTERN_VAR:
             case ST_DE_IMPORT:
             case ST_DE_TYPE_ALIAS:
+            case ST_DE_TRAIT:
             case ST_DE_COUNT:
-                break;
+            break;
             case ST_DE_GLOBAL:
-                if (d->global_.init)
-                    ST_default_expr(se, d->global_.init);
-                break;
+            if (d->global_.init)
+                ST_default_expr(se, d->global_.init);
+            break;
         }
     }
 }
@@ -4883,6 +5437,8 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
     ST_ht_init(arena, &se->instantiations, 16);
     ST_ht_init(arena, &se->fn_instantiations, 16);
     ST_ht_init(arena, &se->inst_info, 16);
+    ST_ht_init(arena, &se->trait_witnesses, 16);
+    ST_ht_init(arena, &se->overloads, 64);
     se->prog = prog;
     ST_ty_ctx_init(&se->tys, arena);
     ST_forrange(0, ST_array_len(ST_builtin_fns)) {

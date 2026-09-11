@@ -54,10 +54,13 @@ typedef struct {
     ST_ht_t instantiations;
     ST_ht_t fn_instantiations;
     ST_ht_t inst_info;
+    ST_ht_t overloads;
+    ST_ht_t trait_witnesses;
     ST_ht_t *generic_bindings;
 
     b8 stamp_tyexprs;
     u32 n_fn_instances;
+    u32 n_witness_aliases; // see ST_type_call's 'where' handling
 
     b8 has_pack;
     ST_string_t cur_pack_name;
@@ -81,5 +84,9 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
 // unary/binary integer ops, and sizeof/alignof). Returns 0 if 'e' cannot be
 // folded to a constant at compile time.
 b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out);
+
+// @note: looks up the symbol for exactly this decl, not just any symbol sharing
+// its name
+ST_sym_t *ST_sym_for_decl(ST_sema_t *se, ST_decl_t *d);
 
 #endif

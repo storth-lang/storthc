@@ -1017,6 +1017,10 @@ static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) 
                 ST_ht_generic_t key = {.tag = e->name.data, .size = e->name.len};
                 ST_sym_t *sym = ST_ht_get(&c->sema->globals, key).tag;
                 if (sym && sym->kind == ST_SYM_CONST && sym->decl && sym->decl->kind == ST_DE_CONST) {
+                    ST_expr_t *cv = sym->decl->const_.value;
+                    if (sym->t && sym->t->kind == ST_TY_STRUCT && cv->kind == ST_EX_STRUCT_LIT) {
+                        return ST_lower_struct_addr(c, cv, sym->t);
+                    }
                     ST_lower_ensure_const_global(c, sym);
                     ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, sym->t);
                     return ST_ir_global_addr(c->cur, ptr_ty, sym->name, e->line, e->col);
@@ -1336,6 +1340,9 @@ static ST_ir_inst_t *ST_lower_addr_of(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *
             ST_ht_generic_t key = {.tag = v->name.data, .size = v->name.len};
             ST_sym_t *sym = ST_ht_get(&c->sema->globals, key).tag;
             if (sym && sym->kind == ST_SYM_CONST && sym->decl && sym->decl->kind == ST_DE_CONST) {
+                ST_expr_t *cv = sym->decl->const_.value;
+                if (sym->t && sym->t->kind == ST_TY_STRUCT && cv->kind == ST_EX_STRUCT_LIT)
+                    return ST_lower_struct_addr(c, cv, sym->t);
                 ST_lower_ensure_const_global(c, sym);
                 return ST_ir_global_addr(c->cur, ptr_ty, sym->name, e->line, e->col);
             }
@@ -1615,6 +1622,11 @@ static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
                         return ST_ir_cast(c->cur, e->ty, v, e->line, e->col);
                     return v;
                 }
+            }
+            {
+                ST_ir_fn_t *fn = ST_ir_module_find_fn(c->module, e->name);
+                if (fn)
+                    return ST_ir_global_addr(c->cur, e->ty, e->name, e->line, e->col);
             }
             ST_diag_error(&c->diag, e->line, e->col,
                           "internal: '" ST_sv_fmt "' used as a value is not supported yet "
@@ -3590,17 +3602,13 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
         else if (d->kind == ST_DE_EXTERN_FN)
             ST_lower_register_fn(&c, d->name, &d->extern_fn.sig, d->is_pub, 1);
         else if (d->kind == ST_DE_EXTERN_VAR) {
-            ST_sym_t *sym = ST_ht_get(&sema->globals, (ST_ht_generic_t){.tag = d->name.data,
-                                                                        .size = d->name.len})
-                                .tag;
+            ST_sym_t *sym = ST_sym_for_decl(sema, d);
             ST_ty_t *ty = sym ? sym->t : NULL;
             if (!ty)
                 continue;
             ST_ir_module_add_extern_global(out, d->name, ty);
         } else if (d->kind == ST_DE_GLOBAL) {
-            ST_sym_t *sym = ST_ht_get(&sema->globals, (ST_ht_generic_t){.tag = d->name.data,
-                                                                        .size = d->name.len})
-                                .tag;
+            ST_sym_t *sym = ST_sym_for_decl(sema, d);
             ST_ty_t *ty = sym ? sym->t : NULL;
             if (!ty)
                 continue;

@@ -32,6 +32,8 @@ ST_tyexpr_t *ST_tyexpr_new(ST_arena_t *a, ST_tyexpr_kind_t kind, u32 line, u32 c
     return te;
 }
 
+static void ST_dump_body(FILE *out, ST_stmts_t *body, u32 depth);
+
 static void ST_indent(FILE *out, u32 depth) {
     fprintf(out, "%*s", (int)(depth * 2), "");
 }
@@ -249,6 +251,16 @@ void ST_dump_expr(FILE *out, ST_expr_t *e, u32 depth) {
         fprintf(out, "pack_fold (" ST_sv_fmt " " ST_sv_fmt " ...)\n",
                 ST_sv_args(e->pack_fold.pack_name), ST_sv_args(e->pack_fold.op));
         break;
+        case ST_EX_TRAIT_IMPL:
+        fprintf(out, "trait_impl " ST_sv_fmt "(", ST_sv_args(e->trait_impl.trait_name));
+        ST_forrange(0, e->trait_impl.trait_args.count) {
+            if (i)
+                fputs(", ", out);
+            ST_dump_tyexpr(out, e->trait_impl.trait_args.items[i]);
+        }
+        fputs(")\n", out);
+        ST_dump_body(out, &e->trait_impl.body, depth + 1);
+        break;
         case ST_EX_COUNT:
         ST_assert(0);
         break;
@@ -415,6 +427,18 @@ static void ST_dump_sig(FILE *out, ST_fn_sig_t *sig, u32 depth) {
         ST_indent(out, depth);
         fprintf(out, "ret <missing>\n");
     }
+    ST_forrange(0, sig->wheres.count) {
+        ST_where_clause_t *w = &sig->wheres.items[i];
+        ST_indent(out, depth);
+        fprintf(out, "where " ST_sv_fmt " : " ST_sv_fmt "(", ST_sv_args(w->witness_name),
+                ST_sv_args(w->trait_name));
+        ST_forrange(0, w->trait_args.count) {
+            if (i)
+                fputs(", ", out);
+            ST_dump_tyexpr(out, w->trait_args.items[i]);
+        }
+        fputs(")\n", out);
+    }
 }
 
 void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
@@ -514,6 +538,23 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
         case ST_DE_IMPORT:
         fprintf(out, "import " ST_sv_fmt " as " ST_sv_fmt "\n",
                 ST_sv_args(d->import_.module_name), ST_sv_args(d->import_.alias));
+        break;
+        case ST_DE_TRAIT:
+        fprintf(out, "trait " ST_sv_fmt "%s", ST_sv_args(d->name), d->is_pub ? " pub" : "");
+        ST_forrange(0, d->trait_.generics.count) {
+            fprintf(out, " $" ST_sv_fmt, ST_sv_args(d->trait_.generics.items[i]));
+        }
+        fputc('\n', out);
+        if (d->trait_.self_alias.len) {
+            ST_indent(out, depth + 1);
+            fprintf(out, "self_alias " ST_sv_fmt "\n", ST_sv_args(d->trait_.self_alias));
+        }
+        ST_forrange(0, d->trait_.methods.count) {
+            ST_trait_method_t *m = &d->trait_.methods.items[i];
+            ST_indent(out, depth + 1);
+            fprintf(out, "method " ST_sv_fmt "\n", ST_sv_args(m->name));
+            ST_dump_sig(out, &m->sig, depth + 2);
+        }
         break;
         case ST_DE_COUNT:
         ST_assert(0);

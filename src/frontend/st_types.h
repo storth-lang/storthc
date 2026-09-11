@@ -62,6 +62,7 @@ struct ST_ty_t {
     b8 has_any_pack;
     b8 is_noreturn;
     ST_ty_state_t state;
+    b8 is_trait_witness;
 };
 
 typedef struct {
