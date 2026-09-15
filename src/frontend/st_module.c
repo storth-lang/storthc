@@ -371,6 +371,21 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
             ST_modrw_expr(rw, e->str_from_raw.len);
             break;
 
+        case ST_EX_TRAIT_IMPL: {
+            ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(e->trait_impl.trait_name));
+            if (r.tag) {
+                e->trait_impl.trait_name = *(ST_string_t *)r.tag;
+            } else if (rw->auto_exposed) {
+                ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(e->trait_impl.trait_name));
+                if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                    e->trait_impl.trait_name = *(ST_string_t *)a.tag;
+            }
+            ST_forrange(0, e->trait_impl.trait_args.count)
+                ST_modrw_tyexpr(rw, e->trait_impl.trait_args.items[i]);
+            ST_modrw_body(rw, &e->trait_impl.body);
+            break;
+        }
+
         case ST_EX_COUNT:
             break;
     }
@@ -513,6 +528,29 @@ static void ST_modrw_decl(ST_module_rw_t *rw, ST_decl_t *d) {
             break;
         case ST_DE_IMPORT:
         case ST_DE_COUNT:
+            break;
+        case ST_DE_TRAIT:
+            ST_modrw_tyexpr(rw, d->trait_.self_ty);
+            ST_forrange(0, d->trait_.methods.count) {
+                ST_trait_method_t *m = &d->trait_.methods.items[i];
+                ST_forrange(0, m->sig.params.count) {
+                    ST_modrw_tyexpr(rw, m->sig.params.items[i].te);
+                    ST_modrw_expr(rw, m->sig.params.items[i].def);
+                }
+                ST_forrange(0, m->sig.rets.count) ST_modrw_tyexpr(rw, m->sig.rets.items[i]);
+                ST_forrange(0, m->sig.wheres.count) {
+                    ST_where_clause_t *w = &m->sig.wheres.items[i];
+                    ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(w->trait_name));
+                    if (r.tag) {
+                        w->trait_name = *(ST_string_t *)r.tag;
+                    } else if (rw->auto_exposed) {
+                        ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(w->trait_name));
+                        if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                            w->trait_name = *(ST_string_t *)a.tag;
+                    }
+                    ST_forrange(0, w->trait_args.count) ST_modrw_tyexpr(rw, w->trait_args.items[i]);
+                }
+            }
             break;
     }
 }

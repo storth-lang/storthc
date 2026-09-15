@@ -235,9 +235,11 @@ static void st_append_link(ST_arena_t *arena, ST_procs_t *procs, const char *out
     opt.args[n++] = out_flag;
     opt.args[n++] = obj_path;
     opt.args[n++] = "kernel32.lib";
-    opt.args[n++] = "user32.lib";
+    // opt.args[n++] = "user32.lib";
     opt.args[n++] = "gdi32.lib";
     opt.args[n++] = "msvcrt.lib";
+    opt.args[n++] = "vcruntime.lib";
+    opt.args[n++] = "ucrt.lib";
     opt.args[n++] = "legacy_stdio_definitions.lib";
 #else
     ST_unused(arena);

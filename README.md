@@ -10,10 +10,22 @@ This is meant for the enjoyment of the humanity and not putting politics into a 
 
 ## Build
 
-As long as you have a c compiler building it is self explanatory. You just run make.
+### Linux
+
+As long as you have a c compiler building it is self explanatory. You just run make. There is a configuration file config.mk which if you want to
+customize what you want like installation prefix you can do that from there since there is not a single centralized help yet.
 
 ```sh
 make -j$(nproc)
+```
+
+### Window
+
+Do note that you have to be in developer mode to access the cl compiler. Then run build.
+Also since we do not have stand alone linker you are always required to be in dev shell for windows so that it links the programs successfully.
+
+```console
+./build.bat
 ```
 
 

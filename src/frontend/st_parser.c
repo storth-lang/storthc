@@ -537,6 +537,10 @@ static b8 ST_parse_call_args(ST_parser_t *p, ST_args_t *out) {
         arg.value = ST_parse_expr(p);
         if (!arg.value)
             return 0;
+        if (ST_at_symbol(p, "...")) {
+            p->pos++;
+            arg.is_pack_spread = 1;
+        }
         ST_da_append_arena(p->arena, out, arg);
     }
     return ST_expect_sym(p, ")");
@@ -683,6 +687,13 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_ASM, t->line, t->col);
         if (!ST_parse_asm_tokens(p, &e->asm_.tokens, &e->asm_.n_tokens))
             return NULL;
+        return e;
+    }
+
+    if (ST_tok_is_symbol(t, "#code")) {
+        p->pos++;
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_CODE_LOC, t->line, t->col);
+        e->sval = p->file;
         return e;
     }
 
@@ -2083,6 +2094,24 @@ static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
             continue;
         }
         ST_token_t *mt = ST_peek(p);
+        if (ST_tok_is_ident(mt) && ST_string_eq_cstr(mt->text, "self") &&
+            ST_tok_is_symbol(ST_peek2(p), "=")) {
+            if (d->trait_.self_ty) {
+                ST_perr_here(p, "trait '" ST_sv_fmt "' already has a 'self' field",
+                             ST_sv_args(d->name));
+                return NULL;
+            }
+            p->pos += 2;
+            ST_tyexpr_t *te = ST_try_type(p);
+            if (!te) {
+                ST_perr_here(p, "expected a type after 'self ='");
+                return NULL;
+            }
+            d->trait_.self_ty = te;
+            if (!ST_expect_semi(p))
+                return NULL;
+            continue;
+        }
         if (ST_tok_is_ident(mt) && ST_tok_is_symbol(ST_peek2(p), ":=")) {
             if (d->trait_.self_alias.len) {
                 ST_perr_here(p, "trait '" ST_sv_fmt "' already has a self alias '" ST_sv_fmt "'",

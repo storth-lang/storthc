@@ -261,6 +261,9 @@ void ST_dump_expr(FILE *out, ST_expr_t *e, u32 depth) {
         fputs(")\n", out);
         ST_dump_body(out, &e->trait_impl.body, depth + 1);
         break;
+        case ST_EX_CODE_LOC:
+        fprintf(out, "code " ST_sv_fmt ":%u:%u\n", ST_sv_args(e->sval), e->line, e->col);
+        break;
         case ST_EX_COUNT:
         ST_assert(0);
         break;

@@ -1,28 +1,70 @@
-pub fn arrayReserve(arr: *[..]$T, capacity : i64 = 256) {
-    if arr.capacity == 0 then arr.capacity = capacity;
-    else { arr.capacity = arr.capacity  * 2; }
+pub fn reserve(arr: *[..]$T, size : i32 = 256) -> void {
+    if arr.capacity == 0 then arr.capacity = cast(i64) size;
+    else then arr.capacity *= 2;
+
+    arr.items = realloc(arr.items, cast(i64) type_info(arr.items).size *
+                        cast(i64) arr.capacity);
 }
 
-pub fn arrayPush(arr: *[..]$T, item: $T) {
-    if arr.count >= arr.capacity {
-        arrayReserve(arr);
-        new_bytes, _ := realloc(arr.items, arr.capacity);
-        arr.items = new_bytes;
+pub fn append(arr: *[..]$T, item: $T) -> void {
+    if arr.count >= arr.capacity then reserve(arr);
+    arr.items[arr.count] = item;
+    arr.count += 1;
+}
+
+pub fn reset(arr: *[..]$T) {
+    free(arr.items);
+    arr.count = 0;
+    arr.capacity = 0;
+}
+
+pub fn slice(array: []$T, start: i32, end: i32) -> []$T {
+    new_array: []$T;
+
+    for i: start..end {
+        new_array[i] = array[i];
     }
 
-    arr.items[arr.count] = item;
-    arr.count = arr.count + 1;
+    return new_array;
 }
 
-pub fn arrayRemoveUnordered(arr: *[..]$T, index: i32) {
-    arr.count -= 1;
-    arr.items[index] = arr.items[arr.count];
+pub fn slice(array: *[]$T, start: i32, end: i32) -> void {
+    if start > end then return;
+    array.ptr += end - start;
+    array.len = end - start;
 }
 
-pub fn shift(args: *[]$T) {
-    if args.len <= 0 then return;
-    args.ptr = args.ptr + 1;
-    args.len -= 1;
+pub fn shift(array: *[]$T) -> void {
+    slice(array, 0, 1);
 }
 
-#import "mem";
+pub fn reverse(arr: []$T) {
+    start : i64 = 0;
+    end := arr.len - 1;
+    while start < end {
+        temp := arr[start];
+        arr[start] = arr[end];
+        arr[end] = temp;
+        start += 1;
+        end -= 1;
+    }
+}
+
+// TODO: @bug: This is a clear bug as in it does not preserve the array pointer
+// state making so that we can not create a copy..
+pub fn insert(arr: *[..]$T, index: i32, value: $T) {
+    copy := *arr;
+    reset(arr);
+    for i:0..index {
+        temp := copy[i];
+        append(arr, temp);
+    }
+    append(arr, value);
+
+    for i:index..copy.count {
+        temp := copy[i];
+        append(arr, temp);
+    }
+}
+
+#import "libc";

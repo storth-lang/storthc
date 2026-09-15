@@ -273,7 +273,7 @@ static b8 ST_ty_is_int_like(ST_ty_t *t) {
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
-static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out);
+static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors);
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
@@ -459,6 +459,7 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_ASM:
         case ST_EX_STR_FROM_RAW:
         case ST_EX_PACK_FOLD:
+        case ST_EX_CODE_LOC:
         return 0;
         case ST_EX_COUNT:
         ST_assert(0);
@@ -645,16 +646,40 @@ static ST_ty_t *ST_instantiate_trait_witness(ST_sema_t *se, ST_decl_t *trait, ST
         for (u32 r = 0; r < m->sig.rets.count; r++)
             ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[r]);
 
+        u32 dup_idx = 0;
+        for (u32 j = 0; j < k; j++)
+            if (ST_string_eq(trait->trait_.methods.items[j].name, m->name))
+                dup_idx++;
+
         ST_field_spec_t f = {0};
-        f.name = m->name;
+        if (dup_idx == 0) {
+            f.name = m->name;
+        } else {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf), "%.*s$ovl%u", (int)m->name.len, m->name.data,
+                             dup_idx);
+            u8 *nb = ST_arena_push(se->arena, (u32)n);
+            memcpy(nb, buf, (u32)n);
+            f.name = (ST_string_t){.data = nb, .len = (u32)n};
+        }
         f.te = fnte;
         f.line = m->line;
         f.col = m->col;
         ST_da_append_arena(se->arena, &id->struct_.fields, f);
     }
 
+    if (trait->trait_.self_ty) {
+        ST_field_spec_t sf = {0};
+        sf.name = ST_cstr_to_str("self");
+        sf.te = trait->trait_.self_ty;
+        sf.line = trait->trait_.self_ty->line;
+        sf.col = trait->trait_.self_ty->col;
+        ST_da_append_arena(se->arena, &id->struct_.fields, sf);
+    }
+
     ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
     t->is_trait_witness = 1;
+    t->trait_decl = trait;
     ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
     hk->tag = mangled.data;
     hk->size = mangled.len;
@@ -692,14 +717,25 @@ static i32 ST_trait_method_index(ST_decl_t *trait, ST_string_t name) {
     return -1;
 }
 
+static i32 ST_trait_method_index_for(ST_decl_t *trait, ST_ty_t *witness_ty, ST_string_t name,
+                                     ST_ty_t *cand_ty) {
+    i32 first = -1;
+    for (u32 i = 0; i < trait->trait_.methods.count; i++) {
+        if (!ST_string_eq(trait->trait_.methods.items[i].name, name))
+            continue;
+        if (first < 0)
+            first = (i32)i;
+        if (cand_ty && (u32)i < witness_ty->fields.count &&
+            ST_ty_equal(cand_ty, witness_ty->fields.items[i].ty))
+            return (i32)i;
+    }
+    return first;
+}
+
 // @note: resolves a 'where name : Trait(...)' witness for one call site.
 // Checks the *caller's currently active scope* first (innermost block out
 // to the enclosing function's params), so an ordinary local shadows a
-// same-named global exactly like any other identifier would -- this is
-// what lets 'main' declare its own witness and have calls made from
-// inside 'main' pick it up automatically. Only once no local matches does
-// it fall back to the overload table (multiple top-level witnesses of the
-// same name, different types) and finally a plain single global/const.
+// same-named global exactly like any other identifier would
 static ST_sym_t *ST_find_witness(ST_sema_t *se, ST_string_t name, ST_ty_t *want_ty) {
     for (ST_scope_t *s = se->scope; s; s = s->parent) {
         ST_sym_t *sym = ST_sym_find_in(&s->table, name);
@@ -755,30 +791,65 @@ static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
         if (s->kind == ST_ST_NESTED_FN) {
             ST_decl_t *nd = s->nested_fn;
             ST_string_t bare = nd->display_name.len ? nd->display_name : nd->name;
-            i32 idx = ST_trait_method_index(trait, bare);
+
+            ST_expr_t *ref = ST_expr_new(se->arena, ST_EX_IDENT, nd->line, nd->col);
+            ref->name = nd->name;
+            ST_sym_t *nd_sym = ST_sym_for_decl(se, nd);
+            ST_ty_t *rt = nd_sym ? nd_sym->t : NULL;
+            if (!rt && nd_sym && nd->kind == ST_DE_FN) {
+                ST_build_fn_ty(se, nd_sym, &nd->fn.sig);
+                rt = nd_sym->t;
+            }
+            if (rt)
+                ref->ty = rt;
+            else
+                rt = ST_type_expr(se, ref);
+
+            i32 idx = ST_trait_method_index_for(trait, witness_ty, bare, rt);
             if (idx < 0) {
                 ST_diag_error(&se->diag, nd->line, nd->col,
                               "'" ST_sv_fmt "' is not a method of trait '" ST_sv_fmt "'",
                               ST_sv_args(bare), ST_sv_args(trait->name));
                 continue;
             }
-            ST_expr_t *ref = ST_expr_new(se->arena, ST_EX_IDENT, nd->line, nd->col);
-            ref->name = nd->name;
-            ST_ty_t *rt = ST_type_expr(se, ref);
             ST_ty_t *field_ty =
                 (u32)idx < witness_ty->fields.count ? witness_ty->fields.items[idx].ty : NULL;
             if (rt && field_ty && !ST_ty_coerces(se, rt, field_ty))
                 ST_diag_error(&se->diag, nd->line, nd->col,
                               "'" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(bare), ST_tstr(se, field_ty), ST_tstr(se, rt));
-            ST_field_init_t fi = {.name = bare, .value = ref, .line = nd->line, .col = nd->col};
+            ST_string_t field_name =
+                (u32)idx < witness_ty->fields.count ? witness_ty->fields.items[idx].name : bare;
+            ST_field_init_t fi = {
+                .name = field_name, .value = ref, .line = nd->line, .col = nd->col};
             ST_da_append_arena(se->arena, &inits, fi);
             supplied[idx] = 1;
+            continue;
+        }
+        if (s->kind == ST_ST_ASSIGN && s->assign.lhs && s->assign.lhs->kind == ST_EX_IDENT &&
+            ST_string_eq_cstr(s->assign.lhs->name, "self") &&
+            ST_string_eq_cstr(s->assign.op, "=") && trait->trait_.self_ty) {
+            ST_ty_t *self_ty = NULL;
+            for (u32 fi = 0; fi < witness_ty->fields.count; fi++)
+                if (ST_string_eq_cstr(witness_ty->fields.items[fi].name, "self")) {
+                    self_ty = witness_ty->fields.items[fi].ty;
+                    break;
+                }
+            ST_ty_t *vt = ST_type_expr(se, s->assign.rhs);
+            if (vt && self_ty && !ST_ty_coerces(se, vt, self_ty))
+                ST_diag_error(&se->diag, s->line, s->col, "'self' expects '%s', got '%s'",
+                              ST_tstr(se, self_ty), ST_tstr(se, vt));
+            ST_field_init_t sfi = {.name = ST_cstr_to_str("self"),
+                                   .value = s->assign.rhs,
+                                   .line = s->line,
+                                   .col = s->col};
+            ST_da_append_arena(se->arena, &inits, sfi);
             continue;
         }
         if (s->kind == ST_ST_ASSIGN && s->assign.lhs && s->assign.lhs->kind == ST_EX_FIELD &&
             ST_string_eq_cstr(s->assign.op, "=")) {
             ST_string_t field = s->assign.lhs->field.name;
+
             i32 idx = ST_trait_method_index(trait, field);
             if (idx < 0) {
                 ST_diag_error(&se->diag, s->line, s->col,
@@ -793,7 +864,10 @@ static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
                 ST_diag_error(&se->diag, s->line, s->col,
                               "'" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(field), ST_tstr(se, field_ty), ST_tstr(se, vt));
-            ST_field_init_t fi = {.name = field, .value = s->assign.rhs, .line = s->line, .col = s->col};
+            ST_string_t field_name =
+                (u32)idx < witness_ty->fields.count ? witness_ty->fields.items[idx].name : field;
+            ST_field_init_t fi = {
+                .name = field_name, .value = s->assign.rhs, .line = s->line, .col = s->col};
             ST_da_append_arena(se->arena, &inits, fi);
             supplied[idx] = 1;
             continue;
@@ -1041,6 +1115,7 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
         case ST_EX_IDENT:
         case ST_EX_ASM:
         case ST_EX_PACK_FOLD: // just two ST_string_t fields, already shallow-copied by '*n = *e;'
+        case ST_EX_CODE_LOC:
         break;
 
         case ST_EX_STR_FROM_RAW:
@@ -1117,6 +1192,16 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
         break;
     }
 
+    return n;
+}
+
+static ST_expr_t *ST_clone_default_at_call_site(ST_sema_t *se, ST_expr_t *def, ST_expr_t *call) {
+    ST_expr_t *n = ST_clone_expr(se->arena, def);
+    if (n && n->kind == ST_EX_CODE_LOC) {
+        n->line = call->line;
+        n->col = call->col;
+        n->sval = se->cur_fn_decl ? se->cur_fn_decl->file : n->sval;
+    }
     return n;
 }
 
@@ -1260,6 +1345,8 @@ static ST_fn_sig_t ST_clone_fn_sig(ST_arena_t *a, ST_fn_sig_t *s) {
     out.has_ret_ann = s->has_ret_ann;
     out.is_variadic = s->is_variadic;
     out.is_comptime = s->is_comptime;
+    out.is_noreturn = s->is_noreturn;
+    out.has_any_pack = s->has_any_pack;
     ST_forrange(0, s->params.count) {
         ST_param_t p = s->params.items[i];
         p.te = ST_clone_tyexpr(a, p.te);
@@ -1513,14 +1600,7 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     {
         // Two different templates sharing a name (arity-based overloads, see
         // ST_select_fn_template) can end up bound to identical generic type
-        // arguments -- e.g. both a 'where d : Drawable($T)' version and a
-        // plain 'd : Drawable($T)' version of 'render' instantiated with
-        // $T=Rectangle. Their mangled names would otherwise collide and the
-        // second call would wrongly reuse the first template's cached
-        // instance. Fold in the template's own (pre-witness-injection) arity
-        // whenever its name isn't unique, which is exactly what
-        // ST_select_fn_template used to tell the two apart in the first
-        // place.
+        // arguments
         ST_syms_t *ovl = ST_overload_find(se, tmpl->name);
         if (ovl && ovl->count > 1) {
             char buf[64];
@@ -1577,9 +1657,7 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     inst->fn.sig.generics = (ST_strings_t){0};
     inst->fn.is_prototype = tmpl->fn.is_prototype;
     inst->fn.body = ST_clone_body(se->arena, &tmpl->fn.body);
-    // 'where' clauses are now handled entirely as sugar for a trailing
-    // parameter, auto-supplied as a trailing argument at each call site
-    // (see ST_type_call) -- nothing left to do with them here.
+
     inst->fn.has_bound_str = has_bound_str;
     inst->fn.bound_str_param = bound_str_param;
     inst->fn.bound_str_value = bound_str_value;
@@ -2125,7 +2203,52 @@ static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, u32 n_a
     return fallback;
 }
 
+// @note: resolves every 'name...' pack-spread argument in 'e->call.args' (parsed by
+// ST_parse_call_args when a call argument is followed by '...') into real, separate
+// arguments
+static void ST_expand_pack_spread_args(ST_sema_t *se, ST_expr_t *e) {
+    b8 any_spread = 0;
+    for (u32 i = 0; i < e->call.args.count; i++)
+        if (e->call.args.items[i].is_pack_spread) {
+            any_spread = 1;
+            break;
+        }
+    if (!any_spread)
+        return;
+
+    ST_args_t new_args = {0};
+    for (u32 i = 0; i < e->call.args.count; i++) {
+        ST_arg_t *arg = &e->call.args.items[i];
+        if (!arg->is_pack_spread) {
+            ST_da_append_arena(se->arena, &new_args, *arg);
+            continue;
+        }
+        if (arg->value->kind != ST_EX_IDENT) {
+            ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                          "'...' after a call argument can only spread a bare '$T...' "
+                          "pack parameter name, not a general expression");
+            continue;
+        }
+        if (!se->has_pack || !ST_string_eq(arg->value->name, se->cur_pack_name)) {
+            ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                          "'" ST_sv_fmt "...' isn't valid here: '" ST_sv_fmt "' must be "
+                          "this function's '$T...' pack parameter",
+                          ST_sv_args(arg->value->name), ST_sv_args(arg->value->name));
+            continue;
+        }
+        for (u32 k = 0; k < se->cur_pack_count; k++) {
+            ST_expr_t *elem =
+                ST_expr_new(se->arena, ST_EX_IDENT, arg->value->line, arg->value->col);
+            elem->name = ST_pack_param_name(se, se->cur_pack_name, k);
+            ST_arg_t new_arg = {.name = (ST_string_t){0}, .value = elem};
+            ST_da_append_arena(se->arena, &new_args, new_arg);
+        }
+    }
+    e->call.args = new_args;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
     ST_sym_t *sym = NULL;
     ST_ty_t *fnty = NULL;
@@ -2180,9 +2303,119 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             }
         }
     } else if (callee) {
+        if (callee->kind == ST_EX_FIELD && callee->field.base) {
+            ST_ty_t *base_ty = ST_type_expr(se, callee->field.base);
+            if (base_ty && base_ty->is_trait_witness) {
+                ST_string_t base_name = callee->field.name;
+                for (u32 fi = 0; fi < base_ty->fields.count; fi++) {
+                    ST_string_t fname = base_ty->fields.items[fi].name;
+                    b8 is_candidate =
+                        (fname.len == base_name.len &&
+                         memcmp(fname.data, base_name.data, base_name.len) == 0) ||
+                        (fname.len > base_name.len + 4 &&
+                         memcmp(fname.data, base_name.data, base_name.len) == 0 &&
+                         memcmp(fname.data + base_name.len, "$ovl", 4) == 0);
+                    if (!is_candidate)
+                        continue;
+                    ST_ty_t *cand_ty = base_ty->fields.items[fi].ty;
+                    if (!cand_ty || cand_ty->kind != ST_TY_FN)
+                        continue;
+                    u32 pc = cand_ty->params.count;
+                    if (pc != e->call.args.count && pc != e->call.args.count + 1)
+                        continue;
+                    u32 arg_off = (pc == e->call.args.count + 1) ? 1 : 0;
+                    b8 matches = 1;
+                    for (u32 ai = 0; ai < e->call.args.count; ai++) {
+                        ST_ty_t *at = ST_type_expr(se, e->call.args.items[ai].value);
+                        ST_ty_t *pt =
+                            (ai + arg_off) < pc ? cand_ty->params.items[ai + arg_off] : NULL;
+                        if (at && pt && !ST_ty_coerces(se, at, pt)) {
+                            matches = 0;
+                            break;
+                        }
+                    }
+                    if (matches) {
+                        callee->field.name = fname;
+                        break;
+                    }
+                }
+            }
+        }
         fnty = ST_type_expr(se, callee);
         if (fnty && fnty->kind == ST_TY_PTR && fnty->inner && fnty->inner->kind == ST_TY_FN)
             fnty = fnty->inner;
+
+        if (fnty && fnty->kind == ST_TY_FN && callee->kind == ST_EX_FIELD &&
+            fnty->params.count > e->call.args.count) {
+            ST_ty_t *base_ty = callee->field.base ? callee->field.base->ty : NULL;
+            if (base_ty && base_ty->is_trait_witness) {
+                i32 self_idx = -1;
+                for (u32 fi = 0; fi < base_ty->fields.count; fi++)
+                    if (ST_string_eq_cstr(base_ty->fields.items[fi].name, "self")) {
+                        self_idx = (i32)fi;
+                        break;
+                    }
+
+                // Recover the trait's own declared signature for this method (via the
+                // witness's back-pointer) so we can see which trailing params, beyond
+                // the injected 'self', still have default values to fall back on.
+                ST_fn_sig_t *msig = NULL;
+                if (base_ty->trait_decl) {
+                    ST_string_t mname = callee->field.name;
+                    for (u32 ci = 0; ci < mname.len; ci++) {
+                        if (mname.data[ci] == '$') { // strip a 'name$ovlN' overload suffix
+                            mname.len = ci;
+                            break;
+                        }
+                    }
+                    i32 midx = ST_trait_method_index(base_ty->trait_decl, mname);
+                    if (midx >= 0)
+                        msig = &base_ty->trait_decl->trait_.methods.items[midx].sig;
+                }
+
+                u32 supplied = e->call.args.count;
+                u32 needed = fnty->params.count;
+                b8 have_self = self_idx >= 0 && needed >= supplied + 1;
+
+                if (have_self) {
+                    u32 still_missing = needed - (supplied + 1);
+                    b8 all_have_defaults = 1;
+                    if (still_missing > 0) {
+                        if (!msig || msig->params.count != needed)
+                            all_have_defaults = 0;
+                        else
+                            for (u32 pi = supplied + 1; pi < needed; pi++)
+                                if (!msig->params.items[pi].def) {
+                                    all_have_defaults = 0;
+                                    break;
+                                }
+                    }
+
+                    if (all_have_defaults) {
+                        ST_expr_t *self_ref =
+                            ST_expr_new(se->arena, ST_EX_FIELD, callee->line, callee->col);
+                        self_ref->field.base = callee->field.base;
+                        self_ref->field.name = ST_cstr_to_str("self");
+                        self_ref->ty = base_ty->fields.items[(u32)self_idx].ty;
+
+                        ST_args_t new_args = {0};
+                        ST_arg_t self_arg = {.name = (ST_string_t){0}, .value = self_ref};
+                        ST_da_append_arena(se->arena, &new_args, self_arg);
+                        ST_forrange(0, e->call.args.count)
+                            ST_da_append_arena(se->arena, &new_args, e->call.args.items[i]);
+                        for (u32 pi = supplied + 1; pi < needed; pi++) {
+                            ST_expr_t *dv = ST_clone_default_at_call_site(
+                                se, msig->params.items[pi].def, e);
+                            ST_type_expr(se, dv);
+                            ST_arg_t darg = {.name = (ST_string_t){0}, .value = dv};
+                            ST_da_append_arena(se->arena, &new_args, darg);
+                        }
+                        e->call.args = new_args;
+                    }
+                }
+            }
+        }
+
         if (fnty && fnty->kind != ST_TY_FN) {
             ST_diag_error(&se->diag, callee->line, callee->col, "cannot call a value of type '%s'",
                           ST_tstr(se, fnty));
@@ -2224,12 +2457,49 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         if (tsig->has_generic_pack)
             pack_idx = (i32)tsig->params.count - 1;
 
+        u32 fixed_fill_count = 0;
+        {
+            u32 n_unnamed = 0;
+            ST_forrange(0, e->call.args.count) if (!e->call.args.items[i].name.len) n_unnamed++;
+
+            if (pack_idx < 0)
+                fixed_fill_count = n_unnamed;
+            else {
+                u32 arg_pos = 0;
+                for (i32 pi = 0; pi < pack_idx; pi++) {
+                    if (fixed_fill_count >= n_unnamed)
+                        break;
+                    ST_param_t *fp = &tsig->params.items[pi];
+                    if (fp->def) {
+                        ST_ty_t *dty = fp->def->ty ? fp->def->ty : ST_type_expr(se, fp->def);
+                        u32 seen = 0;
+                        ST_ty_t *at = NULL;
+                        ST_forrange(0, e->call.args.count) {
+                            if (e->call.args.items[i].name.len)
+                                continue;
+                            if (seen == arg_pos) {
+                                at = e->call.args.items[i].value->ty;
+                                break;
+                            }
+                            seen++;
+                        }
+                        if (at && dty && !ST_ty_coerces(se, at, dty))
+                            break;
+                    }
+                    fixed_fill_count++;
+                    arg_pos++;
+                }
+            }
+        }
+
         b8 has_bound_str = 0;
         ST_string_t bound_str_param = {0}, bound_str_value = {0};
 
         u32 pos = 0;
         u32 n_pack_args = 0;
         b8 unify_ok = 1;
+        ST_expr_t *fixed_vals[64] = {0};
+        ST_exprs_t pack_vals = {0};
         ST_forrange(0, e->call.args.count) {
             ST_arg_t *arg = &e->call.args.items[i];
             u32 idx = tsig->params.count;
@@ -2247,12 +2517,16 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                     unify_ok = 0;
                     continue;
                 }
+            } else if (pack_idx >= 0 && pos >= fixed_fill_count) {
+                idx = (u32)pack_idx + (pos - fixed_fill_count);
+                pos++;
             } else
                 idx = pos++;
 
             if (pack_idx >= 0 && (i32)idx >= pack_idx) {
                 u32 k = idx - (u32)pack_idx;
                 n_pack_args = k + 1;
+                ST_da_append_arena(se->arena, &pack_vals, arg->value);
                 ST_tyexpr_t *elem_te = tsig->params.items[pack_idx].te;
                 ST_tyexpr_t *indexed = ST_pack_elem_te(se, elem_te, k);
                 if (!indexed) {
@@ -2269,6 +2543,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 continue;
             }
 
+            if (idx < tsig->params.count && idx < 64)
+                fixed_vals[idx] = arg->value;
+
             if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty)
                 if (!ST_unify_tyexpr(se, tsig->params.items[idx].te, arg->value->ty, &bindings,
                                      arg->value->line, arg->value->col))
@@ -2282,7 +2559,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 se->generic_bindings = save_gb;
                 if (pty && pty->kind == ST_TY_STRING) {
                     ST_ct_val_t val;
-                    if (ST_ct_eval_expr(se, arg->value, &val) && val.kind == ST_CT_STRING) {
+                    if (ST_ct_eval_expr(se, arg->value, &val, 0) && val.kind == ST_CT_STRING) {
                         has_bound_str = 1;
                         bound_str_param = tsig->params.items[idx].name;
                         u8 *buf = ST_arena_push(se->arena, val.str.len);
@@ -2291,6 +2568,25 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                     }
                 }
             }
+        }
+        if (unify_ok && pack_idx >= 0) {
+            ST_args_t new_call_args = {0};
+            for (i32 pi = 0; pi < pack_idx; pi++) {
+                ST_expr_t *v = (pi < 64) ? fixed_vals[pi] : NULL;
+                if (!v && tsig->params.items[pi].def) {
+                    v = ST_clone_default_at_call_site(se, tsig->params.items[pi].def, e);
+                    ST_type_expr(se, v);
+                }
+                if (!v)
+                    continue;
+                ST_arg_t na = {.name = (ST_string_t){0}, .value = v};
+                ST_da_append_arena(se->arena, &new_call_args, na);
+            }
+            ST_forrange(0, pack_vals.count) {
+                ST_arg_t na = {.name = (ST_string_t){0}, .value = pack_vals.items[i]};
+                ST_da_append_arena(se->arena, &new_call_args, na);
+            }
+            e->call.args = new_call_args;
         }
         if (unify_ok && tsig->wheres.count) {
             ST_ht_t *save_gb = se->generic_bindings;
@@ -2421,6 +2717,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     u32 n = e->call.args.count;
     u32 max_p = fnty->params.count;
     u32 min_args = max_p;
+    ST_string_t call_name = sym                                      ? ST_sym_display_name(sym)
+                           : (callee && callee->kind == ST_EX_FIELD) ? callee->field.name
+                                                                     : ST_cstr_to_str("function");
     if (sig) {
         min_args = 0;
         ST_forrange(0, sig->params.count)
@@ -2430,7 +2729,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     if (n < min_args || (!fnty->is_variadic && !fnty->has_any_pack && n > max_p)) {
         u32 line = sym ? sym->line : (callee ? callee->line : e->line);
         u32 col = sym ? sym->col : (callee ? callee->col : e->col);
-        ST_string_t name = sym ? ST_sym_display_name(sym) : ST_cstr_to_str("function");
+        ST_string_t name = call_name;
         if (fnty->is_variadic || fnty->has_any_pack)
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' expects at least %u argument%s, got %u",
@@ -2457,8 +2756,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         ST_ty_t *at = arg->value->ty;
         if (pt && at && !ST_ty_coerces(se, at, pt)) {
             ST_diag_error(&se->diag, arg->value->line, arg->value->col,
-                          "argument %u expects '%s', got '%s'", i + 1, ST_tstr(se, pt),
-                          ST_tstr(se, at));
+                          "'" ST_sv_fmt "' argument %u expects '%s', got '%s'",
+                          ST_sv_args(call_name), i + 1, ST_tstr(se, pt), ST_tstr(se, at));
             if (sym)
                 ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
                                      "'" ST_sv_fmt "' is declared here",
@@ -2629,6 +2928,9 @@ static ST_ty_t *ST_type_cast(ST_sema_t *se, ST_expr_t *e) {
     if (from->kind == ST_TY_PTR && ST_ty_is_int(to))
         return to;
     if (ST_ty_is_int(from) && to->kind == ST_TY_PTR)
+        return to;
+    if ((from->kind == ST_TY_FN || from->kind == ST_TY_PTR) &&
+        (to->kind == ST_TY_FN || to->kind == ST_TY_PTR))
         return to;
     if (from->kind == ST_TY_ANY)
         return to;
@@ -3033,6 +3335,9 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
         break;
         case ST_EX_NULL:
         t = se->tys.null_ptr;
+        break;
+        case ST_EX_CODE_LOC:
+        t = ST_ty_code_loc(&se->tys);
         break;
         case ST_EX_IDENT:
         t = ST_type_ident(se, e);
@@ -3656,7 +3961,10 @@ static void ST_stamp_kind_operands(ST_sema_t *se, ST_expr_t *e) {
     }
 }
 
-static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out) {
+// @note: 'report_errors' controls whether a failed evaluation surfaces a diagnostic.
+// Genuine 'this MUST be a compile-time value' contexts (#if/#switch conditions, a
+// comptime '#for' target) pass 1. Purely speculative probes.
+static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors) {
     ST_stamp_kind_operands(se, e);
     ST_ct_chunk_t chunk;
     ST_ct_chunk_init(se->arena, &chunk);
@@ -3664,18 +3972,22 @@ static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out) {
     ST_ct_compiler_init(&cc, se->arena, &chunk);
     ST_ct_compile_expr_return(&cc, e);
     if (cc.failed) {
-        ST_diag_error(&se->diag, cc.err_line, cc.err_col, "%s", cc.err_msg);
+        if (report_errors)
+            ST_diag_error(&se->diag, cc.err_line, cc.err_col, "%s", cc.err_msg);
         return 0;
     }
     ST_ct_vm_t vm;
     ST_ct_vm_init(&vm);
     ST_ct_status_t st = ST_ct_run(&vm, &chunk, out);
     if (st == ST_CT_ERR_COMPTIME) {
-        ST_diag_error(&se->diag, vm.err_line, e->col, "%s", vm.err_msg);
+        if (report_errors)
+            ST_diag_error(&se->diag, vm.err_line, e->col, "%s", vm.err_msg);
         return 0;
     }
     if (st == ST_CT_ERR_RUNTIME) {
-        ST_diag_error(&se->diag, e->line, e->col, "internal: comptime VM error: %s", vm.err_msg);
+        if (report_errors)
+            ST_diag_error(&se->diag, e->line, e->col, "internal: comptime VM error: %s",
+                          vm.err_msg);
         return 0;
     }
     return 1;
@@ -3688,7 +4000,7 @@ static void ST_rewrite_as_block(ST_stmt_t *s, ST_stmts_t body) {
 
 static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s) {
     ST_ct_val_t cond;
-    if (!ST_ct_eval_expr(se, s->if_.cond, &cond)) {
+    if (!ST_ct_eval_expr(se, s->if_.cond, &cond, 1)) {
         ST_rewrite_as_block(s, (ST_stmts_t){0});
         return;
     }
@@ -3704,7 +4016,7 @@ static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s) {
 
 static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s) {
     ST_ct_val_t scrutinee;
-    if (!ST_ct_eval_expr(se, s->switch_.cond, &scrutinee)) {
+    if (!ST_ct_eval_expr(se, s->switch_.cond, &scrutinee, 1)) {
         ST_rewrite_as_block(s, (ST_stmts_t){0});
         return;
     }
@@ -3718,7 +4030,7 @@ static void ST_check_comptime_switch(ST_sema_t *se, ST_stmt_t *s) {
         b8 hit = 0;
         for (u32 k = 0; k < c->values.count && !hit; k++) {
             ST_ct_val_t v;
-            if (!ST_ct_eval_expr(se, c->values.items[k], &v)) {
+            if (!ST_ct_eval_expr(se, c->values.items[k], &v, 1)) {
                 ST_rewrite_as_block(s, (ST_stmts_t){0});
                 return;
             }
@@ -4180,7 +4492,7 @@ static void ST_check_pack_expand(ST_sema_t *se, ST_stmt_t *s) {
 
 static void ST_check_comptime_for_array(ST_sema_t *se, ST_stmt_t *s) {
     ST_ct_val_t str;
-    if (!ST_ct_eval_expr(se, s->for_array.target, &str) || str.kind != ST_CT_STRING) {
+    if (!ST_ct_eval_expr(se, s->for_array.target, &str, 1) || str.kind != ST_CT_STRING) {
         ST_diag_error(&se->diag, s->line, s->col,
                       "'#for' over a value needs a compile-time-constant string here "
                       "(e.g. a string literal or a 'string ::' constant)");
@@ -4703,9 +5015,7 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
             // overloading). A generic 'fn' template only conflicts with a
             // *non-fn* template under the same name (e.g. a generic struct);
             // multiple generic 'fn' templates sharing a name are legitimate
-            // arity-based overloads -- see ST_select_fn_template, which picks
-            // among them at each call site the same way ST_overload_find
-            // already does for ordinary (non-generic) fn overloads.
+            // arity-based overloads.
             if (prev && (is_generic_struct || prev->kind != ST_SYM_FN)) {
                 ST_diag_error(&se->diag, d->line, d->col, "redefinition of '" ST_sv_fmt "'",
                               ST_sv_args(d->name));
@@ -4999,7 +5309,8 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                         ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
                                       "global '" ST_sv_fmt "' expects '%s', got '%s'",
                                       ST_sv_args(d->name), ST_tstr(se, dt), ST_tstr(se, it));
-                    else if (!ST_ty_is_float(sym->t)) {
+                    else if (sym->t->kind == ST_TY_STRUCT && d->global_.init->kind == ST_EX_STRUCT_LIT) {
+                    } else if (!ST_ty_is_float(sym->t)) {
                         i64 iv;
                         if (!ST_const_eval(se, d->global_.init, &iv))
                             ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
@@ -5250,6 +5561,7 @@ static void ST_default_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_IDENT:
         case ST_EX_ARRAY_NEW:
         case ST_EX_ASM:
+        case ST_EX_CODE_LOC:
         break;
         case ST_EX_SIZEOF:
         if (!e->tyop.te)
