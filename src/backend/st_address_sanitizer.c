@@ -94,6 +94,8 @@ static void ST_asan_walk_expr(ST_arena_t *arena, ST_expr_t *e, ST_string_t file)
         case ST_EX_ARRAY_NEW:
         case ST_EX_ASM:
         case ST_EX_PACK_FOLD:
+        case ST_EX_TRAIT_IMPL:
+        case ST_EX_CODE_LOC:
         case ST_EX_COUNT:
             break;
     }

@@ -460,6 +460,7 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_STR_FROM_RAW:
         case ST_EX_PACK_FOLD:
         case ST_EX_CODE_LOC:
+        case ST_EX_TRAIT_IMPL:
         return 0;
         case ST_EX_COUNT:
         ST_assert(0);
@@ -1108,6 +1109,7 @@ static ST_expr_t *ST_clone_expr(ST_arena_t *a, ST_expr_t *e) {
     switch(e->kind) {
         case ST_EX_INT:
         case ST_EX_FLOAT:
+        case ST_EX_TRAIT_IMPL:
         case ST_EX_STR:
         case ST_EX_CHAR:
         case ST_EX_BOOL:
@@ -3778,7 +3780,15 @@ static ST_expr_t *ST_lvalue_root_ident(ST_expr_t *e) {
 
 static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
     ST_ty_t *lt = ST_type_expr(se, s->assign.lhs);
-    ST_ty_t *rt = ST_type_expr(se, s->assign.rhs);
+    ST_ty_t *rt = {0};
+    ST_expr_t *rv = s->assign.rhs;
+    if (rv->kind == ST_EX_STRUCT_LIT && !rv->struct_lit.type_name.len && lt) {
+        rt = ST_type_struct_lit(se, rv, lt);
+        rv->ty = rt;
+    } else {
+        rt = ST_type_expr(se, s->assign.rhs);
+    }
+
     if (!lt || !rt)
         return;
     ST_expr_t *lhs = s->assign.lhs;

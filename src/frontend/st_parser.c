@@ -1117,6 +1117,8 @@ static ST_expr_t *ST_parse_cond(ST_parser_t *p) {
 static b8 ST_is_lvalue(ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT:
+        case ST_EX_TRAIT_IMPL:
+        case ST_EX_CODE_LOC:
         case ST_EX_FIELD:
         case ST_EX_INDEX:
             return 1;

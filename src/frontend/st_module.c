@@ -71,7 +71,7 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     const char *env = getenv("STORTHC_MODULE_PATH");
     if (env && *env) {
         candidate = ST_mod_join(arena, env, rel);
-        if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+        if (ST_access_file(ST_mod_cstr(arena, candidate))) {
             *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
             return 1;
         }
@@ -244,6 +244,7 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
         return;
     switch (e->kind) {
         case ST_EX_INT:
+        case ST_EX_CODE_LOC:
         case ST_EX_PACK_FOLD:
         case ST_EX_FLOAT:
         case ST_EX_STR:

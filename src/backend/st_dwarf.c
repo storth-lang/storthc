@@ -528,7 +528,9 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
         fputs("    db 0x01\n", out);
     }
     fputs("Ldbg_line_end:\n\n", out);
+}
 
+void ST_dwarf_emit_nasm_asan_lines(FILE *out, ST_dbg_info_t *info) {
     fputs("section .asan_lines progbits alloc noexec nowrite align=8\n", out);
 
     for (u32 i = 0; i < info->n_files; i++) {

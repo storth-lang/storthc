@@ -48,6 +48,11 @@
 #define STORTHC_GIT_HASH "unknown"
 #endif
 
+#if ST_BIND_GENERATOR
+#define STBIND_IMPLEMENTATION
+#include "utils/st_clang_bindgen.h"
+#endif
+
 #define ST_STR2(x) #x
 #define ST_STR(x) ST_STR2(x)
 #define STORTHC_VERSION_STRING                                                                 \
@@ -331,7 +336,7 @@ static void st_ct_load_ldflag_libs(strings_t *ldflags) {
 }
 
 static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, const char *output,
-                     strings_t *ldflags, i32 *run_exit_code, b8 no_debug, b8 use_fasm) {
+                     strings_t *ldflags, i32 *run_exit_code, b8 no_debug, b8 use_fasm, b8 quiet) {
     ST_procs_t procs;
     ST_procs_init(arena, &procs);
     b8 ok = 0;
@@ -527,7 +532,8 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
         goto done;
     }
 
-    st_print_summary(t_frontend, t_middle, t_backend_write, t_assemble, t_link);
+    if (!quiet)
+        st_print_summary(t_frontend, t_middle, t_backend_write, t_assemble, t_link);
     summary_printed = 1;
 
     ST_append_process(&procs, st_abs_path_cstr(arena, exe_path));
@@ -544,7 +550,7 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     }
 
 done:
-    if (!summary_printed && ok)
+    if (!quiet && !summary_printed && ok)
         st_print_summary(t_frontend, t_middle, t_backend_write, t_assemble, t_link);
     return ok;
 }
@@ -588,11 +594,12 @@ int main(int argc, char **argv) {
     command_t *build_obj = cli_command(build, "obj", "Assemble to an object file (default: test.o)");
     command_t *build_exe = cli_command(build, "exe", "Link a final executable (default: test)");
 
-    bool no_debug = false, use_fasm = false;
+    bool no_debug = false, use_fasm = false, quiet = false;
     const char *nodebug_desc =
         "Skip per-instruction debug-info collection during codegen (faster "
         "assembly, but a crash reports a raw address instead of a "
         "symbolicated file:line)";
+    const char *quiet_desc = "Suppress the timing summary (useful for snapshot-testing output)";
 #ifndef _WIN32
     const char *fasm_desc = "Use the FASM backend instead of nasm";
 #endif
@@ -602,6 +609,7 @@ int main(int argc, char **argv) {
     cli_create_flag_string(build_asm, "output", "Output .asm path", &out_asm);
     cli_alias(build_asm, "output", 'o');
     cli_create_flag_bool(build_asm, "nodebug", nodebug_desc, &no_debug);
+    cli_create_flag_bool(build_asm, "quiet", quiet_desc, &quiet);
 #ifndef _WIN32
     cli_create_flag_bool(build_asm, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -611,6 +619,7 @@ int main(int argc, char **argv) {
     cli_create_flag_string(build_obj, "output", "Output object file path", &out_obj);
     cli_alias(build_obj, "output", 'o');
     cli_create_flag_bool(build_obj, "nodebug", nodebug_desc, &no_debug);
+    cli_create_flag_bool(build_obj, "quiet", quiet_desc, &quiet);
 #ifndef _WIN32
     cli_create_flag_bool(build_obj, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -621,6 +630,7 @@ int main(int argc, char **argv) {
     cli_create_flag_string(build_exe, "output", "Output executable path", &out_exe);
     cli_alias(build_exe, "output", 'o');
     cli_create_flag_bool(build_exe, "nodebug", nodebug_desc, &no_debug);
+    cli_create_flag_bool(build_exe, "quiet", quiet_desc, &quiet);
 #ifndef _WIN32
     cli_create_flag_bool(build_exe, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -634,10 +644,23 @@ int main(int argc, char **argv) {
     cli_create_flag_string(run, "output", "Output executable path", &out_run);
     cli_alias(run, "output", 'o');
     cli_create_flag_bool(run, "nodebug", nodebug_desc, &no_debug);
+    cli_create_flag_bool(run, "quiet", quiet_desc, &quiet);
 #ifndef _WIN32
     cli_create_flag_bool(run, "fasm", fasm_desc, &use_fasm);
 #endif
     cli_rest(run, "Extra flags passed through to the linker (after a lone '-')", &run_ldflags);
+
+#ifdef ST_BIND_GENERATOR
+    char *src_bind  = NULL;
+    char *out_bind  = NULL;
+    strings_t clang_flags = {0};
+
+    command_t *bind = cli_command(root, "bind", "Transpile a C file into stroth file");
+    cli_positional(bind, "source", "Storth source file", &src_bind, true);
+    cli_create_flag_string(bind, "output", "Output to storth path (.st)", &out_bind);
+    cli_alias(bind, "output", 'o');
+    cli_rest(bind, "Extra flags passed through to 'ld' (after a lone '-')", &clang_flags);
+#endif
 
     cli_status_t status = cli_parse(cli, argc, argv);
 
@@ -660,21 +683,55 @@ int main(int argc, char **argv) {
         st_print_version();
         ok = 1;
     } else if (active == dump_tokens)
-        ok = st_compile(arena, src_tokens, ST_STAGE_TOKENS, NULL, NULL, NULL, 0, 0);
+        ok = st_compile(arena, src_tokens, ST_STAGE_TOKENS, NULL, NULL, NULL, 0, 0, 0);
     else if (active == dump_ast)
-        ok = st_compile(arena, src_ast, ST_STAGE_AST, NULL, NULL, NULL, 0, 0);
+        ok = st_compile(arena, src_ast, ST_STAGE_AST, NULL, NULL, NULL, 0, 0, 0);
     else if (active == dump_ir)
-        ok = st_compile(arena, src_ir, ST_STAGE_IR, NULL, NULL, NULL, 0, 0);
+        ok = st_compile(arena, src_ir, ST_STAGE_IR, NULL, NULL, NULL, 0, 0, 0);
     else if (active == build_asm)
-        ok = st_compile(arena, src_asm, ST_STAGE_ASM, out_asm, NULL, NULL, no_debug, use_fasm);
+        ok = st_compile(arena, src_asm, ST_STAGE_ASM, out_asm, NULL, NULL, no_debug, use_fasm,
+                        quiet);
     else if (active == build_obj)
-        ok = st_compile(arena, src_obj, ST_STAGE_OBJ, out_obj, NULL, NULL, no_debug, use_fasm);
+        ok = st_compile(arena, src_obj, ST_STAGE_OBJ, out_obj, NULL, NULL, no_debug, use_fasm,
+                        quiet);
     else if (active == build_exe)
         ok = st_compile(arena, src_exe, ST_STAGE_EXE, out_exe, &exe_ldflags, NULL, no_debug,
-                        use_fasm);
+                        use_fasm, quiet);
     else if (active == run)
         ok = st_compile(arena, src_run, ST_STAGE_RUN, out_run, &run_ldflags, &run_exit_code,
-                        no_debug, use_fasm);
+                        no_debug, use_fasm, quiet);
+
+    else if (active == bind) {
+#if ST_BIND_GENERATOR
+	char *err = NULL;
+	char *generated = stbind_generate_string(src_bind, (const char **)clang_flags.items,
+						 (i32)clang_flags.count, &err);
+    if (!generated) {
+        fprintf(stderr, "storth bind gen: %s\n", err ? err : "unknown error");
+        free(err);
+	ok = 0;
+	goto done;
+    }
+
+    const char *out_path = out_bind ? out_bind : "a.st";
+    FILE *f = fopen(out_path, "wb");
+    if (!f) {
+        fprintf(stderr, "storth bind gen: could not open file %s for writing\n", out_path);
+        free(err);
+	ok = 0;
+	goto done;
+    }
+
+    fwrite(generated, strlen(generated), sizeof(*generated), f);
+    fclose(f);
+    free(generated);
+
+    ok = 1;
+#else
+    fprintf(stderr, "storth is not built with binding generator support\n");
+#endif
+    goto done;
+    }
     else if (active)
         cli_command_usage(active);
     else
