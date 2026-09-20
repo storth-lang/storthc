@@ -3,9 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
+#include "../utils/platform/st_platform.h"
 #include "../utils/st_string.h"
+
 #include "st_lexer.h"
 #include "st_load.h"
 #include "st_parser.h"
@@ -19,7 +20,7 @@ static char *ST_mod_cstr(ST_arena_t *a, ST_string_t s) {
 
 static ST_string_t ST_mod_dirname(ST_string_t path) {
     u32 i = path.len;
-    while (i > 0 && path.data[i - 1] != '/')
+    while (i > 0 && path.data[i - 1] != '/' && path.data[i - 1] != '\\')
         i--;
     if (i == 0)
         return ST_cstr_to_str(".");
@@ -27,6 +28,12 @@ static ST_string_t ST_mod_dirname(ST_string_t path) {
 }
 
 static ST_string_t ST_mod_join(ST_arena_t *a, const char *dir, ST_string_t rel) {
+    if (rel.len && ST_path_is_absolute((const char *)rel.data)) {
+        u8 *buf = ST_arena_push(a, rel.len + 1);
+        memcpy(buf, rel.data, rel.len);
+        buf[rel.len] = 0;
+        return (ST_string_t){.data = buf, .len = rel.len};
+    }
     u32 dlen = (u32)strlen(dir);
     u32 total = dlen + 1 + rel.len;
     u8 *buf = ST_arena_push(a, total + 1);
@@ -55,23 +62,22 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     }
 
     ST_string_t candidate = ST_mod_join(arena, ST_mod_cstr(arena, importer_dir), rel);
-    if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+    if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
         return 1;
     }
 
+    #ifndef _WIN32 // Enviroment varable are stinky unix problem.
     const char *env = getenv("STORTHC_MODULE_PATH");
     if (env && *env) {
         candidate = ST_mod_join(arena, env, rel);
-        if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+        if (ST_access_file(ST_mod_cstr(arena, candidate))) {
             *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
             return 1;
         }
     }
 
     candidate = ST_mod_join(arena, "/usr/local/storthc/modules", (ST_string_t){0});
-    // ST_mod_join expects a single 'rel' path; build the final candidate by
-    // hand here since 'name' still needs '/module.st' appended.
     {
         const char *base = "/usr/local/storthc/modules";
         u32 blen = (u32)strlen(base);
@@ -88,10 +94,13 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
         buf[n] = 0;
         candidate = (ST_string_t){.data = buf, .len = n};
     }
-    if (access(ST_mod_cstr(arena, candidate), F_OK) == 0) {
+    #endif
+
+    if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
         return 1;
     }
+
 
     return 0;
 }
@@ -235,6 +244,7 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
         return;
     switch (e->kind) {
         case ST_EX_INT:
+        case ST_EX_CODE_LOC:
         case ST_EX_PACK_FOLD:
         case ST_EX_FLOAT:
         case ST_EX_STR:
@@ -361,6 +371,21 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
             ST_modrw_expr(rw, e->str_from_raw.ptr);
             ST_modrw_expr(rw, e->str_from_raw.len);
             break;
+
+        case ST_EX_TRAIT_IMPL: {
+            ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(e->trait_impl.trait_name));
+            if (r.tag) {
+                e->trait_impl.trait_name = *(ST_string_t *)r.tag;
+            } else if (rw->auto_exposed) {
+                ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(e->trait_impl.trait_name));
+                if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                    e->trait_impl.trait_name = *(ST_string_t *)a.tag;
+            }
+            ST_forrange(0, e->trait_impl.trait_args.count)
+                ST_modrw_tyexpr(rw, e->trait_impl.trait_args.items[i]);
+            ST_modrw_body(rw, &e->trait_impl.body);
+            break;
+        }
 
         case ST_EX_COUNT:
             break;
@@ -504,6 +529,29 @@ static void ST_modrw_decl(ST_module_rw_t *rw, ST_decl_t *d) {
             break;
         case ST_DE_IMPORT:
         case ST_DE_COUNT:
+            break;
+        case ST_DE_TRAIT:
+            ST_modrw_tyexpr(rw, d->trait_.self_ty);
+            ST_forrange(0, d->trait_.methods.count) {
+                ST_trait_method_t *m = &d->trait_.methods.items[i];
+                ST_forrange(0, m->sig.params.count) {
+                    ST_modrw_tyexpr(rw, m->sig.params.items[i].te);
+                    ST_modrw_expr(rw, m->sig.params.items[i].def);
+                }
+                ST_forrange(0, m->sig.rets.count) ST_modrw_tyexpr(rw, m->sig.rets.items[i]);
+                ST_forrange(0, m->sig.wheres.count) {
+                    ST_where_clause_t *w = &m->sig.wheres.items[i];
+                    ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(w->trait_name));
+                    if (r.tag) {
+                        w->trait_name = *(ST_string_t *)r.tag;
+                    } else if (rw->auto_exposed) {
+                        ST_ht_generic_t a = ST_ht_get(rw->auto_exposed, ST_mod_key(w->trait_name));
+                        if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                            w->trait_name = *(ST_string_t *)a.tag;
+                    }
+                    ST_forrange(0, w->trait_args.count) ST_modrw_tyexpr(rw, w->trait_args.items[i]);
+                }
+            }
             break;
     }
 }

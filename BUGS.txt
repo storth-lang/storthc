@@ -121,4 +121,19 @@ fn foo() -> []i32 {
 
 Comptime is not yet complete has rough edges when I return some stuff plus also modules being compiled to so so that the comptime can load them should be a thing. And then also working on meta programming lets work on it more and more right we need a full fleged compiler module so that the compiler module that is going to be exposed should be enough to build a whole ton of thing on top of the language.
 
-It is sad that we still need a couple of rough edges as the language is becoming good but we need to get rid of those edges so I can work on the standard library more plus doing comptime unroll for template #for is a bit stupid to so we will need a better variadic mechanmism.
+It is sad that we still need a couple of rough edges as the language is becoming good but we need to get rid of those edges so I can work on the standard library more plus doing comptime unroll for template #for is a bit stupid to so we will need a better variadic mechanism.
+
+```rs
+
+trait Allocator($T) {
+    allocator = $T;
+    fn alloc(self: *Self, size: u32) -> *void;
+}
+
+
+
+pub fn main() -> i32 {
+    return 0;
+}
+
+```

@@ -84,7 +84,6 @@ pub extern fn calloc(__nmemb: u64, __size: u64) -> *void;
 pub extern fn realloc(__ptr: *void, __size: u64) -> *void;
 pub extern fn free(__ptr: *void) -> void;
 pub extern fn reallocarray(__ptr: *void, __nmemb: u64, __size: u64) -> *void;
-pub extern fn reallocarray(__ptr: *void, __nmemb: u64, __size: u64) -> *void;
 pub extern fn valloc(__size: u64) -> *void;
 pub extern fn posix_memalign(__memptr: **void, __alignment: u64, __size: u64) -> i32;
 pub extern fn aligned_alloc(__alignment: u64, __size: u64) -> *void;
@@ -112,7 +111,7 @@ pub extern fn qsort(__base: *void, __nmemb: u64, __size: u64, __compar: *fn(a0: 
 pub extern fn abs(__x: i32) -> i32;
 pub extern fn labs(__x: i64) -> i64;
 pub extern fn llabs(__x: i64) -> i64;
-pub extern fn div(__numer: i32, __denom: i32) -> div_t;
+// pub extern fn div(__numer: i32, __denom: i32) -> div_t;
 pub extern fn ldiv(__numer: i64, __denom: i64) -> ldiv_t;
 pub extern fn lldiv(__numer: i64, __denom: i64) -> lldiv_t;
 pub extern fn ecvt(__value: f64, __ndigit: i32, __decpt: *i32, __sign: *i32) -> *char;

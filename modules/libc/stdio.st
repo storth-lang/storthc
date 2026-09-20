@@ -1,23 +1,20 @@
-using FILE *void;
-struct _G_fpos_t {
+pub using FILE void;
+
+pub struct __mbstate_t {
+    __count: i32;
+    __value: [4]u8;
+}
+pub struct _G_fpos_t {
     __pos: i64;
     __state: __mbstate_t;
 }
 
-struct __mbstate_t {
-    __count: i32;
-    __value: [4]u8;
-}
 
-using va_list *void;
-
-using off_t i64;
-
-using ssize_t i64;
-
-using fpos_t _G_fpos_t;
-
-using cookie_io_functions_t *void;
+pub using va_list *void;
+pub using off_t i64;
+pub using ssize_t i64;
+pub using fpos_t _G_fpos_t;
+pub using cookie_io_functions_t *void;
 
 pub extern fn remove(__filename: *char) -> i32;
 pub extern fn rename(__old: *char, __new: *char) -> i32;
@@ -55,12 +52,6 @@ pub extern fn dprintf(__fd: i32, __fmt: *char, ...) -> i32;
 pub extern fn fscanf(__stream: *FILE, __format: *char, ...) -> i32;
 pub extern fn scanf(__format: *char, ...) -> i32;
 pub extern fn sscanf(__s: *char, __format: *char, ...) -> i32;
-pub extern fn fscanf(__stream: *FILE, __format: *char, ...) -> i32;
-pub extern fn scanf(__format: *char, ...) -> i32;
-pub extern fn sscanf(__s: *char, __format: *char, ...) -> i32;
-pub extern fn vfscanf(__s: *FILE, __format: *char, __arg: **void) -> i32;
-pub extern fn vscanf(__format: *char, __arg: **void) -> i32;
-pub extern fn vsscanf(__s: *char, __format: *char, __arg: **void) -> i32;
 pub extern fn vfscanf(__s: *FILE, __format: *char, __arg: **void) -> i32;
 pub extern fn vscanf(__format: *char, __arg: **void) -> i32;
 pub extern fn vsscanf(__s: *char, __format: *char, __arg: **void) -> i32;

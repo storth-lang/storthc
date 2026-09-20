@@ -22,6 +22,7 @@ typedef struct {
     ST_decls_t nested_fns;
     ST_strings_t fn_name_stack;
     u32 next_block_id;
+    u32 next_trait_impl_id;
     b8 in_comptime_scope;
     u32 expr_depth;
 } ST_parser_t;

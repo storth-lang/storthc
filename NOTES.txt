@@ -87,3 +87,12 @@ So all the parsing bugs will have their own file so that I will have to stress t
 - Strength reduction  `x*2` -> `x<<1`, `x%pow2` -> `x&(pow2-1)`, induction-variable simplification (pairs with LICM)
 - Function inlining
 - Branch/jump threading
+
+So far what we have and for what we got using traits as a means of having a stable standard library is nice and obviously such thing makes it so that we can just override the default trait implementation with out custom ones we just need to fill it with our own functions.
+
+Now that we have a true sml style language but for system development I just need to stress test it with a bunch of projects and how to do things and in windows I have no idea how to set installation path enviroment variable and everything.
+
+Resource for making debug symbol and also linker for windows:
+url: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+
+Basically the linker should be a baked in program to make it a self contained executable.

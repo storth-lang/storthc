@@ -1,4 +1,4 @@
-#include "st_fasm_x86_64_linux.h"
+#include "st_fasm.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -159,7 +159,10 @@ static void ST_fasm_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
         ST_ir_global_field_init_t *fi = &sorted[i];
         if (fi->offset > cursor)
             fprintf(out, "    times %u db 0\n", fi->offset - cursor);
-        ST_fasm_gen_scalar_data(out, fi->size, fi->is_float, fi->i, fi->f);
+        if (fi->is_fn_ref)
+            fprintf(out, "    dq " ST_sv_fmt "\n", ST_sv_args(fi->fn_name));
+        else
+            ST_fasm_gen_scalar_data(out, fi->size, fi->is_float, fi->i, fi->f);
         cursor = fi->offset + fi->size;
     }
     u32 total = g->ty && g->ty->size ? g->ty->size : cursor;
@@ -861,7 +864,10 @@ static void ST_fasm_generate_term(FILE *out, ST_fasm_ctx_t *ctx, ST_ir_block_t *
             fprintf(out, "    jmp .bb%u\n", t->t_block->id);
             break;
         case ST_IR_TERM_NONE:
-            ST_todo("ST_IR_TERM_RET");
+            fprintf(stderr, "block .bb%u ('" ST_sv_fmt "') in function '" ST_sv_fmt
+                             "' (declared at line %u) never got a terminator\n",
+                    b->id, ST_sv_args(b->name), ST_sv_args(b->fn->name), b->fn->decl_line);
+            ST_todo("ST_IR_TERM_NONE");
             break;
         case ST_IR_TERM_COND_BR: {
             ST_fasm_load(out, "rax", t->cond);
@@ -942,6 +948,28 @@ static void ST_fasm_generate_fn(FILE *out, ST_ir_fn_t *fn) {
     }
 }
 
+static void ST_fasm_generate_string_eq(FILE *out) {
+    fputs("\nst_string_eq:\n", out);
+    fputs("    mov rax, [rdi+8]\n", out);
+    fputs("    cmp rax, [rsi+8]\n", out);
+    fputs("    jne .st_string_eq_false\n", out);
+    fputs("    mov r8, [rdi]\n", out);
+    fputs("    mov r9, [rsi]\n", out);
+    fputs("    mov rcx, rax\n", out);
+    fputs("    test rcx, rcx\n", out);
+    fputs("    jz .st_string_eq_true\n", out);
+    fputs("    mov rsi, r8\n", out);
+    fputs("    mov rdi, r9\n", out);
+    fputs("    repe cmpsb\n", out);
+    fputs("    jne .st_string_eq_false\n", out);
+    fputs(".st_string_eq_true:\n", out);
+    fputs("    mov eax, 1\n", out);
+    fputs("    ret\n", out);
+    fputs(".st_string_eq_false:\n", out);
+    fputs("    xor eax, eax\n", out);
+    fputs("    ret\n", out);
+}
+
 b8 ST_fasm_generate(FILE *out, ST_ir_module_t *m, ST_string_t src, ST_string_t file,
                     b8 emit_entry, ST_dbg_info_t *dbg) {
     ST_unused(src);
@@ -954,6 +982,7 @@ b8 ST_fasm_generate(FILE *out, ST_ir_module_t *m, ST_string_t src, ST_string_t f
     ST_fasm_generate_strs(out, m);
     ST_fasm_generate_globals(out, m);
     fprintf(out, "section '.text' executable\n");
+    ST_fasm_generate_string_eq(out);
     ST_forrange(0, m->fns.count) {
         ST_ir_fn_t *fn = m->fns.items[i];
         if (fn->is_extern) {

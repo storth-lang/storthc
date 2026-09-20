@@ -62,6 +62,8 @@ struct ST_ty_t {
     b8 has_any_pack;
     b8 is_noreturn;
     ST_ty_state_t state;
+    b8 is_trait_witness;
+    ST_decl_t *trait_decl;
 };
 
 typedef struct {
@@ -71,6 +73,7 @@ typedef struct {
     ST_ty_t *untyped_float;
     ST_ty_t *null_ptr;
     ST_ty_t *typeid_ty;
+    ST_ty_t *code_loc_ty;
     ST_ht_t interned, decl_type;
 } ST_ty_ctx_t;
 
@@ -83,6 +86,7 @@ ST_ty_t *ST_ty_array(ST_ty_ctx_t *ctx, ST_ty_t *inner, u64 count);
 ST_ty_t *ST_ty_dyn_array(ST_ty_ctx_t *ctx, ST_ty_t *inner);
 ST_ty_t *ST_ty_slice(ST_ty_ctx_t *ctx, ST_ty_t *inner);
 ST_ty_t *ST_ty_fn_new(ST_ty_ctx_t *ctx);
+ST_ty_t *ST_ty_code_loc(ST_ty_ctx_t *ctx);
 ST_ty_t *ST_ty_for_decls(ST_ty_ctx_t *ctx, ST_decl_t *d);
 
 b8 ST_ty_equal(ST_ty_t *a, ST_ty_t *b);

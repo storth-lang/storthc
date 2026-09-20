@@ -140,6 +140,8 @@ struct ST_ir_inst_t {
         struct {
             ST_ir_inst_t *callee_ptr;
             ST_ir_insts_t args;
+            ST_ty_t *fn_ty;
+            u32 ret_buf_offset;
         } call_ind;
         struct {
             ST_ir_inst_t *addr;
@@ -239,8 +241,10 @@ typedef struct {
     u32 offset;
     u32 size;
     b8 is_float;
+    b8 is_fn_ref;
     i64 i;
     f64 f;
+    ST_string_t fn_name;
 } ST_ir_global_field_init_t;
 
 typedef struct {
@@ -304,6 +308,9 @@ ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name
 
 void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
                                  b8 is_float, i64 i, f64 f);
+
+void ST_ir_global_add_field_fn_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                   ST_string_t fn_name);
 
 // @note: ST_ir_block_new is for creating a new block inside the function with a label.
 ST_ir_block_t *ST_ir_block_new(ST_ir_fn_t *fn, const char *label_hint);
@@ -379,8 +386,9 @@ ST_ir_inst_t *ST_ir_extract(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *agg
 // @note: ST_ir_call_indirect is for indirect call of that happens due to
 // pointer aka function pointer as it accept the arugments, the number of the
 // arguments and the calle as it is a pointer.
-ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *callee_ptr,
-                                  ST_ir_inst_t **args, u32 n_args, u32 line, u32 col);
+ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ty_t *fn_ty,
+                                  ST_ir_inst_t *callee_ptr, ST_ir_inst_t **args, u32 n_args,
+                                  u32 line, u32 col);
 
 // @note: ST_ir_mem_arg marks a call argument that must be passed per the SysV
 // MEMORY class (aggregates > 16 bytes): 'addr' points at the source value and

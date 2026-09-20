@@ -81,7 +81,13 @@ ST_ir_global_var_t *ST_ir_module_find_global(ST_ir_module_t *m, ST_string_t name
 
 void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
                                  b8 is_float, i64 i, f64 f) {
-    ST_ir_global_field_init_t fi = {offset, size, is_float, i, f};
+    ST_ir_global_field_init_t fi = {offset, size, is_float, 0, i, f, (ST_string_t){0}};
+    ST_da_append_arena(arena, &g->field_inits, fi);
+}
+
+void ST_ir_global_add_field_fn_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                   ST_string_t fn_name) {
+    ST_ir_global_field_init_t fi = {offset, size, 0, 1, 0, 0.0, fn_name};
     ST_da_append_arena(arena, &g->field_inits, fi);
 }
 
@@ -394,10 +400,12 @@ ST_ir_inst_t *ST_ir_extract(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *agg
     return inst;
 }
 
-ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ir_inst_t *callee_ptr,
-                                  ST_ir_inst_t **args, u32 n_args, u32 line, u32 col) {
+ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ty_t *fn_ty,
+                                  ST_ir_inst_t *callee_ptr, ST_ir_inst_t **args, u32 n_args,
+                                  u32 line, u32 col) {
     ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_CALL_INDIRECT, ret_ty, line, col);
     inst->call_ind.callee_ptr = callee_ptr;
+    inst->call_ind.fn_ty = fn_ty;
     ST_forrange(0, n_args) {
         ST_da_append_arena(b->fn->arena, &inst->call_ind.args, args[i]);
     }
