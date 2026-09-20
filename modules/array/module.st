@@ -6,8 +6,8 @@ pub fn arrayReserve(arr: *[..]$T, capacity : i64 = 256) {
 pub fn arrayPush(arr: *[..]$T, item: $T) {
     if arr.count >= arr.capacity {
         arrayReserve(arr);
-        new_bytes, _ := realloc(arr.items, arr.capacity);
-        arr.items = new_bytes;
+        arr.items = reallocarray(arr.items, arr.capacity #as u64,
+                    type_info(arr).size #as u64);
     }
 
     arr.items[arr.count] = item;
@@ -25,4 +25,4 @@ pub fn shift(args: *[]$T) {
     args.len -= 1;
 }
 
-#import "mem";
+#import "libc";

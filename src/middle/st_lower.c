@@ -2320,7 +2320,7 @@ static b8 ST_lower_expr_is_noreturn_call(ST_lower_ctx_t *c, ST_expr_t *e) {
 }
 
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
-    if (ST_ir_block_is_terminated(c->cur))
+    if (s->kind != ST_ST_LABEL && ST_ir_block_is_terminated(c->cur))
         return;
     switch (s->kind) {
         case ST_ST_EXPR:
