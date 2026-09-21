@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 
+// TODO(20260921-023501) disable fasm extern definition twice.
+// in fasm if we have 2 extrn of the same name it errors out.
 static const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 #define ST_N_ARG_REGS ((u32)ST_array_len(arg_regs))
 static const char *xmm_regs[] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};

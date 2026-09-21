@@ -1,7 +1,7 @@
 # Write my own linker for windows
 
 - STATUS: OPEN
-- PRIORITY: 100
-- TAGS:
+- PRIORITY: 80
+- TAGS: backend
 
-No description.
+Windows linker is dog shit interms of performance to my liking.
