@@ -1,4 +1,7 @@
 TAGS
 tags
 obj
+build
 bin
+*.st
+*.exe

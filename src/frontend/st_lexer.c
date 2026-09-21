@@ -101,6 +101,10 @@ static b8 ST_ishex(char c) {
     return ST_isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+static b8 ST_isoctal(char c) {
+    return '0' <= c && c <= '7';
+}
+
 static b8 ST_isalpha(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
@@ -389,6 +393,26 @@ static b8 ST_lx_number(ST_lexer_t *l, ST_token_t *t) {
         }
         buf[n] = 0;
         t->val.i = (i64)strtoull(buf, NULL, 2);
+    } else if (c == '0' && (ST_isdigit(c2) || c2 == 'o' || c2 == 'O')) {
+        // permit both 0755 and 0o755 as octal
+        ST_lx_advance_char(l);
+        if (c2 == 'o' || c2 == 'O') {
+            ST_lx_advance_char(l);
+        } else if (ST_isdigit(c2) && !ST_isoctal(c2)) {
+            ST_lx_error(l, line, col, start, "unexpected number in octal literal");
+        }
+        while (ST_isoctal(ST_lx_peek_char(l)) || ST_lx_peek_char(l) == '_') {
+            char d = ST_lx_advance_char(l);
+            if (d != '_' && n < sizeof(buf) - 1) {
+                buf[n++] = d;
+            }
+        }
+        if (n == 0) {
+            ST_lx_error(l, line, col, start, "octal literal has no digits");
+            return 0;
+        }
+        buf[n] = 0;
+        t->val.i = (i64)strtoull(buf, NULL, 8);
     } else {
         while (ST_isdigit(ST_lx_peek_char(l)) || ST_lx_peek_char(l) == '_') {
             char d = ST_lx_advance_char(l);

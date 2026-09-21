@@ -142,6 +142,21 @@ ST_ty_t *ST_ty_fn_new(ST_ty_ctx_t *ctx) {
     return ST_ty_alloc(ctx, ST_TY_FN, 8, 8);
 }
 
+ST_ty_t *ST_ty_code_loc(ST_ty_ctx_t *ctx) {
+    if (ctx->code_loc_ty)
+        return ctx->code_loc_ty;
+    ST_ty_t *t = ST_ty_alloc(ctx, ST_TY_STRUCT, 24, 8);
+    ST_ty_field_t filename = {ST_cstr_to_str("filename"), ctx->prim[ST_tstring], 0};
+    ST_ty_field_t line = {ST_cstr_to_str("line"), ctx->prim[ST_tu32], 16};
+    ST_ty_field_t col = {ST_cstr_to_str("col"), ctx->prim[ST_tu32], 20};
+    ST_da_append_arena(ctx->arena, &t->fields, filename);
+    ST_da_append_arena(ctx->arena, &t->fields, line);
+    ST_da_append_arena(ctx->arena, &t->fields, col);
+    t->state = ST_TY_STATE_DONE;
+    ctx->code_loc_ty = t;
+    return t;
+}
+
 ST_ty_t *ST_ty_for_decls(ST_ty_ctx_t *ctx, ST_decl_t *d) {
     ST_ht_generic_t k = {
         .tag = &d,

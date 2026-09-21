@@ -156,6 +156,31 @@ static void ST_perr_here(ST_parser_t *p, const char *fmt, ...) {
         ST_perr(p, ST_cur_line(p), ST_cur_col(p), "%s", buf);
 }
 
+// @note: a non-fatal, advisory diagnostic -- unlike ST_perr_tok, this never
+// increments p->n_errors (so it can never fail the build on its own) and
+// is silently skipped during speculative/backtracking parses, same as
+// errors are. Used for deprecation notices etc. where the code is still
+// valid and should keep compiling. Prints the same source-line-plus-caret
+// snippet ST_perr_tok does, so the warning shows the actual expression
+// being flagged, not just a bare line:col.
+static void ST_pwarn_tok(ST_parser_t *p, ST_token_t *t, const char *fmt, ...) {
+    if (p->suppress_errors)
+        return;
+    ST_string_t src = p->srcs ? ST_srcmap_get(p->srcs, t->file) : (ST_string_t){0};
+    if (!src.data)
+        src = p->src;
+    fprintf(stderr,
+            ST_COLOR_BOLD ST_sv_fmt ":%u:%u: " ST_COLOR_YELLOW
+                                    "warning: " ST_COLOR_RESET ST_COLOR_BOLD,
+            ST_sv_args(t->file), t->line, t->col);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, ST_COLOR_RESET "\n");
+    ST_snippet_src(src, t->line, t->col);
+}
+
 static void ST_sync_stmt(ST_parser_t *p) {
     i32 depth = 0;
     while (p->pos < p->n_tokens) {
@@ -512,9 +537,34 @@ static b8 ST_parse_call_args(ST_parser_t *p, ST_args_t *out) {
         arg.value = ST_parse_expr(p);
         if (!arg.value)
             return 0;
+        if (ST_at_symbol(p, "...")) {
+            p->pos++;
+            arg.is_pack_spread = 1;
+        }
         ST_da_append_arena(p->arena, out, arg);
     }
     return ST_expect_sym(p, ")");
+}
+
+static ST_string_t ST_mangle_trait_impl_name(ST_arena_t *a, ST_string_t trait_name,
+                                             ST_tyexprs_t *args, u32 impl_id) {
+    ST_string_t suffix = (args->count && args->items[0]->kind == ST_TE_NAME)
+                             ? args->items[0]->name
+                             : ST_cstr_to_str("anon");
+    char idbuf[16];
+    u32 idlen = (u32)snprintf(idbuf, sizeof(idbuf), "%u", impl_id);
+    u32 total = trait_name.len + 1 + suffix.len + 1 + idlen;
+    u8 *buf = ST_arena_push(a, total);
+    u32 off = 0;
+    memcpy(buf + off, trait_name.data, trait_name.len);
+    off += trait_name.len;
+    buf[off++] = '$';
+    memcpy(buf + off, suffix.data, suffix.len);
+    off += suffix.len;
+    buf[off++] = '$';
+    memcpy(buf + off, idbuf, idlen);
+    off += idlen;
+    return (ST_string_t){.data = buf, .len = off};
 }
 
 static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
@@ -640,6 +690,13 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
+    if (ST_tok_is_symbol(t, "#code")) {
+        p->pos++;
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_CODE_LOC, t->line, t->col);
+        e->sval = p->file;
+        return e;
+    }
+
     if (ST_tok_is_symbol(t, "#comp_error")) {
         p->pos++;
         if (!ST_expect_sym(p, "("))
@@ -754,9 +811,30 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             }
             p->suppress_errors--;
             if (ok && gargs.count && ST_at_symbol(p, ")") && ST_tok_is_symbol(ST_peek2(p), "{")) {
+                u32 save_pos2 = p->pos, save_err2 = p->n_errors, save_nested = p->nested_fns.count;
                 p->pos++; // )
-                p->pos++; // }
-                return ST_parse_struct_lit(p, t->text, gargs, t->line, t->col);
+                p->pos++; // {
+                p->suppress_errors++;
+                ST_expr_t *lit = ST_parse_struct_lit(p, t->text, gargs, t->line, t->col);
+                p->suppress_errors--;
+                if (lit)
+                    return lit;
+                p->pos = save_pos2;
+                p->n_errors = save_err2;
+                p->nested_fns.count = save_nested;
+                p->pos += 2; // ) {
+                ST_expr_t *ti = ST_expr_new(p->arena, ST_EX_TRAIT_IMPL, t->line, t->col);
+                ti->trait_impl.trait_name = t->text;
+                ti->trait_impl.trait_args = gargs;
+                ST_string_t synth = ST_mangle_trait_impl_name(p->arena, t->text, &gargs, ++p->next_trait_impl_id);
+                ST_da_append_arena(p->arena, &p->fn_name_stack, synth);
+                b8 body_ok = ST_parse_body(p, &ti->trait_impl.body);
+                p->fn_name_stack.count--;
+                if (!body_ok)
+                    return NULL;
+                if (!ST_expect_sym(p, "}"))
+                    return NULL;
+                return ti;
             }
             p->pos = save_pos;
             p->n_errors = save_err;
@@ -907,20 +985,87 @@ static const char *ST_match_binop(ST_parser_t *p, u32 level) {
     return NULL;
 }
 
+// @note: slices raw source text between two token boundaries -- token
+// .text spans point directly into the (arena-owned) source buffer, so a
+// span from 'from's start to 'to_excl's start is just pointer
+// subtraction; 'to_excl' NULL means "to end of source". Trims trailing
+// whitespace, since the end boundary lands at the start of whatever
+// comes right after (a space, a newline, etc.), not at the span's last
+// real character. Used to show the actual expression/type text in the
+// '#as' deprecation warning instead of a generic placeholder.
+static ST_string_t ST_span_between(ST_token_t *from, ST_token_t *to_excl, ST_string_t src) {
+    if (!from || !from->text.data)
+        return (ST_string_t){0};
+    u8 *start = from->text.data;
+    u8 *end = (to_excl && to_excl->text.data) ? to_excl->text.data : (src.data + src.len);
+    if (end < start)
+        return (ST_string_t){0};
+    u32 len = (u32)(end - start);
+    while (len > 0 && ST_iswhitespace((char)start[len - 1]))
+        len--;
+    return (ST_string_t){.data = start, .len = len};
+}
+
+// @note: 'cast(Type) expr' is prefix -- checked first, before ever calling
+// ST_parse_unary, since 'cast' is a keyword ST_parse_primary doesn't
+// otherwise handle. The postfix '#as' loop still runs afterward so the
+// two forms compose, e.g. 'cast(u32) x #as u64'. '#as' itself is
+// deprecated: every use warns (non-fatally) to prefer 'cast(Type) expr'.
 static ST_expr_t *ST_parse_cast_expr(ST_parser_t *p) {
-    ST_expr_t *e = ST_parse_unary(p);
-    if (!e)
-        return NULL;
-    while (ST_at_symbol(p, "#as")) {
+    ST_token_t *e_start = ST_peek(p);
+    ST_expr_t *e;
+    if (ST_at_keyword(p, "cast")) {
         ST_token_t *t = ST_peek(p);
         p->pos++;
+        if (!ST_expect_sym(p, "("))
+            return NULL;
+
+        ST_tyexpr_t *to = ST_parse_type(p);
+        if (!to)
+            return NULL;
+
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+
+        ST_expr_t *op = ST_parse_cast_expr(p);
+        if (!op)
+            return NULL;
+
+        ST_expr_t *c = ST_expr_new(p->arena, ST_EX_CAST, t->line, t->col);
+        c->cast.operand = op;
+        c->cast.to = to;
+        e = c;
+    } else {
+        e = ST_parse_unary(p);
+        if (!e)
+            return NULL;
+    }
+
+    while (ST_at_symbol(p, "#as")) {
+        ST_token_t *t = ST_peek(p);
+        ST_string_t warn_src = p->srcs ? ST_srcmap_get(p->srcs, t->file) : (ST_string_t){0};
+        if (!warn_src.data)
+            warn_src = p->src;
+        ST_string_t operand_src = ST_span_between(e_start, t, warn_src);
+        p->pos++;
+        u32 type_start_pos = p->pos;
+        ST_tyexpr_t *to = ST_parse_type(p);
+        if (!to)
+            return NULL;
+        ST_string_t type_src =
+            ST_span_between(ST_tok_at(p, type_start_pos), ST_peek(p), warn_src);
+        if (operand_src.len && type_src.len)
+            ST_pwarn_tok(p, t,
+                        "'#as' is deprecated, use 'cast(" ST_sv_fmt ") " ST_sv_fmt "' instead",
+                        ST_sv_args(type_src), ST_sv_args(operand_src));
+        else
+            ST_pwarn_tok(p, t, "'#as' is deprecated, use 'cast(Type) expr' instead");
         ST_expr_t *c = ST_expr_new(p->arena, ST_EX_CAST, t->line, t->col);
         c->cast.operand = e;
-        c->cast.to = ST_parse_type(p);
-        if (!c->cast.to)
-            return NULL;
+        c->cast.to = to;
         e = c;
     }
+
     return e;
 }
 
@@ -972,6 +1117,8 @@ static ST_expr_t *ST_parse_cond(ST_parser_t *p) {
 static b8 ST_is_lvalue(ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT:
+        case ST_EX_TRAIT_IMPL:
+        case ST_EX_CODE_LOC:
         case ST_EX_FIELD:
         case ST_EX_INDEX:
             return 1;
@@ -1934,6 +2081,93 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
     return d;
 }
 
+static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
+    ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TRAIT, line, col);
+    d->name = ST_expect_ident(p, "a trait name");
+    if (!d->name.len)
+        return NULL;
+    if (!ST_parse_generic_list(p, &d->trait_.generics))
+        return NULL;
+    if (!ST_expect_sym(p, "{"))
+        return NULL;
+    while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
+        if (ST_at_symbol(p, ";")) {
+            p->pos++;
+            continue;
+        }
+        ST_token_t *mt = ST_peek(p);
+        if (ST_tok_is_ident(mt) && ST_string_eq_cstr(mt->text, "self") &&
+            ST_tok_is_symbol(ST_peek2(p), "=")) {
+            if (d->trait_.self_ty) {
+                ST_perr_here(p, "trait '" ST_sv_fmt "' already has a 'self' field",
+                             ST_sv_args(d->name));
+                return NULL;
+            }
+            p->pos += 2;
+            ST_tyexpr_t *te = ST_try_type(p);
+            if (!te) {
+                ST_perr_here(p, "expected a type after 'self ='");
+                return NULL;
+            }
+            d->trait_.self_ty = te;
+            if (!ST_expect_semi(p))
+                return NULL;
+            continue;
+        }
+        if (ST_tok_is_ident(mt) && ST_tok_is_symbol(ST_peek2(p), ":=")) {
+            if (d->trait_.self_alias.len) {
+                ST_perr_here(p, "trait '" ST_sv_fmt "' already has a self alias '" ST_sv_fmt "'",
+                             ST_sv_args(d->name), ST_sv_args(d->trait_.self_alias));
+                return NULL;
+            }
+            d->trait_.self_alias = mt->text;
+            p->pos += 2;
+            if (!ST_expect_sym(p, "$"))
+                return NULL;
+            ST_string_t gname = ST_expect_ident(p, "a generic parameter after '$'");
+            if (!gname.len)
+                return NULL;
+            b8 known = 0;
+            ST_forrange(0, d->trait_.generics.count)
+                if (ST_string_eq(d->trait_.generics.items[i], gname))
+                    known = 1;
+            if (!known) {
+                ST_perr_here(p, "'$" ST_sv_fmt "' is not one of trait '" ST_sv_fmt "'s generic parameters",
+                             ST_sv_args(gname), ST_sv_args(d->name));
+                return NULL;
+            }
+            if (!ST_expect_semi(p))
+                return NULL;
+            continue;
+        }
+        if (!ST_tok_is_keyword(mt, "fn")) {
+            ST_perr_here(p,
+                        "expected a method signature ('fn name(...) -> ret;') inside trait '" ST_sv_fmt "'",
+                        ST_sv_args(d->name));
+            return NULL;
+        }
+        p->pos++;
+        ST_trait_method_t m = {.line = mt->line, .col = mt->col};
+        m.name = ST_expect_ident(p, "a method name");
+        if (!m.name.len)
+            return NULL;
+        if (!ST_parse_fn_sig(p, &m.sig, 0))
+            return NULL;
+        if (!m.sig.has_ret_ann) {
+            ST_perr(p, m.line, m.col,
+                    "trait method '" ST_sv_fmt "' needs a return annotation (`-> void` if none)",
+                    ST_sv_args(m.name));
+            return NULL;
+        }
+        if (!ST_expect_semi(p))
+            return NULL;
+        ST_da_append_arena(p->arena, &d->trait_.methods, m);
+    }
+    if (!ST_expect_sym(p, "}"))
+        return NULL;
+    return d;
+}
+
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
     if (!ST_expect_sym(p, "("))
         return 0;
@@ -2136,6 +2370,65 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         }
     }
 
+    ST_where_clauses_t wheres = {0};
+    while (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "where")) {
+        p->pos++;
+        ST_where_clause_t w = {.line = t->line, .col = t->col};
+        w.witness_name = ST_expect_ident(p, "a witness name after 'where'");
+        if (!w.witness_name.len)
+            return NULL;
+        if (!ST_expect_sym(p, ":"))
+            return NULL;
+        w.trait_name = ST_expect_ident(p, "a trait name after ':'");
+        if (!w.trait_name.len)
+            return NULL;
+        if (!ST_expect_sym(p, "("))
+            return NULL;
+        while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
+            if (ST_at_symbol(p, ",")) {
+                p->pos++;
+                continue;
+            }
+            ST_tyexpr_t *arg = ST_parse_type(p);
+            if (!arg)
+                return NULL;
+            ST_da_append_arena(p->arena, &w.trait_args, arg);
+        }
+        if (!ST_expect_sym(p, ")"))
+            return NULL;
+        ST_da_append_arena(p->arena, &wheres, w);
+        t = ST_peek(p);
+        if (!t) {
+            ST_perr_here(p, "expected 'fn' after a 'where' clause");
+            return NULL;
+        }
+    }
+    if (wheres.count) {
+        if (!ST_tok_is_keyword(t, "fn")) {
+            ST_perr_here(p, "'where' clauses are only allowed directly before a function declaration");
+            return NULL;
+        }
+        ST_decl_t *d = ST_parse_fn_decl(p, is_pub);
+        if (d) {
+            d->fn.sig.wheres = wheres;
+            // Each 'where name : Trait($T)' becomes sugar for a real trailing
+            // parameter 'name: Trait($T)':
+            ST_forrange(0, wheres.count) {
+                ST_where_clause_t *w = &wheres.items[i];
+                ST_param_t wp = {0};
+                wp.name = w->witness_name;
+                wp.line = w->line;
+                wp.col = w->col;
+                ST_tyexpr_t *wte = ST_tyexpr_new(p->arena, ST_TE_GENERIC_INST, w->line, w->col);
+                wte->name = w->trait_name;
+                wte->generic_args = w->trait_args;
+                wp.te = wte;
+                ST_da_append_arena(p->arena, &d->fn.sig.params, wp);
+            }
+        }
+        return d;
+    }
+
     if (ST_tok_is_keyword(t, "struct")) {
         p->pos++;
         ST_string_t name = ST_expect_ident(p, "a struct name");
@@ -2174,6 +2467,15 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         if (!ST_expect_semi(p))
             return NULL;
+        return d;
+    }
+
+    if ((ST_tok_is_keyword(t, "trait") || (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "trait"))) &&
+        ST_tok_is_ident(ST_peek2(p))) {
+        p->pos++;
+        ST_decl_t *d = ST_parse_trait_decl(p, t->line, t->col);
+        if (d)
+            d->is_pub = is_pub;
         return d;
     }
 

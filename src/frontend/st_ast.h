@@ -85,6 +85,8 @@ typedef enum {
     ST_EX_ASM,
     ST_EX_STR_FROM_RAW,
     ST_EX_PACK_FOLD,
+    ST_EX_TRAIT_IMPL,
+    ST_EX_CODE_LOC,
     ST_EX_COUNT,
 } ST_expr_kind_t;
 
@@ -102,6 +104,7 @@ typedef struct {
 typedef struct {
     ST_string_t name;
     ST_expr_t *value;
+    b8 is_pack_spread;
 } ST_arg_t;
 
 typedef struct {
@@ -171,6 +174,11 @@ struct ST_expr_t {
             ST_string_t pack_name;
             ST_string_t op;
         } pack_fold; // '(args OP ...)'
+        struct {
+            ST_string_t trait_name;
+            ST_tyexprs_t trait_args;
+            ST_stmts_t body;
+        } trait_impl;
     };
 };
 
@@ -192,15 +200,9 @@ typedef enum {
     ST_ST_LABEL,
     ST_ST_GODOWN,
     ST_ST_ASM,
-    ST_ST_COMPTIME_BLOCK, // '#comptime { ... }' as a statement: executed once, entirely at
-                         // compile time (own fresh scope, no access to the enclosing
-                         // function's locals), then discarded -- see ST_check_comptime_block
-                         // in st_semantic.c
+    ST_ST_COMPTIME_BLOCK,
     ST_ST_PACK_EXPAND,
-    ST_ST_NESTED_FN, // marks the exact point inside a block where a nested 'fn' was
-                     // written; the fn itself is hoisted out into the program's own
-                     // decl list (see ST_parse_body), so this is just a scoping marker
-                     // that makes it visible to ST_check_stmt exactly where it belongs
+    ST_ST_NESTED_FN,
     ST_ST_COUNT,
 } ST_stmt_kind_t;
 
@@ -295,6 +297,7 @@ typedef enum {
     ST_DE_GLOBAL,
     ST_DE_FN,
     ST_DE_IMPORT,
+    ST_DE_TRAIT,
     ST_DE_COUNT,
 } ST_decl_kind_t;
 
@@ -336,13 +339,25 @@ typedef struct {
     ST_expr_t *def;
     u32 line, col;
     b8 is_pack;  // 'name: any...'
-    b8 is_const; // 'name :: T' -- caller's argument must be a compile-time constant
+    b8 is_const; // 'name :: T' caller's argument must be a compile-time constant
 } ST_param_t;
 
 typedef struct {
     ST_param_t *items;
     u32 count, capacity;
 } ST_params_t;
+
+typedef struct {
+    ST_string_t witness_name;
+    ST_string_t trait_name;
+    ST_tyexprs_t trait_args;
+    u32 line, col;
+} ST_where_clause_t;
+
+typedef struct {
+    ST_where_clause_t *items;
+    u32 count, capacity;
+} ST_where_clauses_t;
 
 typedef struct {
     ST_params_t params;
@@ -354,7 +369,19 @@ typedef struct {
     b8 is_comptime;   // trailing '#comptime'
     b8 is_noreturn;
     ST_strings_t generics;
+    ST_where_clauses_t wheres;
 } ST_fn_sig_t;
+
+typedef struct {
+    ST_string_t name;
+    ST_fn_sig_t sig;
+    u32 line, col;
+} ST_trait_method_t;
+
+typedef struct {
+    ST_trait_method_t *items;
+    u32 count, capacity;
+} ST_trait_methods_t;
 
 struct ST_decl_t {
     ST_decl_kind_t kind;
@@ -363,6 +390,7 @@ struct ST_decl_t {
     ST_string_t file;
     b8 is_pub;
     u32 line, col;
+    void *sema_sym;
     union {
         struct {
             ST_packing_t packing;
@@ -409,15 +437,21 @@ struct ST_decl_t {
             ST_string_t call_file;
             u32 call_line, call_col;
             u32 decl_block_id; // >0 for a nested 'fn' declared inside another function's
-                              // body: the id of the exact block (ST_parser_t.next_block_id)
-                              // it was written in. Used to scope its visibility and to
-                              // find its same-block siblings (ST_declare_block_siblings).
-                              // 0 for an ordinary top-level function.
+            // body: the id of the exact block (ST_parser_t.next_block_id)
+            // it was written in. Used to scope its visibility and to
+            // find its same-block siblings (ST_declare_block_siblings).
+            // 0 for an ordinary top-level function.
         } fn;
         struct {
             ST_string_t module_name; // directory name under modules/
             ST_string_t alias;       // namespace bound to (defaults to module_name)
         } import_;
+        struct {
+            ST_strings_t generics;
+            ST_string_t self_alias;
+            ST_trait_methods_t methods;
+            ST_tyexpr_t *self_ty;
+        } trait_;
     };
 };
 

@@ -591,8 +591,13 @@ static cli_status_t cli_parse_commands(command_t *cmd, int argc, char **argv, in
             rest->seen = 1;
             continue;
         }
+        if (cmd->cli->active && cmd->cli->active != &cmd->cli->root)
+            fprintf(stderr, "please refer to the help by doing '%s %s help'\n",
+                    cmd->cli->program, cmd->cli->active->name);
+        else
+            fprintf(stderr, "please refer to the help by doing '%s help'\n",
+                    cmd->cli->program);
 
-        fprintf(stderr, "%s: unexpected argument '%s'\n", cmd->cli->program, arg);
         return CLI_ERROR;
     }
 

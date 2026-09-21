@@ -1,0 +1,58 @@
+using __locale_data void;
+
+struct __locale_struct {
+    __locales: [13]*__locale_data;
+    __ctype_b: *u16;
+    __ctype_tolower: *i32;
+    __ctype_toupper: *i32;
+    __names: [13]*char;
+}
+
+pub extern fn memcpy(__dest: *void, __src: *void, __n: u64) -> *void;
+pub extern fn memmove(__dest: *void, __src: *void, __n: u64) -> *void;
+pub extern fn memccpy(__dest: *void, __src: *void, __c: i32, __n: u64) -> *void;
+pub extern fn memset(__s: *void, __c: i32, __n: u64) -> *void;
+pub extern fn memset_explicit(__s: *void, __c: i32, __n: u64) -> *void;
+pub extern fn memcmp(__s1: *void, __s2: *void, __n: u64) -> i32;
+pub extern fn __memcmpeq(__s1: *void, __s2: *void, __n: u64) -> i32;
+pub extern fn memchr(__s: *void, __c: i32, __n: u64) -> *void;
+pub extern fn strcpy(__dest: *char, __src: *char) -> *char;
+pub extern fn strncpy(__dest: *char, __src: *char, __n: u64) -> *char;
+pub extern fn strcat(__dest: *char, __src: *char) -> *char;
+pub extern fn strncat(__dest: *char, __src: *char, __n: u64) -> *char;
+pub extern fn strcmp(__s1: *char, __s2: *char) -> i32;
+pub extern fn strncmp(__s1: *char, __s2: *char, __n: u64) -> i32;
+pub extern fn strcoll(__s1: *char, __s2: *char) -> i32;
+pub extern fn strxfrm(__dest: *char, __src: *char, __n: u64) -> void;
+pub extern fn strcoll_l(__s1: *char, __s2: *char, __l: *__locale_struct) -> i32;
+pub extern fn strxfrm_l(__dest: *char, __src: *char, __n: u64, __l: *__locale_struct) -> u64;
+pub extern fn strdup(__s: *char) -> *char;
+pub extern fn strndup(__string: *char, __n: u64) -> *char;
+pub extern fn strchr(__s: *char, __c: i32) -> *char;
+pub extern fn strrchr(__s: *char, __c: i32) -> *char;
+pub extern fn strchrnul(__s: *char, __c: i32) -> *char;
+pub extern fn strcspn(__s: *char, __reject: *char) -> void;
+pub extern fn strspn(__s: *char, __accept: *char) -> void;
+pub extern fn strpbrk(__s: *char, __accept: *char) -> *char;
+pub extern fn strstr(__haystack: *char, __needle: *char) -> *char;
+pub extern fn strtok(__s: *char, __delim: *char) -> *char;
+pub extern fn __strtok_r(__s: *char, __delim: *char, __save_ptr: **char) -> *char;
+pub extern fn strtok_r(__s: *char, __delim: *char, __save_ptr: **char) -> *char;
+pub extern fn strcasestr(__haystack: *char, __needle: *char) -> *char;
+pub extern fn memmem(__haystack: *void, __haystacklen: u64, __needle: *void, __needlelen: u64) -> *void;
+pub extern fn __mempcpy(__dest: *void, __src: *void, __n: u64) -> *void;
+pub extern fn mempcpy(__dest: *void, __src: *void, __n: u64) -> *void;
+pub extern fn strlen(__s: *char) -> i32;
+pub extern fn strnlen(__string: *char, __maxlen: u64) -> u64;
+pub extern fn strerror(__errnum: i32) -> *char;
+pub extern fn strerror_r(__errnum: i32, __buf: *char, __buflen: u64) -> i32;
+pub extern fn strerror_l(__errnum: i32, __l: *__locale_struct) -> *char;
+pub extern fn explicit_bzero(__s: *void, __n: u64) -> void;
+pub extern fn strsep(__stringp: **char, __delim: *char) -> *char;
+pub extern fn strsignal(__sig: i32) -> *char;
+pub extern fn __stpcpy(__dest: *char, __src: *char) -> *char;
+pub extern fn stpcpy(__dest: *char, __src: *char) -> *char;
+pub extern fn __stpncpy(__dest: *char, __src: *char, __n: u64) -> *char;
+pub extern fn stpncpy(__dest: *char, __src: *char, __n: u64) -> *char;
+pub extern fn strlcpy(__dest: *char, __src: *char, __n: u64) -> void;
+pub extern fn strlcat(__dest: *char, __src: *char, __n: u64) -> void;

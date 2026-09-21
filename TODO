@@ -158,3 +158,9 @@ Test framework: Refer the NOTES in the 'tests/' directory
 - [ ] Implicits magnetic vars
 - [ ] Make sure it generates a query.
 - [ ] DSL run time programming
+
+# BUG
+Template generics and trait generic should be treated differently by the compiler right now.
+It resolves them as if they are the exact same.
+
+If object file already exists it should not rebuild in windows in linux this is not an issue.

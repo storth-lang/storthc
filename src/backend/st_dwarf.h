@@ -53,6 +53,7 @@ void ST_dbg_add_var(ST_arena_t *arena, ST_dbg_info_t *info, u32 fn_idx, ST_strin
                     ST_ty_t *ty, i32 frame_off, b8 is_param);
 
 void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir);
+void ST_dwarf_emit_nasm_asan_lines(FILE *out, ST_dbg_info_t *info);
 void ST_dwarf_emit_fasm_asan_lines(FILE *out, ST_dbg_info_t *info);
 
 #endif

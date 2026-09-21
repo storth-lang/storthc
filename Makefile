@@ -2,7 +2,7 @@ include config.mk
 
 SRCROOT := src
 OBJROOT := obj
-BINDIR := bin
+BINDIR  := build
 
 GIT_HASH := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
@@ -14,7 +14,7 @@ LDLIBS := -lm
 
 TARGET := $(BINDIR)/storthc
 
-SRC := $(shell find $(SRCROOT) -name '*.c')
+SRC := $(shell find $(SRCROOT) -name '*.c' ! -name '*win32*')
 OBJ := $(patsubst $(SRCROOT)/%.c,$(OBJROOT)/%.o,$(SRC))
 DEP := $(OBJ:.o=.d)
 
