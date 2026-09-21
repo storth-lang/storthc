@@ -9,6 +9,47 @@ static const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 static const char *xmm_regs[] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
 #define ST_N_XMM_REGS ((u32)ST_array_len(xmm_regs))
 
+static const char *ST_asm_reserved_words[] = {
+    "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh", "spl", "bpl", "sil", "dil",
+    "ax", "bx", "cx", "dx", "sp", "bp", "si", "di",
+    "eax", "ebx", "ecx", "edx", "esp", "ebp", "esi", "edi",
+    "rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+    "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+    "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+    "cs", "ds", "es", "fs", "gs", "ss",
+    NULL,
+};
+
+static b8 ST_asm_name_reserved(ST_string_t name) {
+    for (u32 i = 0; ST_asm_reserved_words[i]; i++) {
+        const char *r = ST_asm_reserved_words[i];
+        u32 rlen = (u32)strlen(r);
+        if (name.len != rlen)
+            continue;
+        b8 match = 1;
+        for (u32 k = 0; k < rlen; k++) {
+            char c = (char)name.data[k];
+            if (c >= 'A' && c <= 'Z')
+                c = (char)(c - 'A' + 'a');
+            if (c != r[k]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match)
+            return 1;
+    }
+    return 0;
+}
+
+static void ST_emit_sym(FILE *out, ST_string_t name) {
+    if (ST_asm_name_reserved(name))
+        fputc('_', out);
+    fprintf(out, ST_sv_fmt, ST_sv_args(name));
+}
+
 typedef struct {
     ST_ir_fn_t *fn;
     u32 hidden_ret_off;
@@ -173,8 +214,11 @@ static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
         ST_ir_global_field_init_t *fi = &sorted[i];
         if (fi->offset > cursor)
             fprintf(out, "    times %u db 0\n", fi->offset - cursor);
-        if (fi->is_fn_ref)
-            fprintf(out, "    dq " ST_sv_fmt "\n", ST_sv_args(fi->fn_name));
+        if (fi->is_fn_ref) {
+            fprintf(out, "    dq ");
+            ST_emit_sym(out, fi->fn_name);
+            fprintf(out, "\n");
+        }
         else
             ST_gen_scalar_data(out, fi->size, fi->is_float, fi->i, fi->f);
         cursor = fi->offset + fi->size;
@@ -189,8 +233,9 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
         return;
     ST_forrange(0, m->globals.count) {
         ST_ir_global_var_t *g = &m->globals.items[i];
-        if (g->is_extern)
-            fprintf(out, "extern " ST_sv_fmt "\n", ST_sv_args(g->name));
+        if (g->is_extern) {
+            fprintf(out, "extern "); ST_emit_sym(out, g->name); fprintf(out, "\n");
+        }
     }
     b8 any_init = 0, any_uninit = 0;
     ST_forrange(0, m->globals.count) {
@@ -210,10 +255,11 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
             if (!g->has_init && !g->field_inits.count)
                 continue;
             u32 align = g->ty && g->ty->align ? g->ty->align : 8;
-            if (g->is_pub)
-                fprintf(out, "global " ST_sv_fmt "\n", ST_sv_args(g->name));
+            if (g->is_pub) {
+                fprintf(out, "global "); ST_emit_sym(out, g->name); fprintf(out, "\n");
+            }
             fprintf(out, "align %u\n", align);
-            fprintf(out, ST_sv_fmt ":\n", ST_sv_args(g->name));
+            ST_emit_sym(out, g->name); fprintf(out, ":\n");
             if (g->field_inits.count) {
                 ST_gen_struct_global_data(out, g);
                 continue;
@@ -232,10 +278,11 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
                 continue;
             u32 size = g->ty && g->ty->size ? g->ty->size : 8;
             u32 align = g->ty && g->ty->align ? g->ty->align : 8;
-            if (g->is_pub)
-                fprintf(out, "global " ST_sv_fmt "\n", ST_sv_args(g->name));
+            if (g->is_pub) {
+                fprintf(out, "global "); ST_emit_sym(out, g->name); fprintf(out, "\n");
+            }
             fprintf(out, "align %u\n", align);
-            fprintf(out, ST_sv_fmt ":\n", ST_sv_args(g->name));
+            ST_emit_sym(out, g->name); fprintf(out, ":\n");
             fprintf(out, "    resb %u\n", size);
         }
     }
@@ -697,7 +744,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             u32 float_idx = ST_emit_call_args(out, &in->call.args, reserved, &stack_bytes);
 
             fprintf(out, "    mov al, %u\n", float_idx);
-            fprintf(out, "    call " ST_sv_fmt "\n", ST_sv_args(in->call.callee_name));
+            fprintf(out, "    call "); ST_emit_sym(out, in->call.callee_name); fprintf(out, "\n");
             if (stack_bytes)
                 fprintf(out, "    add rsp, %u\n", stack_bytes);
 
@@ -844,7 +891,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
                 fprintf(out, "    lea rax, [rax + %d]\n", in->addr.offset);
         } break;
         case ST_IR_GLOBAL_ADDR:
-            fprintf(out, "    lea rax, [rel " ST_sv_fmt "]\n", ST_sv_args(in->global_name));
+            fprintf(out, "    lea rax, [rel "); ST_emit_sym(out, in->global_name); fprintf(out, "]\n");
             break;
 
         case ST_IR_INLINE_ASM: {
@@ -1054,7 +1101,7 @@ static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena,
     ctx.next_float_arg = 0;
     ctx.next_stack_arg = 0;
     u32 frame = (extra + 15) & ~15u;
-    fprintf(out, "\n" ST_sv_fmt ":\n", ST_sv_args(fn->name));
+    fprintf(out, "\n"); ST_emit_sym(out, fn->name); fprintf(out, ":\n");
     fprintf(out, "    push rbp\n");
     fprintf(out, "    mov rbp, rsp\n");
     fprintf(out, "    sub rsp, %u\n", frame);
@@ -1113,12 +1160,13 @@ static b8 ST_nasm_generate_linux(FILE *out, ST_ir_module_t *m, ST_string_t src, 
         ST_ir_fn_t *fn = m->fns.items[i];
         if (fn->is_extern) {
             b8 asan_provided = fn->name.len > 7 && memcmp(fn->name.data, "__asan_", 7) == 0;
-            if (!asan_provided)
-                fprintf(out, "extern " ST_sv_fmt "\n", ST_sv_args(fn->name));
+            if (!asan_provided) {
+                fprintf(out, "extern "); ST_emit_sym(out, fn->name); fprintf(out, "\n");
+            }
             continue;
         }
         if (fn->is_pub) {
-            fprintf(out, "global " ST_sv_fmt "\n", ST_sv_args(fn->name));
+            fprintf(out, "global "); ST_emit_sym(out, fn->name); fprintf(out, "\n");
         }
         ST_generate_fn(out, fn, m->arena, dbg);
     }

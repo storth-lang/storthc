@@ -2,6 +2,6 @@
 
 - STATUS: OPEN
 - PRIORITY: 100
-- TAGS:
+- TAGS: semantic, frontend
 
-No description.
+This is the idea from the linear type system.
