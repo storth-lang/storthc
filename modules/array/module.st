@@ -24,11 +24,12 @@ pub fn slice(array: []$T, start: i32, end: i32) -> []$T {
     memcpy(&dest[0], array.ptr + start, cast(u64)len);
     return dest;
 }
-// pub fn slice(array: *[]$T, start: i32, end: i32) -> void {
-//     if start > end || array.ptr == null then return;
-//     array.ptr = array.ptr + start;
-//     array.len = cast(i64) (end - start);
-// }
+
+pub fn slice(array: *[]$T, start: i32, end: i32) -> void {
+    if start > end || array.ptr == null then return;
+    array.ptr = array.ptr + start;
+    array.len = cast(i64) (end - start);
+}
 
 pub fn shift(array: *[]$T) -> void {
     slice(array, 0, 1);

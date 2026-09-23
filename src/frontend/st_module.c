@@ -45,7 +45,7 @@ static ST_string_t ST_mod_join(ST_arena_t *a, const char *dir, ST_string_t rel) 
 }
 
 static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_t name,
-                         ST_string_t *out_path) {
+                         ST_strings_t *import_dirs, ST_string_t *out_path) {
     ST_string_t rel = {0};
     {
         u32 total = 8 + name.len + 10; // "modules/" + name + "/module.st"
@@ -61,6 +61,17 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
         rel = (ST_string_t){.data = buf, .len = n};
     }
 
+    if (import_dirs) {
+        ST_forrange(0, import_dirs->count) {
+            ST_string_t abs_dir = ST_abs_path(arena, ST_mod_cstr(arena, import_dirs->items[i]));
+            ST_string_t candidate = ST_mod_join(arena, ST_mod_cstr(arena, abs_dir), rel);
+            if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
+                *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
+                return 1;
+            }
+        }
+    }
+
     ST_string_t candidate = ST_mod_join(arena, ST_mod_cstr(arena, importer_dir), rel);
     if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
@@ -71,7 +82,7 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
     const char *env = getenv("STORTHC_MODULE_PATH");
     if (env && *env) {
         candidate = ST_mod_join(arena, env, rel);
-        if (ST_access_file(ST_mod_cstr(arena, candidate))) {
+        if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
             *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
             return 1;
         }
@@ -120,6 +131,7 @@ typedef struct {
     ST_srcmap_t *srcs;
     ST_ht_t modules; // canonical path -> ST_module_entry_t*
     ST_string_t project_root; // directory containing the root file's 'modules/'
+    ST_strings_t *import_dirs; // '-import_dir' values, highest-priority search dirs
 } ST_module_ctx_t;
 
 static ST_ht_generic_t ST_mod_key(ST_string_t s) {
@@ -630,9 +642,11 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
             continue;
         if (d->kind == ST_DE_IMPORT) {
             ST_string_t dep_path;
-            if (!ST_mod_resolve(ctx->arena, ctx->project_root, d->import_.module_name, &dep_path)) {
+            if (!ST_mod_resolve(ctx->arena, ctx->project_root, d->import_.module_name,
+                                ctx->import_dirs, &dep_path)) {
                 ST_diag_error(ctx->diag, d->line, d->col,
                               "cannot find module '" ST_sv_fmt "' (looked in "
+                              "-import_dir dirs, "
                               "'<file dir>/modules/" ST_sv_fmt "/module.st', "
                               "$STORTHC_MODULE_PATH, and "
                               "/usr/local/storthc/modules/" ST_sv_fmt "/module.st)",
@@ -687,7 +701,7 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
 }
 
 b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t root_file,
-                      ST_srcmap_t *srcs, ST_diag_t *diag) {
+                      ST_srcmap_t *srcs, ST_diag_t *diag, ST_strings_t *import_dirs) {
     b8 has_import = 0;
     ST_forrange(0, root_prog->decls.count) if (root_prog->decls.items[i] &&
                                                root_prog->decls.items[i]->kind == ST_DE_IMPORT) {
@@ -698,7 +712,8 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
         return 1;
 
     ST_string_t root_dir = ST_mod_dirname(root_file);
-    ST_module_ctx_t ctx = {.arena = arena, .diag = diag, .srcs = srcs, .project_root = root_dir};
+    ST_module_ctx_t ctx = {.arena = arena, .diag = diag, .srcs = srcs, .project_root = root_dir,
+                           .import_dirs = import_dirs};
     ST_ht_init(arena, &ctx.modules, 8);
 
     ST_decls_t merged = {0};
@@ -713,9 +728,11 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
         if (!d || d->kind != ST_DE_IMPORT)
             continue;
         ST_string_t dep_path;
-        if (!ST_mod_resolve(arena, ctx.project_root, d->import_.module_name, &dep_path)) {
+        if (!ST_mod_resolve(arena, ctx.project_root, d->import_.module_name, ctx.import_dirs,
+                            &dep_path)) {
             ST_diag_error(diag, d->line, d->col,
                           "cannot find module '" ST_sv_fmt "' (looked in "
+                          "-import_dir dirs, "
                           "'<file dir>/modules/" ST_sv_fmt "/module.st', "
                           "$STORTHC_MODULE_PATH, and "
                           "/usr/local/storthc/modules/" ST_sv_fmt "/module.st)",

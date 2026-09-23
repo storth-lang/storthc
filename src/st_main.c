@@ -189,14 +189,6 @@ static void st_append_assemble(ST_procs_t *procs, const char *asm_path, const ch
 }
 
 #ifdef _WIN32
-// @note: translates GCC/ld-style linker flags into what MSVC's link.exe
-// expects, since '-lraylib' and '-Lpath' are what people habitually type
-// and what the Linux side of ST_append_link already accepts as-is.
-// '-lname' -> 'name.lib' (a bare '-lname.lib' or '-lname.dll' is passed
-// through as just 'name.lib'/'name.dll' unchanged, in case the caller
-// already spelled out the extension). '-Lpath' -> '/LIBPATH:path'.
-// Anything else (already a bare '.lib' filename, or an MSVC-style flag
-// like '/LIBPATH:...' or '/NODEFAULTLIB') passes through untouched.
 static const char *st_translate_win_ldflag(ST_arena_t *arena, const char *flag) {
     size_t len = strlen(flag);
     if (len > 2 && flag[0] == '-' && flag[1] == 'l') {
@@ -333,8 +325,23 @@ static void st_ct_load_ldflag_libs(strings_t *ldflags) {
     }
 }
 
+// @note: the cli.h library's own 'strings_t' (a bare char**) is what
+// -import_dir values arrive as; ST_modules_process wants an 'ST_strings_t'
+// (ST_string_t entries, arena-backed) instead. Convert once at the call site.
+static ST_strings_t st_convert_strings(ST_arena_t *arena, strings_t *in) {
+    ST_strings_t out = {0};
+    if (!in)
+        return out;
+    for (u32 i = 0; i < in->count; i++) {
+        ST_string_t s = ST_cstr_to_str(in->items[i]);
+        ST_da_append_arena(arena, &out, s);
+    }
+    return out;
+}
+
 static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, const char *output,
-                     strings_t *ldflags, i32 *run_exit_code, b8 no_debug, b8 use_fasm, b8 quiet) {
+                     strings_t *ldflags, strings_t *import_dirs, i32 *run_exit_code, b8 no_debug,
+                     b8 use_fasm, b8 quiet) {
     ST_procs_t procs;
     ST_procs_init(arena, &procs);
     b8 ok = 0;
@@ -368,8 +375,9 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     }
     ST_TIME_MARK(&t_frontend);
 
+    ST_strings_t st_import_dirs = st_convert_strings(arena, import_dirs);
     ST_diag_t mod_diag = {.src = src, .file = file, .max_errors = ST_SEMA_MAX_ERRORS};
-    if (!ST_modules_process(arena, &prog, file, &srcs, &mod_diag)) {
+    if (!ST_modules_process(arena, &prog, file, &srcs, &mod_diag, &st_import_dirs)) {
         st_error("module resolution for '%s' failed", path);
         goto done;
     }
@@ -593,11 +601,15 @@ int main(int argc, char **argv) {
     command_t *build_exe = cli_command(build, "exe", "Link a final executable (default: test)");
 
     bool no_debug = false, use_fasm = false, quiet = false;
+    strings_t import_dirs = {0};
     const char *nodebug_desc =
         "Skip per-instruction debug-info collection during codegen (faster "
         "assembly, but a crash reports a raw address instead of a "
         "symbolicated file:line)";
     const char *quiet_desc = "Suppress the timing summary (useful for snapshot-testing output)";
+    const char *import_dir_desc =
+        "Add a directory to search for '#import' modules. Relative paths are resolved against "
+        "the current working directory.";
 #ifndef _WIN32
     const char *fasm_desc = "Use the FASM backend instead of nasm";
 #endif
@@ -608,6 +620,7 @@ int main(int argc, char **argv) {
     cli_alias(build_asm, "output", 'o');
     cli_create_flag_bool(build_asm, "nodebug", nodebug_desc, &no_debug);
     cli_create_flag_bool(build_asm, "quiet", quiet_desc, &quiet);
+    cli_create_flag_strings(build_asm, "import_dir", import_dir_desc, &import_dirs);
 #ifndef _WIN32
     cli_create_flag_bool(build_asm, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -618,6 +631,7 @@ int main(int argc, char **argv) {
     cli_alias(build_obj, "output", 'o');
     cli_create_flag_bool(build_obj, "nodebug", nodebug_desc, &no_debug);
     cli_create_flag_bool(build_obj, "quiet", quiet_desc, &quiet);
+    cli_create_flag_strings(build_obj, "import_dir", import_dir_desc, &import_dirs);
 #ifndef _WIN32
     cli_create_flag_bool(build_obj, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -629,6 +643,7 @@ int main(int argc, char **argv) {
     cli_alias(build_exe, "output", 'o');
     cli_create_flag_bool(build_exe, "nodebug", nodebug_desc, &no_debug);
     cli_create_flag_bool(build_exe, "quiet", quiet_desc, &quiet);
+    cli_create_flag_strings(build_exe, "import_dir", import_dir_desc, &import_dirs);
 #ifndef _WIN32
     cli_create_flag_bool(build_exe, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -643,6 +658,7 @@ int main(int argc, char **argv) {
     cli_alias(run, "output", 'o');
     cli_create_flag_bool(run, "nodebug", nodebug_desc, &no_debug);
     cli_create_flag_bool(run, "quiet", quiet_desc, &quiet);
+    cli_create_flag_strings(run, "import_dir", import_dir_desc, &import_dirs);
 #ifndef _WIN32
     cli_create_flag_bool(run, "fasm", fasm_desc, &use_fasm);
 #endif
@@ -681,23 +697,23 @@ int main(int argc, char **argv) {
         st_print_version();
         ok = 1;
     } else if (active == dump_tokens)
-        ok = st_compile(arena, src_tokens, ST_STAGE_TOKENS, NULL, NULL, NULL, 0, 0, 0);
+        ok = st_compile(arena, src_tokens, ST_STAGE_TOKENS, NULL, NULL, NULL, NULL, 0, 0, 0);
     else if (active == dump_ast)
-        ok = st_compile(arena, src_ast, ST_STAGE_AST, NULL, NULL, NULL, 0, 0, 0);
+        ok = st_compile(arena, src_ast, ST_STAGE_AST, NULL, NULL, NULL, NULL, 0, 0, 0);
     else if (active == dump_ir)
-        ok = st_compile(arena, src_ir, ST_STAGE_IR, NULL, NULL, NULL, 0, 0, 0);
+        ok = st_compile(arena, src_ir, ST_STAGE_IR, NULL, NULL, NULL, NULL, 0, 0, 0);
     else if (active == build_asm)
-        ok = st_compile(arena, src_asm, ST_STAGE_ASM, out_asm, NULL, NULL, no_debug, use_fasm,
-                        quiet);
-    else if (active == build_obj)
-        ok = st_compile(arena, src_obj, ST_STAGE_OBJ, out_obj, NULL, NULL, no_debug, use_fasm,
-                        quiet);
-    else if (active == build_exe)
-        ok = st_compile(arena, src_exe, ST_STAGE_EXE, out_exe, &exe_ldflags, NULL, no_debug,
+        ok = st_compile(arena, src_asm, ST_STAGE_ASM, out_asm, NULL, &import_dirs, NULL, no_debug,
                         use_fasm, quiet);
-    else if (active == run)
-        ok = st_compile(arena, src_run, ST_STAGE_RUN, out_run, &run_ldflags, &run_exit_code,
+    else if (active == build_obj)
+        ok = st_compile(arena, src_obj, ST_STAGE_OBJ, out_obj, NULL, &import_dirs, NULL, no_debug,
+                        use_fasm, quiet);
+    else if (active == build_exe)
+        ok = st_compile(arena, src_exe, ST_STAGE_EXE, out_exe, &exe_ldflags, &import_dirs, NULL,
                         no_debug, use_fasm, quiet);
+    else if (active == run)
+        ok = st_compile(arena, src_run, ST_STAGE_RUN, out_run, &run_ldflags, &import_dirs,
+                        &run_exit_code, no_debug, use_fasm, quiet);
 
     else if (active == bind) {
 #if ST_BIND_GENERATOR

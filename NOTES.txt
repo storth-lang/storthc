@@ -1,4 +1,4 @@
-	# The error handeling is done via return of -1.
+# The error handeling is done via return of -1.
 I still am too lazy to do perror style erroring to check for errors so later down the line we will infact change it but for now lemme be lazy.
 
 # Compiler
