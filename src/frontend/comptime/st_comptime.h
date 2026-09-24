@@ -21,6 +21,7 @@ typedef enum {
     ST_CT_PTR,
     ST_CT_NATIVE,
     ST_CT_STRUCT,
+    ST_CT_FN,
 } ST_ct_val_kind_t;
 
 typedef struct {
@@ -31,6 +32,7 @@ typedef struct {
 typedef struct {
     void *fn;
     u32 n_args;
+    b8 storth_abi;
 } ST_ct_native_t;
 
 typedef struct ST_ct_val_s {
@@ -153,6 +155,11 @@ typedef enum {
     ST_OP_HALT,          // no caller frame: halt with ST_CT_NIL as the result; with a caller
                          // frame: same as 'return nil' (a void function falling off its end)
 
+    ST_OP_FN_REF,
+    ST_OP_CALL_INDIRECT,
+    ST_OP_MARK_STORTH_ABI,
+    ST_OP_GLOBAL_ADDR,
+
     ST_OP_COUNT,
 } ST_ct_op_t;
 
@@ -208,10 +215,16 @@ void ST_ct_emit_loop(ST_ct_chunk_t *c, u32 loop_start, u32 line);
 u32 ST_ct_emit_call(ST_ct_chunk_t *c, u32 n_args, u32 line);
 void ST_ct_patch_call(ST_ct_chunk_t *c, u32 entry_ip_operand_offset, u32 entry_ip);
 
+u32 ST_ct_emit_fn_ref(ST_ct_chunk_t *c, u32 line);
+u32 ST_ct_emit_global_addr(ST_ct_chunk_t *c, u32 idx, u32 size, u32 line);
+
 void ST_ct_emit_pack_struct(ST_ct_chunk_t *c, const u32 *field_sizes, u32 n_fields, u32 line);
 
 #define ST_CT_STACK_MAX 1024
 #define ST_CT_FRAMES_MAX 256
+#define ST_CT_GLOBALS_MAX 128
+#define ST_CT_FN_TAG 0xC7F0ull
+#define ST_CT_STORTH_ABI_BIT (1ull << 62)
 
 typedef enum {
     ST_CT_OK,
@@ -243,6 +256,9 @@ typedef struct {
                      // address gets taken); a real, stable, byte-addressable buffer,
                      // not a boxed ST_ct_val_t
     u32 mem_used;
+
+    void *globals[ST_CT_GLOBALS_MAX];
+    b8 global_inited[ST_CT_GLOBALS_MAX];
 } ST_ct_vm_t;
 
 void ST_ct_vm_init(ST_ct_vm_t *vm);

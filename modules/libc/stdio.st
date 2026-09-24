@@ -15,6 +15,8 @@ pub using off_t i64;
 pub using ssize_t i64;
 pub using fpos_t _G_fpos_t;
 pub using cookie_io_functions_t *void;
+pub SEEK_END :: 2;
+pub SEEK_SET :: 0;
 
 pub extern fn remove(__filename: *char) -> i32;
 pub extern fn rename(__old: *char, __new: *char) -> i32;
@@ -77,7 +79,7 @@ pub extern fn fputs(__s: *char, __stream: *FILE) -> i32;
 pub extern fn puts(__s: *char) -> i32;
 pub extern fn ungetc(__c: i32, __stream: *FILE) -> i32;
 pub extern fn fread(__ptr: *void, __size: u64, __n: u64, __stream: *FILE) -> u64;
-pub extern fn fwrite(__ptr: *void, __size: u64, __n: u64, __s: *FILE) -> void;
+pub extern fn fwrite(__ptr: *void, __size: u64, __n: u64, __s: *FILE) -> u64;
 pub extern fn fread_unlocked(__ptr: *void, __size: u64, __n: u64, __stream: *FILE) -> u64;
 pub extern fn fwrite_unlocked(__ptr: *void, __size: u64, __n: u64, __stream: *FILE) -> u64;
 pub extern fn fseek(__stream: *FILE, __off: i64, __whence: i32) -> i32;

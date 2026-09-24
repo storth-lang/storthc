@@ -333,9 +333,18 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
             break;
 
         case ST_EX_STRUCT_LIT: {
-            ST_ht_generic_t r = ST_ht_get(rw->self_renames, ST_mod_key(e->struct_lit.type_name));
-            if (r.tag)
-                e->struct_lit.type_name = *(ST_string_t *)r.tag;
+            if (e->struct_lit.type_name.len) {
+                ST_ht_generic_t r =
+                    ST_ht_get(rw->self_renames, ST_mod_key(e->struct_lit.type_name));
+                if (r.tag)
+                    e->struct_lit.type_name = *(ST_string_t *)r.tag;
+                else if (rw->auto_exposed) {
+                    ST_ht_generic_t a =
+                        ST_ht_get(rw->auto_exposed, ST_mod_key(e->struct_lit.type_name));
+                    if (a.tag && a.tag != (void *)ST_MOD_AMBIGUOUS)
+                        e->struct_lit.type_name = *(ST_string_t *)a.tag;
+                }
+            }
             ST_forrange(0, e->struct_lit.generic_args.count)
                 ST_modrw_tyexpr(rw, e->struct_lit.generic_args.items[i]);
             ST_forrange(0, e->struct_lit.inits.count)

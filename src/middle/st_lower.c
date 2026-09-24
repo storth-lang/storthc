@@ -451,7 +451,6 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
                           "internal: this tag_union payload type isn't lowered yet");
         }
     } else {
-        // No payload: zero the payload region for a clean, deterministic value.
         u32 payload_bytes = ut->size > 8 ? ut->size - 8 : 0;
         i32 poff = off + 8;
         while (payload_bytes >= 8) {
@@ -463,7 +462,6 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
     }
 }
 
-// Allocates a fresh temp slot, constructs into it, and returns its address
 static ST_ir_inst_t *ST_lower_union_construct_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, (ST_string_t){0}, e->line, e->col);
     ST_lower_union_construct_into(c, slot, 0, e->ty, e);
@@ -477,7 +475,6 @@ static ST_ir_inst_t *ST_lower_string_lit_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
 }
 
 static ST_ir_inst_t *ST_lower_str_from_raw_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
-    // 'str_from_raw(ptr, len)'
     ST_ir_inst_t *slot =
         ST_ir_alloca(c->fn, &c->sema->tys, c->sema->tys.prim[ST_tstring], (ST_string_t){0}, e->line, e->col);
 
@@ -1196,8 +1193,7 @@ static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) 
                 len_bound = ST_ir_load(c->cur, len_fty, len_field, e->line, e->col);
             } else if (bt && bt->kind == ST_TY_STRING) {
                 // 'string' isn't backed by a general struct-field table the
-                // way SLICE/DYN_ARRAY are (see ST_ty_alloc(..., ST_TY_STRING,
-                // ...) in st_types.c
+                // way SLICE/DYN_ARRAY are
                 ST_ir_inst_t *str_addr = ST_lower_lvalue_addr(c, b);
                 if (!str_addr)
                     return NULL;
@@ -1527,7 +1523,7 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
             if (pty && (pty->kind == ST_TY_STRUCT || pty->kind == ST_TY_TAG_UNION ||
                        pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
                        pty->kind == ST_TY_SLICE || pty->kind == ST_TY_STRING))
-                max_args += pty->size > 16 ? (pty->size + 7) / 8 : 2;
+                max_args += 2; // <=16B: up to two eightbytes; >16B: one pointer
             else
                 max_args += 1;
         }
@@ -1597,7 +1593,7 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
             if (aty && (aty->kind == ST_TY_STRUCT || aty->kind == ST_TY_TAG_UNION ||
                        aty->kind == ST_TY_ARRAY || aty->kind == ST_TY_DYN_ARRAY ||
                        aty->kind == ST_TY_SLICE || aty->kind == ST_TY_STRING))
-                max_n_args += aty->size > 16 ? (aty->size + 7) / 8 : 2;
+                max_n_args += 2; // <=16B: up to two eightbytes; >16B: one pointer
             else
                 max_n_args += 1;
         }
@@ -3510,7 +3506,7 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                         pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
                         pty->kind == ST_TY_SLICE)) {
             if (pty->size > 16)
-                total_slots += (pty->size + 7) / 8;
+                total_slots += 1; // passed as a pointer to the caller's copy
             else if (pty->size <= 8)
                 total_slots += 1;
             else
@@ -3533,14 +3529,11 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                           pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY ||
                           pty->kind == ST_TY_SLICE)) {
             if (pty->size > 16) {
-                ST_ty_t *ebty = c->sema->tys.prim[ST_ti64];
-                u32 n_eb = (pty->size + 7) / 8;
-                for (u32 k = 0; k < n_eb; k++) {
-                    ST_ir_inst_t *v = ST_ir_param(entry, ebty, param_index, p->name);
-                    v->force_stack_arg = 1;
-                    raw[raw_n++] = v;
-                    param_index++;
-                }
+                // @note: aggregates over 16 bytes cross a non-extern call as ONE pointer
+                // to the caller's storage.
+                ST_ty_t *pptr = ST_ty_ptr(&c->sema->tys, pty);
+                raw[raw_n++] = ST_ir_param(entry, pptr, param_index, p->name);
+                param_index++;
             } else if (pty->size <= 8) {
                 ST_ty_t *ebty = ST_lower_eight_byte_ty(c, pty, 0);
                 raw[raw_n++] = ST_ir_param(entry, ebty, param_index, p->name);
@@ -3583,6 +3576,15 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                 ST_lower_field_ptr(c, slot, 8, c->sema->tys.prim[ST_ti64], d->line, d->col);
             ST_ir_store(entry, c->sema->tys.prim[ST_ti64], len_field, len_param, d->line, d->col);
 
+            ST_lower_bind_addr(c, p->name, slot, pty);
+            continue;
+        }
+        if (pty && pty->size > 16 &&
+            (pty->kind == ST_TY_STRUCT || pty->kind == ST_TY_TAG_UNION ||
+             pty->kind == ST_TY_ARRAY || pty->kind == ST_TY_DYN_ARRAY)) {
+            ST_ir_inst_t *src = raw[raw_n++];
+            ST_ir_inst_t *slot = ST_ir_alloca(fn, &c->sema->tys, pty, p->name, d->line, d->col);
+            ST_lower_raw_copy(c, slot, 0, src, 0, pty->size, d->line, d->col);
             ST_lower_bind_addr(c, p->name, slot, pty);
             continue;
         }
