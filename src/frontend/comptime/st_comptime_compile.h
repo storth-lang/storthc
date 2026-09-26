@@ -22,6 +22,11 @@ typedef struct {
     i32 len_slot;    // >=0: this local is a slice-shaped parameter whose length lives
                      // in ANOTHER local at this VM slot (a hidden companion declared
                      // right after it
+    b8 is_boxed;
+    b8 box_signed;
+    u32 box_kind;
+    u32 box_width;
+    u32 box_tag;
 } ST_ct_local_t;
 
 typedef struct {
@@ -57,6 +62,9 @@ typedef struct {
     ST_ct_pending_call_t pending[ST_CT_MAX_PENDING_CALLS];
     u32 n_pending;
 
+    ST_string_t global_names[ST_CT_GLOBALS_MAX];
+    u32 n_globals;
+
     b8 native_so_built;
     b8 native_so_ok;
     char native_so_path[512];
@@ -84,6 +92,27 @@ typedef struct {
 } ST_ct_defer_scope_t;
 
 typedef struct {
+    ST_string_t name;
+    u32 ip;
+    u32 n_locals;
+    b8 defined;
+} ST_ct_label_t;
+
+typedef struct {
+    ST_string_t label;
+    u32 jump_off;
+    u32 n_locals;
+    u32 line, col;
+    b8 resolved;
+} ST_ct_goto_t;
+
+typedef struct {
+    ST_stmts_t *body;
+    u32 saved_locals;
+    u32 defer_idx;
+} ST_ct_scope_t;
+
+typedef struct {
     ST_arena_t *arena;
     ST_ct_chunk_t *chunk;
 
@@ -98,7 +127,20 @@ typedef struct {
 
     ST_ct_prog_ctx_t *prog_ctx;
 
+    ST_stmts_t *scope_body;
+    u32 scope_next;
+
+    ST_stmts_t *fn_body;
+    ST_ct_scope_t scopes[64];
+    u32 n_scopes;
+    ST_ct_label_t labels[32];
+    u32 n_labels;
+    ST_ct_goto_t gotos[64];
+    u32 n_gotos;
+
     ST_string_t cur_file;
+    ST_string_t static_src_file;
+    u32 const_depth;
     b8 failed;
     u32 err_line, err_col;
     ST_string_t err_file;

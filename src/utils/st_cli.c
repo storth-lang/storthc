@@ -453,6 +453,8 @@ static void cli_run_callback(command_t *cmd) {
 
 static cli_status_t cli_set_flag(cli_t *cli, command_t *cmd, cli_flag_t *flag, const char *value,
                                  int *index, int argc, char **argv) {
+    (void)cmd;
+
     switch (flag->kind) {
         case CLI_BOOL:
             if (!value)
@@ -500,12 +502,8 @@ static cli_status_t cli_set_flag(cli_t *cli, command_t *cmd, cli_flag_t *flag, c
 
             while (*index + 1 < argc) {
                 char *next = argv[*index + 1];
-                if (next[0] == '-') {
-                    if (cli_find_flag(cmd, next + 2))
-                        break;
-                    if (next[1] && cli_find_flag_alias(cmd, next[1]))
-                        break;
-                }
+                if (next[0] == '-')
+                    break;
                 da_append(&cli->arena, list, next);
                 (*index)++;
             }
@@ -583,7 +581,7 @@ static cli_status_t cli_parse_commands(command_t *cmd, int argc, char **argv, in
         if (rest) {
             strings_t *list = rest->value;
             if (strcmp(arg, "-") == 0)
-                (*cursor)++; // optional '-' sentinel, if present, is not part of the list
+                (*cursor)++;
             while (*cursor < argc) {
                 da_append(&cmd->cli->arena, list, argv[*cursor]);
                 (*cursor)++;

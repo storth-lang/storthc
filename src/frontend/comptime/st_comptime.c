@@ -35,6 +35,7 @@ void ST_ct_val_print(ST_ct_val_t v) {
         case ST_CT_PTR: printf("<ptr %p>", v.ptr); break;
         case ST_CT_NATIVE: printf("<native %p/%u>", v.native.fn, v.native.n_args); break;
         case ST_CT_STRUCT: printf("<struct %u field%s>", v.st.n_fields, v.st.n_fields == 1 ? "" : "s"); break;
+        case ST_CT_FN: printf("<fn @%lld>", (long long)v.i); break;
     }
 }
 
@@ -171,6 +172,41 @@ u32 ST_ct_emit_call(ST_ct_chunk_t *c, u32 n_args, u32 line) {
 
 void ST_ct_patch_call(ST_ct_chunk_t *c, u32 entry_ip_operand_offset, u32 entry_ip) {
     ST_ct_patch_u32(c, entry_ip_operand_offset, entry_ip);
+}
+
+u32 ST_ct_emit_fn_ref(ST_ct_chunk_t *c, u32 line) {
+    ST_ct_write_byte(c, (u8)ST_OP_FN_REF, line);
+    u32 off = c->count;
+    ST_ct_write_u32(c, 0, line);
+    return off;
+}
+
+u32 ST_ct_emit_global_addr(ST_ct_chunk_t *c, u32 idx, u32 size, u32 line) {
+    ST_ct_write_byte(c, (u8)ST_OP_GLOBAL_ADDR, line);
+    ST_ct_write_u32(c, idx, line);
+    ST_ct_write_u32(c, size, line);
+    u32 off = c->count;
+    ST_ct_write_u32(c, 0, line);
+    return off;
+}
+
+static u64 ST_ct_encode_fn(ST_ct_val_t v) {
+    if (v.kind == ST_CT_FN)
+        return (ST_CT_FN_TAG << 48) | ((u64)v.i & 0xFFFFFFFFull);
+    if (v.kind == ST_CT_NATIVE)
+        return (u64)(uintptr_t)v.native.fn | (v.native.storth_abi ? ST_CT_STORTH_ABI_BIT : 0);
+    return 0;
+}
+
+static ST_ct_val_t ST_ct_decode_fn(u64 raw) {
+    if (raw == 0)
+        return ST_ct_nil();
+    if ((raw >> 48) == ST_CT_FN_TAG)
+        return (ST_ct_val_t){.kind = ST_CT_FN, .i = (i64)(raw & 0xFFFFFFFFull)};
+    ST_ct_val_t v = {.kind = ST_CT_NATIVE};
+    v.native.fn = (void *)(uintptr_t)(raw & ~ST_CT_STORTH_ABI_BIT);
+    v.native.storth_abi = (raw & ST_CT_STORTH_ABI_BIT) != 0;
+    return v;
 }
 
 void ST_ct_emit_pack_struct(ST_ct_chunk_t *c, const u32 *field_sizes, u32 n_fields, u32 line) {
@@ -414,6 +450,8 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                                  memcmp(a.str.data, b.str.data, a.str.len) == 0;
                             break;
                         case ST_CT_PTR: eq = a.ptr == b.ptr; break;
+                        case ST_CT_FN: eq = a.i == b.i; break;
+                        case ST_CT_NATIVE: eq = a.native.fn == b.native.fn; break;
                         default: eq = 0; break;
                     }
                     r = (op == ST_OP_EQ) ? eq : !eq;
@@ -778,6 +816,7 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
 
             case ST_OP_ALLOC_ZEROED: {
                 u32 size = ST_ct_read_u32(chunk, ip); ip += 4;
+                vm->mem_used = (vm->mem_used + 7u) & ~7u;
                 if ((u64)vm->mem_used + size > sizeof(vm->mem)) {
                     ST_ct_fail(vm, line,
                               "comptime: out of comptime scratch memory (used for "
@@ -818,6 +857,24 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                     ST_ct_push(vm, ST_ct_ptr(raw_ptr));
                     break;
                 }
+                if (tag == 4) {
+                    u64 fraw;
+                    memcpy(&fraw, p.ptr, sizeof(fraw));
+                    ST_ct_push(vm, ST_ct_decode_fn(fraw));
+                    break;
+                }
+                if (tag == 1) {
+                    if (width == 4) {
+                        float fv;
+                        memcpy(&fv, p.ptr, sizeof(fv));
+                        ST_ct_push(vm, ST_ct_float((f64)fv));
+                    } else {
+                        double dv;
+                        memcpy(&dv, p.ptr, sizeof(dv));
+                        ST_ct_push(vm, ST_ct_float((f64)dv));
+                    }
+                    break;
+                }
                 u64 raw = 0;
                 memcpy(&raw, p.ptr, width > 8 ? 8 : width);
                 i64 iv;
@@ -844,6 +901,23 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 }
                 if (v.kind == ST_CT_PTR) {
                     memcpy(p.ptr, &v.ptr, sizeof(void *));
+                    ST_ct_push(vm, v);
+                    break;
+                }
+                if (v.kind == ST_CT_FN || v.kind == ST_CT_NATIVE) {
+                    u64 fraw = ST_ct_encode_fn(v);
+                    memcpy(p.ptr, &fraw, sizeof(fraw));
+                    ST_ct_push(vm, v);
+                    break;
+                }
+                if (v.kind == ST_CT_FLOAT) {
+                    if (width == 4) {
+                        float fv = (float)v.f;
+                        memcpy(p.ptr, &fv, sizeof(fv));
+                    } else {
+                        double dv = (double)v.f;
+                        memcpy(p.ptr, &dv, sizeof(dv));
+                    }
                     ST_ct_push(vm, v);
                     break;
                 }
@@ -973,6 +1047,114 @@ ST_ct_status_t ST_ct_run(ST_ct_vm_t *vm, ST_ct_chunk_t *chunk, ST_ct_val_t *out)
                 vm->base = vm->frames[vm->n_frames].saved_base;
                 ip = vm->frames[vm->n_frames].return_ip;
                 ST_forrange(0, n) ST_ct_push(vm, vals[i]);
+                break;
+            }
+
+            case ST_OP_FN_REF: {
+                u32 entry_ip = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_push(vm, (ST_ct_val_t){.kind = ST_CT_FN, .i = (i64)entry_ip});
+                break;
+            }
+
+            case ST_OP_MARK_STORTH_ABI: {
+                ST_ct_val_t v = ST_ct_pop(vm);
+                if (v.kind == ST_CT_NATIVE)
+                    v.native.storth_abi = 1;
+                ST_ct_push(vm, v);
+                break;
+            }
+
+            case ST_OP_GLOBAL_ADDR: {
+                u32 idx = ST_ct_read_u32(chunk, ip); ip += 4;
+                u32 size = ST_ct_read_u32(chunk, ip); ip += 4;
+                i32 skip = (i32)ST_ct_read_u32(chunk, ip); ip += 4;
+                if (idx >= ST_CT_GLOBALS_MAX) {
+                    ST_ct_fail(vm, line, "comptime: too many globals");
+                    break;
+                }
+                if (vm->global_inited[idx]) {
+                    ST_ct_push(vm, ST_ct_ptr(vm->globals[idx]));
+                    ip = (u32)((i64)ip + skip);
+                    break;
+                }
+                vm->mem_used = (vm->mem_used + 7u) & ~7u;
+                u32 alloc = size ? size : 8;
+                if ((u64)vm->mem_used + alloc > sizeof(vm->mem)) {
+                    ST_ct_fail(vm, line, "comptime: out of comptime scratch memory (globals)");
+                    break;
+                }
+                void *gp = vm->mem + vm->mem_used;
+                memset(gp, 0, alloc);
+                vm->mem_used += alloc;
+                vm->globals[idx] = gp;
+                vm->global_inited[idx] = 1;
+                ST_ct_push(vm, ST_ct_ptr(gp));
+                break;
+            }
+
+            case ST_OP_CALL_INDIRECT: {
+                u32 n_args = ST_ct_read_u32(chunk, ip); ip += 4;
+                ST_ct_val_t fnv = ST_ct_pop(vm);
+                if (n_args > vm->sp) { ST_ct_fail(vm, line, "comptime: bad call argument count"); break; }
+                if (fnv.kind == ST_CT_FN) {
+                    if (vm->n_frames >= ST_CT_FRAMES_MAX) {
+                        ST_ct_fail(vm, line, "comptime: call stack too deep (max %u; likely "
+                                             "runaway recursion)", (u32)ST_CT_FRAMES_MAX);
+                        break;
+                    }
+                    vm->frames[vm->n_frames].return_ip = ip;
+                    vm->frames[vm->n_frames].saved_base = vm->base;
+                    vm->n_frames++;
+                    vm->base = vm->sp - n_args;
+                    ip = (u32)fnv.i;
+                    break;
+                }
+                if (fnv.kind != ST_CT_NATIVE || !fnv.native.fn) {
+                    ST_ct_fail(vm, line, "comptime: calling a value that isn't a function (or a "
+                                         "null function value)");
+                    break;
+                }
+                i64 args[6] = {0};
+                u32 n = 0;
+                u32 first = vm->sp - n_args;
+                b8 bad = 0;
+                for (u32 k = 0; k < n_args && !bad; k++) {
+                    ST_ct_val_t a = vm->stack[first + k];
+                    if (a.kind == ST_CT_STRING && fnv.native.storth_abi) {
+                        if (n + 2 > 6) { bad = 1; break; }
+                        args[n++] = (i64)(intptr_t)a.str.data;
+                        args[n++] = (i64)a.str.len;
+                        continue;
+                    }
+                    if (n + 1 > 6) { bad = 1; break; }
+                    switch (a.kind) {
+                        case ST_CT_STRING: {
+                            char *buf = malloc((size_t)a.str.len + 1);
+                            if (!buf) { bad = 1; break; }
+                            memcpy(buf, a.str.data, a.str.len);
+                            buf[a.str.len] = 0;
+                            args[n++] = (i64)(intptr_t)buf;
+                            break;
+                        }
+                        case ST_CT_INT: args[n++] = a.i; break;
+                        case ST_CT_BOOL: args[n++] = a.b ? 1 : 0; break;
+                        case ST_CT_PTR: args[n++] = (i64)(intptr_t)a.ptr; break;
+                        case ST_CT_NIL: args[n++] = 0; break;
+                        case ST_CT_FN:
+                        case ST_CT_NATIVE: args[n++] = (i64)ST_ct_encode_fn(a); break;
+                        default: bad = 1; break;
+                    }
+                }
+                if (bad) {
+                    ST_ct_fail(vm, line, "comptime: this argument list can't be passed to a native "
+                                         "function value (max 6 integer-class args; no floats "
+                                         "or by-value structs)");
+                    break;
+                }
+                vm->sp = first;
+                ST_ct_native_t nat = fnv.native;
+                nat.n_args = n;
+                ST_ct_push(vm, ST_ct_int(ST_ct_call_native(nat, args, n)));
                 break;
             }
 
