@@ -77,6 +77,17 @@ static void ST_lower_array_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, 
                                 i32 soff, ST_ty_t *sty, u32 line, u32 col);
 static void ST_lower_array_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *sty,
                                     ST_expr_t *lit);
+static void ST_lower_value_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *ty,
+                                ST_expr_t *v);
+static void ST_lower_raw_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, u32 size, u32 line,
+                              u32 col);
+static void ST_lower_raw_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff, ST_ir_inst_t *src,
+                              i32 soff, u32 size, u32 line, u32 col);
+static void ST_lower_bracket_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *slot, ST_ty_t *slice_ty,
+                                      ST_expr_t *lit);
+static ST_ir_inst_t *ST_lower_string_addr(ST_lower_ctx_t *c, ST_expr_t *e);
+static void ST_lower_string_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dest, ST_ir_inst_t *src, u32 line,
+                                 u32 col);
 static void ST_lower_scan_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ir_inst_t *ST_lower_struct_addr(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *st);
 
@@ -430,36 +441,75 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
     ST_ir_inst_t *tagp = ST_lower_field_ptr(c, base, off, tagty, lit->line, lit->col);
     ST_ir_store(c->cur, tagty, tagp, ST_ir_const_int(c->cur, tagty, idx), lit->line, lit->col);
 
-    if (lit->struct_lit.inits.count == 2) {
-        ST_expr_t *pval = lit->struct_lit.inits.items[1].value;
-        if (payload_ty && payload_ty->kind == ST_TY_STRUCT) {
-            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, off + 8, payload_ty, lit->line, lit->col);
-            ST_lower_struct_zero(c, pp, 0, payload_ty, lit->line, lit->col);
-            if (pval->kind == ST_EX_STRUCT_LIT)
-                ST_lower_struct_lit_into(c, pp, 0, payload_ty, pval);
-            else {
-                ST_ir_inst_t *src = ST_lower_lvalue_addr(c, pval);
-                if (src)
-                    ST_lower_struct_copy(c, pp, 0, src, 0, payload_ty, lit->line, lit->col);
-            }
-        } else if (payload_ty && ST_lower_ty_is_scalar(payload_ty)) {
-            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, off + 8, payload_ty, lit->line, lit->col);
-            ST_ir_inst_t *v = ST_lower_expr(c, pval);
-            ST_ir_store(c->cur, payload_ty, pp, v, lit->line, lit->col);
+    if (lit->struct_lit.inits.count == 2 && payload_ty)
+        ST_lower_value_into(c, base, off + 8, payload_ty, lit->struct_lit.inits.items[1].value);
+    else if (lit->struct_lit.inits.count == 2)
+        ST_diag_error(&c->diag, lit->line, lit->col,
+                      "internal: this tag_union payload type isn't lowered yet");
+    else if (ut->size > 8)
+        ST_lower_raw_zero(c, base, off + 8, ut->size - 8, lit->line, lit->col);
+}
+
+static void ST_lower_value_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *ty,
+                                ST_expr_t *v) {
+    u32 line = v->line, col = v->col;
+    switch (ty->kind) {
+        case ST_TY_STRUCT:
+        ST_lower_struct_zero(c, base, off, ty, line, col);
+        if (v->kind == ST_EX_STRUCT_LIT)
+            ST_lower_struct_lit_into(c, base, off, ty, v);
+        else {
+            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
+            if (src)
+                ST_lower_struct_copy(c, base, off, src, 0, ty, line, col);
+        }
+        return;
+        case ST_TY_TAG_UNION:
+        if (ST_lower_is_union_construct(v))
+            ST_lower_union_construct_into(c, base, off, ty, v);
+        else {
+            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
+            if (src)
+                ST_lower_raw_copy(c, base, off, src, 0, ty->size, line, col);
+        }
+        return;
+        case ST_TY_ARRAY:
+        if (v->kind == ST_EX_STRUCT_LIT)
+            ST_lower_array_lit_into(c, base, off, ty, v);
+        else {
+            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
+            if (src)
+                ST_lower_array_copy(c, base, off, src, 0, ty, line, col);
+        }
+        return;
+        case ST_TY_STRING: {
+            ST_ir_inst_t *src = ST_lower_string_addr(c, v);
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, off, ty, line, col);
+            if (src)
+                ST_lower_string_copy(c, dp, src, line, col);
+            return;
+        }
+        case ST_TY_SLICE:
+        case ST_TY_DYN_ARRAY:
+        if (v->kind == ST_EX_STRUCT_LIT && v->struct_lit.is_bracket_lit && ty->kind == ST_TY_SLICE) {
+            ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, off, ty, line, col);
+            ST_lower_bracket_lit_into(c, dp, ty, v);
         } else {
-            ST_diag_error(&c->diag, lit->line, lit->col,
-                          "internal: this tag_union payload type isn't lowered yet");
+            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
+            if (src)
+                ST_lower_raw_copy(c, base, off, src, 0, ty->size, line, col);
         }
-    } else {
-        u32 payload_bytes = ut->size > 8 ? ut->size - 8 : 0;
-        i32 poff = off + 8;
-        while (payload_bytes >= 8) {
-            ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, poff, tagty, lit->line, lit->col);
-            ST_ir_store(c->cur, tagty, pp, ST_ir_const_int(c->cur, tagty, 0), lit->line, lit->col);
-            poff += 8;
-            payload_bytes -= 8;
-        }
+        return;
+        default:
+        break;
     }
+    if (ST_lower_ty_is_scalar(ty)) {
+        ST_ir_inst_t *pp = ST_lower_field_ptr(c, base, off, ty, line, col);
+        ST_ir_inst_t *val = ST_lower_expr(c, v);
+        ST_ir_store(c->cur, ty, pp, val, line, col);
+        return;
+    }
+    ST_diag_error(&c->diag, line, col, "internal: this value type isn't lowered yet");
 }
 
 static ST_ir_inst_t *ST_lower_union_construct_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
@@ -543,6 +593,9 @@ static void ST_lower_array_elem_zero(ST_lower_ctx_t *c, ST_ir_inst_t *elem_base,
         ST_ir_store(c->cur, lty, fp, ST_ir_const_int(c->cur, lty, 0), line, col);
     } else if (ety->kind == ST_TY_ARRAY) {
         ST_lower_array_zero(c, elem_base, 0, ety, line, col);
+    } else if (ety->kind == ST_TY_TAG_UNION || ety->kind == ST_TY_SLICE ||
+               ety->kind == ST_TY_DYN_ARRAY) {
+        ST_lower_raw_zero(c, elem_base, 0, ety->size, line, col);
     } else if (ST_lower_ty_is_scalar(ety)) {
         ST_ir_inst_t *fp = ST_lower_field_ptr(c, elem_base, 0, ety, line, col);
         ST_ir_inst_t *z = ST_ty_is_float(ety) ? ST_ir_const_float(c->cur, ety, 0.0)
@@ -636,6 +689,8 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
             ST_lower_array_zero(c, base, foff, f->ty, line, col);
         } else if (f->ty->kind == ST_TY_DYN_ARRAY || f->ty->kind == ST_TY_SLICE) {
             ST_lower_dyn_array_zero(c, base, foff, f->ty, line, col);
+        } else if (f->ty->kind == ST_TY_TAG_UNION) {
+            ST_lower_raw_zero(c, base, foff, f->ty->size, line, col);
         } else if (f->ty->kind == ST_TY_STRING) {
             ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
             ST_ty_t *lty = c->sema->tys.prim[ST_ti32];
@@ -657,6 +712,21 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
                           "internal: field '" ST_sv_fmt "' has a type that isn't "
                           "lowered yet (arrays in structs come later)",
                           ST_sv_args(f->name));
+        }
+    }
+}
+
+static void ST_lower_raw_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, u32 size, u32 line,
+                              u32 col) {
+    u32 at = 0;
+    u32 widths[4] = {8, 4, 2, 1};
+    ST_ty_t *tys[4] = {c->sema->tys.prim[ST_ti64], c->sema->tys.prim[ST_ti32],
+                       c->sema->tys.prim[ST_ti16], c->sema->tys.prim[ST_ti8]};
+    for (u32 w = 0; w < 4; w++) {
+        while (at + widths[w] <= size) {
+            ST_ir_inst_t *p = ST_lower_field_ptr(c, base, off + (i32)at, tys[w], line, col);
+            ST_ir_store(c->cur, tys[w], p, ST_ir_const_int(c->cur, tys[w], 0), line, col);
+            at += widths[w];
         }
     }
 }
@@ -710,6 +780,10 @@ static void ST_lower_struct_copy(ST_lower_ctx_t *c, ST_ir_inst_t *dst, i32 doff,
         } else if (f->ty->kind == ST_TY_ARRAY) {
             ST_lower_array_copy(c, dst, doff + (i32)f->offset, src, soff + (i32)f->offset, f->ty,
                                 line, col);
+        } else if (f->ty->kind == ST_TY_TAG_UNION || f->ty->kind == ST_TY_SLICE ||
+                   f->ty->kind == ST_TY_DYN_ARRAY) {
+            ST_lower_raw_copy(c, dst, doff + (i32)f->offset, src, soff + (i32)f->offset, f->ty->size,
+                              line, col);
         } else if (f->ty->kind == ST_TY_STRING) {
             ST_ir_inst_t *sp = ST_lower_field_ptr(c, src, soff + (i32)f->offset, f->ty, line, col);
             ST_ir_inst_t *dp = ST_lower_field_ptr(c, dst, doff + (i32)f->offset, f->ty, line, col);
@@ -786,6 +860,8 @@ static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 
                     ST_lower_array_copy(c, base, off + (i32)foff, src, 0, fty, fi->value->line,
                                         fi->value->col);
             }
+        } else if (fty->kind == ST_TY_TAG_UNION) {
+            ST_lower_value_into(c, base, off + (i32)foff, fty, fi->value);
         } else if (fty->kind == ST_TY_STRING) {
             ST_ir_inst_t *src = ST_lower_string_addr(c, fi->value);
             ST_ir_inst_t *dp =
@@ -2037,6 +2113,9 @@ static void ST_lower_array_elem_copy(ST_lower_ctx_t *c, ST_ir_inst_t *delem, ST_
         ST_ir_inst_t *v = ST_ir_load(c->cur, ety, sp, line, col);
         ST_ir_inst_t *dp = ST_lower_field_ptr(c, delem, 0, ety, line, col);
         ST_ir_store(c->cur, ety, dp, v, line, col);
+    } else if (ety->kind == ST_TY_TAG_UNION || ety->kind == ST_TY_SLICE ||
+               ety->kind == ST_TY_DYN_ARRAY) {
+        ST_lower_raw_copy(c, delem, 0, selem, 0, ety->size, line, col);
     } else if (ST_lower_ty_is_scalar(ety)) {
         ST_ir_inst_t *sp = ST_lower_field_ptr(c, selem, 0, ety, line, col);
         ST_ir_inst_t *v = ST_ir_load(c->cur, ety, sp, line, col);
@@ -2130,6 +2209,8 @@ static void ST_lower_array_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 o
                     ST_lower_struct_copy(c, base, eoff, src, 0, ety, fi->value->line,
                                          fi->value->col);
             }
+        } else if (ety->kind == ST_TY_TAG_UNION) {
+            ST_lower_value_into(c, base, eoff, ety, fi->value);
         } else if (ety->kind == ST_TY_STRING) {
             ST_ir_inst_t *src = ST_lower_string_addr(c, fi->value);
             ST_ir_inst_t *dp =

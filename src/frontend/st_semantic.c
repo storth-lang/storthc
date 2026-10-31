@@ -542,7 +542,7 @@ static ST_ty_t *ST_instantiate_tag_union(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_
     id->name = mangled;
     id->file = tmpl->file;
     id->is_pub = tmpl->is_pub;
-    id->display_name = ST_instance_display_name(se, tmpl->name, args);
+    id->display_name = ST_instance_display_name(se, ST_decl_display_name(tmpl), args);
 
     ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
     ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
@@ -607,7 +607,7 @@ static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t a
     id->is_pub = tmpl->is_pub;
     id->struct_.packing = tmpl->struct_.packing;
     id->struct_.fields = tmpl->struct_.fields;
-    id->display_name = ST_instance_display_name(se, tmpl->name, args);
+    id->display_name = ST_instance_display_name(se, ST_decl_display_name(tmpl), args);
 
     ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
     ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
@@ -3217,6 +3217,52 @@ static b8 ST_variant_declares_payload(ST_variant_spec_t *v) {
     return !(v->payload->kind == ST_TE_NAME && ST_string_eq_cstr(v->payload->name, "void"));
 }
 
+static ST_tyexpr_t *ST_expr_to_tyexpr(ST_sema_t *se, ST_expr_t *e) {
+    if (e->kind == ST_EX_IDENT) {
+        ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
+        te->name = e->name;
+        return te;
+    }
+    if (e->kind == ST_EX_UNARY && ST_string_eq_cstr(e->unary.op, "*")) {
+        ST_tyexpr_t *inner = ST_expr_to_tyexpr(se, e->unary.operand);
+        if (!inner)
+            return NULL;
+        ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_PTR, e->line, e->col);
+        te->inner = inner;
+        return te;
+    }
+    if (e->kind == ST_EX_CALL && e->call.callee && e->call.callee->kind == ST_EX_IDENT) {
+        ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_GENERIC_INST, e->line, e->col);
+        te->name = e->call.callee->name;
+        ST_forrange(0, e->call.args.count) {
+            ST_tyexpr_t *arg = ST_expr_to_tyexpr(se, e->call.args.items[i].value);
+            if (!arg)
+                return NULL;
+            ST_da_append_arena(se->arena, &te->generic_args, arg);
+        }
+        return te;
+    }
+    return NULL;
+}
+
+static b8 ST_explicit_union_base(ST_sema_t *se, ST_expr_t *base, ST_decl_t **ud, ST_string_t *tname,
+                                 ST_tyexprs_t *gargs) {
+    if (!base || base->kind != ST_EX_CALL || !base->call.callee ||
+        base->call.callee->kind != ST_EX_IDENT)
+        return 0;
+    ST_decl_t *d = ST_union_type_decl(se, base->call.callee, tname);
+    if (!d || d->tag_union.generics.count != base->call.args.count)
+        return 0;
+    ST_forrange(0, base->call.args.count) {
+        ST_tyexpr_t *te = ST_expr_to_tyexpr(se, base->call.args.items[i].value);
+        if (!te)
+            return 0;
+        ST_da_append_arena(se->arena, gargs, te);
+    }
+    *ud = d;
+    return 1;
+}
+
 static ST_expr_t *ST_dot_field(ST_expr_t *e) {
     ST_expr_t *f = e->kind == ST_EX_CALL ? e->call.callee : e;
     if (!f || f->kind != ST_EX_FIELD || !f->field.base || f->field.base->kind != ST_EX_IDENT)
@@ -3244,13 +3290,20 @@ static b8 ST_ctor_normalize(ST_sema_t *se, ST_expr_t *e, b8 allow_bare, ST_ty_t 
             return 0;
         fld = e->call.callee;
         is_call = 1;
-    } else if (e->kind == ST_EX_FIELD && allow_bare) {
+    } else if (e->kind == ST_EX_FIELD) {
         fld = e;
     } else {
         return 0;
     }
     ST_string_t tname = {0};
-    ST_decl_t *ud = ST_union_type_decl(se, fld->field.base, &tname);
+    ST_tyexprs_t gargs = {0};
+    ST_decl_t *ud = NULL;
+    b8 explicit_args = ST_explicit_union_base(se, fld->field.base, &ud, &tname, &gargs);
+    if (!explicit_args) {
+        if (!is_call && !allow_bare)
+            return 0;
+        ud = ST_union_type_decl(se, fld->field.base, &tname);
+    }
     if (!ud)
         return 0;
     ST_variant_spec_t *variant = NULL;
@@ -3276,6 +3329,7 @@ static b8 ST_ctor_normalize(ST_sema_t *se, ST_expr_t *e, b8 allow_bare, ST_ty_t 
     e->kind = ST_EX_STRUCT_LIT;
     memset(&e->struct_lit, 0, sizeof(e->struct_lit));
     e->struct_lit.type_name = tname;
+    e->struct_lit.generic_args = gargs;
     e->struct_lit.synth_variant = 1;
     ST_field_init_t first = {.value = vid, .line = line, .col = col};
     ST_da_append_arena(se->arena, &e->struct_lit.inits, first);
@@ -3433,7 +3487,13 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                 ST_type_expr(se, fi->value);
                 continue;
             }
-            ST_ty_t *vt = ST_type_expr(se, fi->value);
+            ST_ty_t *vt;
+            if (ety && ST_lit_takes_expected(se, fi->value, ety)) {
+                vt = ST_type_struct_lit(se, fi->value, ety);
+                fi->value->ty = vt;
+            } else {
+                vt = ST_type_expr(se, fi->value);
+            }
             if (!ety) {
                 ety = vt ? ST_ty_defaulted(se, vt) : NULL;
                 continue;
@@ -3690,6 +3750,12 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
                       ST_sv_args(dot->field.name));
         e->ty = NULL;
         return NULL;
+    }
+    if (e->kind == ST_EX_FIELD && e->field.base && e->field.base->kind == ST_EX_CALL &&
+        ST_ctor_normalize(se, e, 0, NULL)) {
+        ST_ty_t *lt = ST_type_struct_lit(se, e, NULL);
+        e->ty = lt;
+        return lt;
     }
     if (se->expr_depth >= ST_MAX_EXPR_DEPTH) {
         ST_diag_error(&se->diag, e->line, e->col, "expression nested too deeply");

@@ -43,7 +43,13 @@ fn find(xs: []u8, want: u8) -> Option(u8) {
 }
 ```
 
+The generic arguments can also be written out: `Option(u8).Some(7)` and `Option(u8).None`. These work anywhere, with or without a destination type.
+
+When there is no destination type, name the type with its arguments: `Option(u8).Some(7)` and `Option(u8).None` both work.
+
 A tag union value is only ever built this way. A brace literal such as `Shape{ Circle, 5 }` is an error.
+
+A zero-initialized tag union is its first variant, so declare the empty variant first (`None, Some($T)`) when you want an uninitialized value to mean "none".
 
 ## Matching
 
@@ -74,6 +80,8 @@ impl Option {
 
 An `impl` block lives in the same file as its struct or tag union. Each method is an ordinary function named `Type__method` whose first parameter is `self`; `x.method(args)` is rewritten to `Type__method(x, args)`. `Self` stands for the type being implemented in signatures and bodies. `impl Option` takes the generic parameters from the type, `impl Option($T)` states them. A method that takes `self` by pointer can be called on a variable, on a pointer, or on a call result.
 
-## Limits
+## Where tag unions can live
 
-A tag union can not yet be a struct field or the payload of another tag union.
+A tag union can be a struct field, an array or slice element, and the payload of another tag union. A payload can be a scalar, struct, string, slice, array or another tag union.
+
+A zero-initialized tag union (a local declared without a value, or a struct field left unset) is the first variant with a zeroed payload, so declare `None` first in an option-like type: `tag_union Option { None, Some($T) }`.
