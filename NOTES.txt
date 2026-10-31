@@ -96,3 +96,6 @@ Resource for making debug symbol and also linker for windows:
 url: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
 
 Basically the linker should be a baked in program to make it a self contained executable.
+
+Finally implemented methods so that we do not have to suffer with a bunch of function pointer passing around and to be honest I do not know if I should add relative
+pointers.

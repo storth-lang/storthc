@@ -259,6 +259,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p);
 static b8 ST_parse_asm_tokens(ST_parser_t *p, ST_token_t **out_toks, u32 *out_n);
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out);
 static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub);
+static ST_decl_t *ST_parse_method_decl(ST_parser_t *p, b8 is_pub);
 static b8 ST_parse_generic_list(ST_parser_t *p, ST_strings_t *out);
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern);
 static void ST_collect_generic_te(ST_parser_t *p, ST_tyexpr_t *te, ST_strings_t *out);
@@ -842,6 +843,23 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_IDENT, t->line, t->col);
         e->name = t->text;
         return e;
+    }
+
+    if (ST_tok_is_symbol(t, ".")) {
+        ST_token_t *next = ST_tok_at(p, p->pos + 1);
+        if (ST_tok_is_symbol(next, "{")) {
+            p->pos += 2;
+            return ST_parse_struct_lit(p, (ST_string_t){0}, (ST_tyexprs_t){0}, t->line, t->col);
+        }
+        if (ST_tok_is_ident(next)) {
+            p->pos += 2;
+            ST_expr_t *base = ST_expr_new(p->arena, ST_EX_IDENT, t->line, t->col);
+            base->name = ST_cstr_to_str(".");
+            ST_expr_t *f = ST_expr_new(p->arena, ST_EX_FIELD, t->line, t->col);
+            f->field.base = base;
+            f->field.name = next->text;
+            return f;
+        }
     }
 
     if (ST_tok_is_symbol(t, "{")) {
@@ -1864,6 +1882,18 @@ static ST_string_t ST_mangle_nested_fn(ST_arena_t *a, ST_string_t parent, ST_str
     return (ST_string_t){.data = buf, .len = total};
 }
 
+static ST_decl_t *ST_parse_method_decl(ST_parser_t *p, b8 is_pub) {
+    ST_token_t *t = ST_peek(p);
+    p->pos++;
+    ST_token_t *nt = ST_peek(p);
+    ST_decl_t *d = ST_decl_new(p->arena, ST_DE_FN, nt ? nt->line : t->line, nt ? nt->col : t->col);
+    d->is_pub = is_pub;
+    d->name = ST_expect_ident(p, "a function name");
+    if (!ST_expect_sym(p, "{"))
+        return NULL;
+    return d;
+}
+
 static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
     ST_token_t *t = ST_peek(p);
     p->pos++;
@@ -2056,6 +2086,8 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
     d->name = ST_expect_ident(p, "a tag_union name");
     if (!d->name.len)
         return NULL;
+    if (!ST_parse_generic_list(p, &d->tag_union.generics))
+        return NULL;
     if (!ST_expect_sym(p, "{"))
         return NULL;
     while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
@@ -2069,16 +2101,148 @@ static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
         if (!v.name.len)
             return NULL;
         if (ST_at_symbol(p, ":")) {
+            ST_perr_here(p, "write a variant payload as 'Variant(Type)', not 'Variant: Type'");
+            return NULL;
+        } else if (ST_at_symbol(p, "(")) {
             p->pos++;
             v.payload = ST_parse_type(p);
-            if (!v.payload)
+            if (!v.payload || !ST_expect_sym(p, ")"))
                 return NULL;
         }
         ST_da_append_arena(p->arena, &d->tag_union.variants, v);
     }
     if (!ST_expect_sym(p, "}"))
         return NULL;
+    ST_forrange(0, d->tag_union.variants.count)
+        ST_collect_generic_te(p, d->tag_union.variants.items[i].payload, &d->tag_union.generics);
     return d;
+}
+
+static b8 ST_parse_impl_block(ST_parser_t *p) {
+    ST_token_t *head = ST_peek(p);
+    ST_string_t type_name = ST_expect_ident(p, "a type name after 'impl'");
+    if (!type_name.len)
+        return 0;
+    ST_strings_t generics = {0};
+    if (!ST_parse_generic_list(p, &generics))
+        return 0;
+    if (!ST_expect_sym(p, "{"))
+        return 0;
+    while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
+        b8 is_pub = 0;
+        if (ST_at_keyword(p, "pub")) {
+            is_pub = 1;
+            p->pos++;
+        }
+        if (!ST_at_keyword(p, "fn")) {
+            ST_perr_here(p, "expected 'fn' inside an impl block");
+            return 0;
+        }
+        ST_decl_t *d = ST_parse_fn_decl(p, is_pub);
+        if (!d)
+            return 0;
+        ST_impl_method_t m = {.fn = d,
+                              .type_name = type_name,
+                              .generics = generics,
+                              .explicit_generics = generics.count > 0,
+                              .head = head};
+        ST_da_append_arena(p->arena, &p->impl_methods, m);
+    }
+    return ST_expect_sym(p, "}");
+}
+
+static void ST_impl_rewrite_te(ST_parser_t *p, ST_tyexpr_t *te, ST_string_t type_name,
+                               ST_strings_t *generics) {
+    if (!te)
+        return;
+    if (te->kind == ST_TE_NAME && !te->is_generic_param && !te->module_alias.len &&
+        (ST_string_eq(te->name, type_name) || ST_string_eq_cstr(te->name, "Self"))) {
+        te->name = type_name;
+        if (!generics->count)
+            return;
+        te->kind = ST_TE_GENERIC_INST;
+        te->generic_args = (ST_tyexprs_t){0};
+        ST_forrange(0, generics->count) {
+            ST_tyexpr_t *a = ST_tyexpr_new(p->arena, ST_TE_NAME, te->line, te->col);
+            a->name = generics->items[i];
+            a->is_generic_param = 1;
+            ST_da_append_arena(p->arena, &te->generic_args, a);
+        }
+        return;
+    }
+    ST_impl_rewrite_te(p, te->inner, type_name, generics);
+    ST_forrange(0, te->fn_params.count)
+        ST_impl_rewrite_te(p, te->fn_params.items[i], type_name, generics);
+    ST_forrange(0, te->fn_rets.count)
+        ST_impl_rewrite_te(p, te->fn_rets.items[i], type_name, generics);
+    ST_forrange(0, te->generic_args.count)
+        ST_impl_rewrite_te(p, te->generic_args.items[i], type_name, generics);
+}
+
+static ST_string_t ST_mangle_method_name(ST_arena_t *a, ST_string_t type_name, ST_string_t method) {
+    u32 total = type_name.len + 2 + method.len;
+    u8 *buf = ST_arena_push(a, total);
+    memcpy(buf, type_name.data, type_name.len);
+    buf[type_name.len] = '_';
+    buf[type_name.len + 1] = '_';
+    memcpy(buf + type_name.len + 2, method.data, method.len);
+    return (ST_string_t){.data = buf, .len = total};
+}
+
+static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) {
+    for (u32 mi = 0; mi < p->impl_methods.count; mi++) {
+        ST_impl_method_t *m = &p->impl_methods.items[mi];
+        ST_decl_t *d = m->fn;
+        ST_strings_t generics = m->generics;
+        ST_decl_t *target = NULL;
+        for (u32 k = 0; k < out->decls.count && !target; k++) {
+            ST_decl_t *td = out->decls.items[k];
+            if ((td->kind == ST_DE_STRUCT || td->kind == ST_DE_TAG_UNION) &&
+                ST_string_eq(td->name, m->type_name))
+                target = td;
+        }
+        if (!target) {
+            ST_perr_tok(p, m->head,
+                        "impl target '" ST_sv_fmt "' must be a struct or tag_union declared in "
+                        "this file",
+                        ST_sv_args(m->type_name));
+            continue;
+        }
+        ST_strings_t decl_generics = target->kind == ST_DE_STRUCT ? target->struct_.generics
+                                                                    : target->tag_union.generics;
+        if (!m->explicit_generics)
+            generics = decl_generics;
+        else if (generics.count != decl_generics.count) {
+            ST_perr_tok(p, m->head,
+                        "'" ST_sv_fmt "' has %u generic parameter(s), but this impl names %u",
+                        ST_sv_args(m->type_name), decl_generics.count, generics.count);
+            continue;
+        }
+        if (!d->fn.sig.params.count ||
+            !ST_string_eq_cstr(d->fn.sig.params.items[0].name, "self")) {
+            ST_perr_tok_at(p, file, d->line, d->col,
+                           "method '" ST_sv_fmt "' must take 'self' as its first parameter",
+                           ST_sv_args(d->name));
+            continue;
+        }
+        ST_forrange(0, d->fn.sig.params.count)
+            ST_impl_rewrite_te(p, d->fn.sig.params.items[i].te, m->type_name, &generics);
+        ST_forrange(0, d->fn.sig.rets.count)
+            ST_impl_rewrite_te(p, d->fn.sig.rets.items[i], m->type_name, &generics);
+        ST_forrange(0, generics.count) {
+            b8 present = 0;
+            for (u32 g = 0; g < d->fn.sig.generics.count; g++)
+                if (ST_string_eq(d->fn.sig.generics.items[g], generics.items[i]))
+                    present = 1;
+            if (!present)
+                ST_da_append_arena(p->arena, &d->fn.sig.generics, generics.items[i]);
+        }
+        d->display_name = d->name;
+        d->fn.is_method = 1;
+        d->name = ST_mangle_method_name(p->arena, m->type_name, d->name);
+        d->file = file;
+        ST_da_append_arena(p->arena, &out->decls, d);
+    }
 }
 
 static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
@@ -2454,6 +2618,13 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             d->is_pub = is_pub;
         return d;
     }
+    if (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "impl") && ST_tok_is_ident(ST_peek2(p))) {
+        p->pos++;
+        if (!ST_parse_impl_block(p))
+            return NULL;
+        p->impl_consumed = 1;
+        return NULL;
+    }
     if (ST_tok_is_keyword(t, "using") && ST_tok_is_ident(ST_peek2(p))) {
         p->pos++;
         ST_string_t name = ST_expect_ident(p, "a type alias name after 'using'");
@@ -2611,6 +2782,9 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
     if (ST_tok_is_keyword(t, "fn"))
         return ST_parse_fn_decl(p, is_pub);
 
+    if (ST_tok_is_keyword(t, "impl"))
+        return ST_parse_method_decl(p, is_pub);
+
     if (ST_tok_is_symbol(t, "#import")) {
         p->pos++;
         ST_token_t *st = ST_peek(p);
@@ -2670,6 +2844,10 @@ b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t 
             break;
         ST_token_t *start_tok = ST_peek(p);
         ST_decl_t *d = ST_parse_top_decl(p);
+        if (!d && p->impl_consumed) {
+            p->impl_consumed = 0;
+            continue;
+        }
         if (!d) {
             p->pos++;
             ST_sync_decl(p);
@@ -2680,5 +2858,6 @@ b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t 
     }
     ST_forrange(0, p->nested_fns.count)
         ST_da_append_arena(arena, &out->decls, p->nested_fns.items[i]);
+    ST_impl_finish(p, out, file);
     return p->n_errors == 0;
 }

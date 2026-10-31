@@ -698,8 +698,13 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
         ST_modrw_decl(&rw, d);
         if (!is_root) {
             ST_ht_generic_t r = ST_ht_get(&self_renames, ST_mod_key(d->name));
-            if (r.tag)
+            if (r.tag) {
+                b8 is_type = d->kind == ST_DE_STRUCT || d->kind == ST_DE_TAG_UNION ||
+                             d->kind == ST_DE_ENUM;
+                if (is_type && !d->display_name.len)
+                    d->display_name = d->name;
                 d->name = *(ST_string_t *)r.tag;
+            }
         }
         ST_da_append_arena(ctx->arena, merged, d);
     }

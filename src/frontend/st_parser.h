@@ -9,6 +9,19 @@
 #define ST_PARSE_MAX_ERRORS 20
 
 typedef struct {
+    ST_decl_t *fn;
+    ST_string_t type_name;
+    ST_strings_t generics;
+    b8 explicit_generics;
+    ST_token_t *head;
+} ST_impl_method_t;
+
+typedef struct {
+    ST_impl_method_t *items;
+    u32 count, capacity;
+} ST_impl_methods_t;
+
+typedef struct {
     ST_arena_t *arena;
     ST_token_t *tokens;
     u32 n_tokens;
@@ -20,6 +33,8 @@ typedef struct {
     ST_srcmap_t *srcs;
     u32 suppress_errors; // Issue fix: https://github.com/storth-lang/storthc/issues/40
     ST_decls_t nested_fns;
+    ST_impl_methods_t impl_methods;
+    b8 impl_consumed;
     ST_strings_t fn_name_stack;
     u32 next_block_id;
     u32 next_trait_impl_id;
