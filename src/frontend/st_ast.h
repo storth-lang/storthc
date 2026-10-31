@@ -57,6 +57,7 @@ struct ST_tyexpr_t {
     ST_tyexprs_t generic_args;
     ST_expr_t *typeof_operand;
     ST_ty_t *resolved;
+    b8 pinned;
 };
 
 typedef enum {
@@ -124,6 +125,7 @@ struct ST_expr_t {
         struct {
             ST_string_t op;
             ST_expr_t *operand;
+            b8 implicit_recv;
         } unary;
         struct {
             ST_string_t op;
@@ -136,6 +138,7 @@ struct ST_expr_t {
         struct {
             ST_expr_t *base;
             ST_string_t name;
+            b8 implicit_payload;
         } field;
         struct {
             ST_expr_t *base;
@@ -150,6 +153,7 @@ struct ST_expr_t {
             ST_tyexprs_t generic_args;
             ST_field_inits_t inits;
             b8 is_bracket_lit;
+            b8 synth_variant;
         } struct_lit;
         struct {
             ST_tyexpr_t *te;
@@ -404,6 +408,7 @@ struct ST_decl_t {
         } enum_;
         struct {
             ST_variant_specs_t variants;
+            ST_strings_t generics;
         } tag_union;
         struct {
             ST_tyexpr_t *te; // optional explicit type: 'NAME : type : expr;' (NULL if 'NAME :: expr;')
@@ -434,6 +439,7 @@ struct ST_decl_t {
             ST_string_t bound_str_param; // that param's declared name, e.g. 'fmt'
             ST_string_t bound_str_value; // the literal value bound at this call site
             b8 has_call_site;
+            b8 is_method;
             ST_string_t call_file;
             u32 call_line, call_col;
             u32 decl_block_id; // >0 for a nested 'fn' declared inside another function's

@@ -11,7 +11,6 @@
 // Functions -> camelCase.
 
 #import "libc";
-#import "os";
 
 // @note: Properties for the function open with in the trait File.
 
@@ -232,21 +231,3 @@ pub fs := File(Libc) {
     }
 
 };
-
-pub fn create_directory_if_not_exist(dir_path: string, perm: u32) -> bool {
-    stats: stat;
-    if stat(dir_path, &stats) == 0 {
-        S_IFMT : u32 : 0xF000;
-        S_IDIR : u32 : 0x4000;
-        // @note: 0040000 octal (0x4000) is the bitmask flag for a directory
-        // 0170000 octal (0xF000) is the file type mask ()
-        file_type := stats.st_mode & S_IFMT;
-        return file_type == S_IDIR;
-    }
-
-    if mkdir(dir_path, perm) == 0 then return true;
-    return false;
-}
-
-#import "libc";
-#import "os";

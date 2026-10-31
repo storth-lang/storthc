@@ -277,6 +277,8 @@ static b8 ST_ty_is_int_like(ST_ty_t *t) {
 }
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
+static ST_expr_t *ST_dot_field(ST_expr_t *e);
+static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors);
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
@@ -497,6 +499,94 @@ static void ST_inst_info_put(ST_sema_t *se, ST_ty_t *t, ST_decl_t *tmpl, ST_tys_
     ST_ht_set(&se->inst_info, hk, (ST_ht_generic_t){.tag = info, .size = 0});
 }
 
+static ST_strings_t *ST_decl_generics(ST_decl_t *d) {
+    if (d->kind == ST_DE_STRUCT)
+        return &d->struct_.generics;
+    if (d->kind == ST_DE_TAG_UNION)
+        return &d->tag_union.generics;
+    return NULL;
+}
+
+static ST_string_t ST_instance_display_name(ST_sema_t *se, ST_string_t name, ST_tys_t args) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "%.*s(", (int)name.len, name.data);
+    ST_forrange(0, args.count) {
+        if (n < (int)sizeof(buf))
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%s", i ? ", " : "",
+                          ST_ty_cstr(se->arena, args.items[i]));
+    }
+    if (n < (int)sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, ")");
+    if (n > (int)sizeof(buf))
+        n = (int)sizeof(buf);
+    u8 *copy = ST_arena_push(se->arena, (u32)n);
+    memcpy(copy, buf, (size_t)n);
+    return (ST_string_t){.data = copy, .len = (u32)n};
+}
+
+static ST_ty_t *ST_instantiate_tag_union(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t args, u32 line,
+                                         u32 col) {
+    if (args.count != tmpl->tag_union.generics.count) {
+        ST_diag_error(&se->diag, line, col, "'" ST_sv_fmt "' expects %u type argument(s), got %u",
+                      ST_sv_args(tmpl->name), tmpl->tag_union.generics.count, args.count);
+        return NULL;
+    }
+    ST_forrange(0, args.count) if (!args.items[i]) return NULL;
+    ST_string_t mangled = ST_ty_mangle_instance_name(se->arena, tmpl->name, &args);
+    ST_ht_generic_t key = {.tag = mangled.data, .size = mangled.len};
+    ST_ht_generic_t existing = ST_ht_get(&se->instantiations, key);
+    if (existing.tag)
+        return (ST_ty_t *)existing.tag;
+
+    ST_decl_t *id = ST_decl_new(se->arena, ST_DE_TAG_UNION, line, col);
+    id->name = mangled;
+    id->file = tmpl->file;
+    id->is_pub = tmpl->is_pub;
+    id->display_name = ST_instance_display_name(se, tmpl->name, args);
+
+    ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
+    ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
+    hk->tag = mangled.data;
+    hk->size = mangled.len;
+    ST_ht_set(&se->instantiations, hk, (ST_ht_generic_t){.tag = t, .size = 0});
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, id);
+
+    ST_ht_t bindings;
+    ST_ht_init(se->arena, &bindings, 8);
+    ST_forrange(0, args.count) {
+        ST_string_t *pname = tmpl->tag_union.generics.items + i;
+        ST_ht_generic_t *bk = ST_arena_push(se->arena, sizeof(*bk));
+        bk->tag = pname->data;
+        bk->size = pname->len;
+        ST_ht_set(&bindings, bk, (ST_ht_generic_t){.tag = args.items[i], .size = 0});
+    }
+
+    ST_inst_info_put(se, t, tmpl, args);
+    ST_ht_t *save = se->generic_bindings;
+    b8 save_s = se->stamp_tyexprs;
+    se->generic_bindings = &bindings;
+    se->stamp_tyexprs = 0;
+
+    ST_forrange(0, tmpl->tag_union.variants.count) {
+        ST_variant_spec_t v = tmpl->tag_union.variants.items[i];
+        if (v.payload) {
+            ST_ty_t *pt = ST_resolve_tyexpr(se, v.payload);
+            ST_tyexpr_t *pin = ST_tyexpr_new(se->arena, ST_TE_NAME, v.payload->line, v.payload->col);
+            pin->name = v.payload->name;
+            pin->resolved = pt;
+            pin->pinned = pt != NULL;
+            v.payload = pin;
+        }
+        ST_da_append_arena(se->arena, &id->tag_union.variants, v);
+    }
+
+    ST_complete_ty(se, t);
+    se->stamp_tyexprs = save_s;
+    se->generic_bindings = save;
+    return t;
+}
+
 static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t args, u32 line,
                                       u32 col) {
     if (args.count != tmpl->struct_.generics.count) {
@@ -517,22 +607,7 @@ static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t a
     id->is_pub = tmpl->is_pub;
     id->struct_.packing = tmpl->struct_.packing;
     id->struct_.fields = tmpl->struct_.fields;
-    {
-        char buf[512];
-        int n = snprintf(buf, sizeof(buf), "%.*s(", (int)tmpl->name.len, tmpl->name.data);
-        ST_forrange(0, args.count) {
-            if (n < (int)sizeof(buf))
-                n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%s", i ? ", " : "",
-                              ST_ty_cstr(se->arena, args.items[i]));
-        }
-        if (n < (int)sizeof(buf))
-            n += snprintf(buf + n, sizeof(buf) - (size_t)n, ")");
-        if (n > (int)sizeof(buf))
-            n = (int)sizeof(buf);
-        u8 *copy = ST_arena_push(se->arena, (u32)n);
-        memcpy(copy, buf, (size_t)n);
-        id->display_name = (ST_string_t){.data = copy, .len = (u32)n};
-    }
+    id->display_name = ST_instance_display_name(se, tmpl->name, args);
 
     ST_ty_t *t = ST_ty_for_decls(&se->tys, id);
     ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
@@ -565,6 +640,13 @@ static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t a
     se->generic_bindings = save;
 
     return t;
+}
+
+static ST_ty_t *ST_instantiate_generic(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t args, u32 line,
+                                       u32 col) {
+    if (tmpl->kind == ST_DE_TAG_UNION)
+        return ST_instantiate_tag_union(se, tmpl, args, line, col);
+    return ST_instantiate_struct(se, tmpl, args, line, col);
 }
 
 static void ST_mark_trait_self_ty(ST_tyexpr_t *te, ST_string_t alias, ST_string_t generic_name) {
@@ -904,8 +986,19 @@ static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
 static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
     if (!te)
         return NULL;
+    if (te->pinned && te->resolved)
+        return te->resolved;
     switch (te->kind) {
         case ST_TE_NAME: {
+            if (!te->is_generic_param && ST_string_eq_cstr(te->name, "Self") && se->cur_fn_decl &&
+                se->cur_fn_decl->kind == ST_DE_FN && se->cur_fn_decl->fn.is_method &&
+                se->cur_fn_decl->fn.sig.params.count) {
+                ST_tyexpr_t *self_te = se->cur_fn_decl->fn.sig.params.items[0].te;
+                while (self_te && self_te->kind == ST_TE_PTR)
+                    self_te = self_te->inner;
+                if (self_te)
+                    return ST_resolve_tyexpr(se, self_te);
+            }
             if (te->is_generic_param) {
                 if (se->generic_bindings) {
                     ST_ht_generic_t k = {.tag = te->name.data, .size = te->name.len};
@@ -949,12 +1042,12 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                 ST_alias_resolve_depth--;
                 return at;
             }
-            if (se->generic_bindings && sym->decl->kind == ST_DE_STRUCT &&
-                sym->decl->struct_.generics.count) {
+            ST_strings_t *sym_generics = ST_decl_generics(sym->decl);
+            if (se->generic_bindings && sym_generics && sym_generics->count) {
                 ST_tys_t args = {0};
                 b8 all_bound = 1;
-                ST_forrange(0, sym->decl->struct_.generics.count) {
-                    ST_string_t g = sym->decl->struct_.generics.items[i];
+                ST_forrange(0, sym_generics->count) {
+                    ST_string_t g = sym_generics->items[i];
                     ST_ht_generic_t k = {.tag = g.data, .size = g.len};
                     ST_ht_generic_t found = ST_ht_get(se->generic_bindings, k);
                     if (!found.tag) {
@@ -964,7 +1057,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                     ST_da_append_arena(se->arena, &args, (ST_ty_t *)found.tag);
                 }
                 if (all_bound)
-                    return ST_instantiate_struct(se, sym->decl, args, te->line, te->col);
+                    return ST_instantiate_generic(se, sym->decl, args, te->line, te->col);
             }
             return ST_ty_for_decls(&se->tys, sym->decl);
         }
@@ -1019,7 +1112,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                                   ST_sv_args(te->name));
                 return NULL;
             }
-            if (tmpl->decl->kind != ST_DE_STRUCT) {
+            if (tmpl->decl->kind != ST_DE_STRUCT && tmpl->decl->kind != ST_DE_TAG_UNION) {
                 ST_diag_error(&se->diag, te->line, te->col,
                               "generic %s instaniation is not supported yet",
                               ST_sym_kind_str(tmpl->kind));
@@ -1035,7 +1128,7 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
             }
             if (!ok)
                 return NULL;
-            return ST_instantiate_struct(se, tmpl->decl, args, te->line, te->col);
+            return ST_instantiate_generic(se, tmpl->decl, args, te->line, te->col);
         }
         case ST_TE_ARRAY: {
             ST_ty_t *inner = ST_resolve_tyexpr(se, te->inner);
@@ -1510,7 +1603,7 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
         }
 
         case ST_TE_GENERIC_INST: {
-            if (at->kind != ST_TY_STRUCT)
+            if (at->kind != ST_TY_STRUCT && at->kind != ST_TY_TAG_UNION)
                 return 1;
             ST_inst_info_t *info = ST_inst_info_find(se, at);
             if (!info)
@@ -1662,6 +1755,7 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     inst->fn.sig = ST_clone_fn_sig(se->arena, &tmpl->fn.sig);
     inst->fn.sig.generics = (ST_strings_t){0};
     inst->fn.is_prototype = tmpl->fn.is_prototype;
+    inst->fn.is_method = tmpl->fn.is_method;
     inst->fn.body = ST_clone_body(se->arena, &tmpl->fn.body);
 
     inst->fn.has_bound_str = has_bound_str;
@@ -1757,6 +1851,11 @@ static void ST_complete_struct(ST_sema_t *se, ST_ty_t *t) {
 static void ST_complete_tag_union(ST_sema_t *se, ST_ty_t *t) {
     ST_decl_t *d = t->decl;
     u32 max = 0;
+    if (d->tag_union.generics.count) {
+        t->align = 8;
+        t->size = 8;
+        return;
+    }
     ST_forrange(0, d->tag_union.variants.count) {
         ST_variant_spec_t *v = &d->tag_union.variants.items[i];
         if (!v->payload)
@@ -1966,7 +2065,7 @@ static ST_ty_t *ST_type_unary(ST_sema_t *se, ST_expr_t *e) {
         return t->inner;
     }
     if (ST_string_eq_cstr(op, "&")) {
-        if (!ST_expr_is_addressable(se, e->unary.operand)) {
+        if (!e->unary.implicit_recv && !ST_expr_is_addressable(se, e->unary.operand)) {
             ST_expr_t *v = e->unary.operand;
             if (v->kind == ST_EX_FIELD) {
                 ST_diag_error(&se->diag, e->line, e->col,
@@ -2253,9 +2352,84 @@ static void ST_expand_pack_spread_args(ST_sema_t *se, ST_expr_t *e) {
     e->call.args = new_args;
 }
 
+static b8 ST_try_method_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    ST_expr_t *base = callee->field.base;
+    ST_string_t mname = callee->field.name;
+    ST_ty_t *bt = ST_type_expr(se, base);
+    if (!bt)
+        return 0;
+    ST_ty_t *st = bt->kind == ST_TY_PTR ? bt->inner : bt;
+    if (!st || !st->decl || st->is_trait_witness)
+        return 0;
+    if (st->kind != ST_TY_STRUCT && st->kind != ST_TY_TAG_UNION)
+        return 0;
+    ST_complete_ty(se, st);
+    if (st->kind == ST_TY_STRUCT) {
+        ST_forrange(0, st->fields.count)
+            if (ST_string_eq(st->fields.items[i].name, mname))
+                return 0;
+    } else {
+        if (ST_string_eq_cstr(mname, "kind"))
+            return 0;
+        ST_forrange(0, st->decl->tag_union.variants.count)
+            if (ST_string_eq(st->decl->tag_union.variants.items[i].name, mname))
+                return 0;
+    }
+
+    ST_inst_info_t *info = ST_inst_info_find(se, st);
+    ST_string_t tname = info ? info->tmpl->name : st->decl->name;
+    u32 total = tname.len + 2 + mname.len;
+    u8 *buf = ST_arena_push(se->arena, total);
+    memcpy(buf, tname.data, tname.len);
+    buf[tname.len] = '_';
+    buf[tname.len + 1] = '_';
+    memcpy(buf + tname.len + 2, mname.data, mname.len);
+    ST_string_t mangled = {.data = buf, .len = total};
+
+    ST_sym_t *fsym = ST_sym_find_in(&se->globals, mangled);
+    ST_sym_t *tsym = ST_sym_find_in(&se->templates, mangled);
+    ST_decl_t *md = fsym && fsym->decl ? fsym->decl : tsym ? tsym->decl : NULL;
+    if (!md || md->kind != ST_DE_FN || !md->fn.sig.params.count)
+        return 0;
+
+    ST_tyexpr_t *recv_te = md->fn.sig.params.items[0].te;
+    b8 want_ptr = recv_te && recv_te->kind == ST_TE_PTR;
+    ST_expr_t *recv = base;
+    if (want_ptr && bt->kind != ST_TY_PTR) {
+        b8 call_temp = base->kind == ST_EX_CALL || base->kind == ST_EX_STRUCT_LIT;
+        if (!call_temp && !ST_expr_is_addressable(se, base)) {
+            ST_diag_error(&se->diag, base->line, base->col,
+                          "method '" ST_sv_fmt "' takes 'self' by pointer, but the receiver is a "
+                          "value with no address; store it in a variable first",
+                          ST_sv_args(mname));
+            return 0;
+        }
+        recv = ST_expr_new(se->arena, ST_EX_UNARY, base->line, base->col);
+        recv->unary.op = ST_cstr_to_str("&");
+        recv->unary.operand = base;
+        recv->unary.implicit_recv = call_temp;
+    } else if (!want_ptr && bt->kind == ST_TY_PTR) {
+        recv = ST_expr_new(se->arena, ST_EX_UNARY, base->line, base->col);
+        recv->unary.op = ST_cstr_to_str("*");
+        recv->unary.operand = base;
+    }
+
+    callee->kind = ST_EX_IDENT;
+    callee->name = mangled;
+    ST_arg_t first = {.value = recv};
+    ST_da_append_arena(se->arena, &e->call.args, first);
+    for (u32 k = e->call.args.count - 1; k > 0; k--)
+        e->call.args.items[k] = e->call.args.items[k - 1];
+    e->call.args.items[0] = first;
+    return 1;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
+    if (callee && callee->kind == ST_EX_FIELD && callee->field.base && ST_try_method_call(se, e))
+        callee = e->call.callee;
     ST_sym_t *sym = NULL;
     ST_ty_t *fnty = NULL;
 
@@ -2440,7 +2614,10 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         }
         ST_ty_t *pt = (fnty && i < fnty->params.count) ? fnty->params.items[i] : NULL;
         ST_ty_t *at;
-        if (av->kind == ST_EX_STRUCT_LIT && av->struct_lit.is_bracket_lit) {
+        if (pt && ST_dot_field(av) && ST_lit_takes_expected(se, av, pt)) {
+            at = ST_type_struct_lit(se, av, pt);
+            av->ty = at;
+        } else if (av->kind == ST_EX_STRUCT_LIT && av->struct_lit.is_bracket_lit) {
             at = ST_type_struct_lit(se, av, pt);
             av->ty = at;
         } else {
@@ -2552,7 +2729,17 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             if (idx < tsig->params.count && idx < 64)
                 fixed_vals[idx] = arg->value;
 
-            if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty)
+            b8 literal_fits_bound = 0;
+            if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty &&
+                tsig->params.items[idx].te->is_generic_param &&
+                (arg->value->ty == se->tys.untyped_int || arg->value->ty == se->tys.untyped_float)) {
+                ST_string_t gname = tsig->params.items[idx].te->name;
+                ST_ht_generic_t gk = {.tag = gname.data, .size = gname.len};
+                ST_ty_t *gbound = (ST_ty_t *)ST_ht_get(&bindings, gk).tag;
+                literal_fits_bound = gbound && ST_ty_coerces(se, arg->value->ty, gbound);
+            }
+            if (!literal_fits_bound && idx < tsig->params.count && tsig->params.items[idx].te &&
+                arg->value->ty)
                 if (!ST_unify_tyexpr(se, tsig->params.items[idx].te, arg->value->ty, &bindings,
                                      arg->value->line, arg->value->col))
                 unify_ok = 0;
@@ -2859,6 +3046,13 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
                               ST_sv_args(e->field.name));
                 return NULL;
             }
+            if (!e->field.implicit_payload) {
+                ST_diag_error(&se->diag, e->line, e->col,
+                              "read the payload of '" ST_sv_fmt "' with a pattern: 'case " ST_sv_fmt
+                              "(name) { .. }'",
+                              ST_sv_args(e->field.name), ST_sv_args(e->field.name));
+                return NULL;
+            }
             return ST_resolve_tyexpr(se, vs->items[i].payload);
         }
         ST_diag_error(&se->diag, e->line, e->col, "'%s' has no variant '" ST_sv_fmt "'",
@@ -2995,10 +3189,127 @@ static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v) {
     return pt && pt->kind != ST_TY_VOID;
 }
 
+static ST_decl_t *ST_union_type_decl(ST_sema_t *se, ST_expr_t *e, ST_string_t *tname) {
+    if (!e || e->kind != ST_EX_IDENT)
+        return NULL;
+    if (ST_string_eq_cstr(e->name, "Self") && se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN &&
+        se->cur_fn_decl->fn.is_method) {
+        ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
+        te->name = e->name;
+        ST_ty_t *st = ST_resolve_tyexpr(se, te);
+        if (!st || st->kind != ST_TY_TAG_UNION)
+            return NULL;
+        ST_inst_info_t *info = ST_inst_info_find(se, st);
+        ST_decl_t *ud = info ? info->tmpl : st->decl;
+        *tname = ud->name;
+        return ud;
+    }
+    ST_sym_t *sym = ST_sym_find(se, e->name);
+    if (!sym || sym->kind != ST_SYM_TYPE || !sym->decl || sym->decl->kind != ST_DE_TAG_UNION)
+        return NULL;
+    *tname = e->name;
+    return sym->decl;
+}
+
+static b8 ST_variant_declares_payload(ST_variant_spec_t *v) {
+    if (!v->payload)
+        return 0;
+    return !(v->payload->kind == ST_TE_NAME && ST_string_eq_cstr(v->payload->name, "void"));
+}
+
+static ST_expr_t *ST_dot_field(ST_expr_t *e) {
+    ST_expr_t *f = e->kind == ST_EX_CALL ? e->call.callee : e;
+    if (!f || f->kind != ST_EX_FIELD || !f->field.base || f->field.base->kind != ST_EX_IDENT)
+        return NULL;
+    return ST_string_eq_cstr(f->field.base->name, ".") ? f : NULL;
+}
+
+static b8 ST_ctor_normalize(ST_sema_t *se, ST_expr_t *e, b8 allow_bare, ST_ty_t *expect) {
+    ST_expr_t *dot = ST_dot_field(e);
+    if (dot) {
+        if (expect && expect->kind == ST_TY_ENUM && expect->decl) {
+            dot->field.base->name = expect->decl->name;
+            return 0;
+        }
+        if (!expect || expect->kind != ST_TY_TAG_UNION || !expect->decl)
+            return 0;
+        ST_inst_info_t *einfo = ST_inst_info_find(se, expect);
+        dot->field.base->name = einfo ? einfo->tmpl->name : expect->decl->name;
+        allow_bare = 1;
+    }
+    ST_expr_t *fld;
+    b8 is_call = 0;
+    if (e->kind == ST_EX_CALL) {
+        if (!e->call.callee || e->call.callee->kind != ST_EX_FIELD)
+            return 0;
+        fld = e->call.callee;
+        is_call = 1;
+    } else if (e->kind == ST_EX_FIELD && allow_bare) {
+        fld = e;
+    } else {
+        return 0;
+    }
+    ST_string_t tname = {0};
+    ST_decl_t *ud = ST_union_type_decl(se, fld->field.base, &tname);
+    if (!ud)
+        return 0;
+    ST_variant_spec_t *variant = NULL;
+    ST_forrange(0, ud->tag_union.variants.count)
+        if (ST_string_eq(ud->tag_union.variants.items[i].name, fld->field.name))
+            variant = &ud->tag_union.variants.items[i];
+    if (!variant)
+        return 0;
+    b8 has_payload = ST_variant_declares_payload(variant);
+    if (!is_call && has_payload)
+        return 0;
+    u32 nargs = is_call ? e->call.args.count : 0;
+    if (nargs > (has_payload ? 1u : 0u))
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "variant '" ST_sv_fmt "' of '" ST_sv_fmt "' %s, got %u",
+                      ST_sv_args(variant->name), ST_sv_args(ST_decl_display_name(ud)),
+                      has_payload ? "takes exactly one payload value" : "takes no payload", nargs);
+    ST_string_t vname = fld->field.name;
+    ST_expr_t *payload = has_payload && nargs ? e->call.args.items[0].value : NULL;
+    ST_expr_t *vid = ST_expr_new(se->arena, ST_EX_IDENT, fld->line, fld->col);
+    vid->name = vname;
+    u32 line = e->line, col = e->col;
+    e->kind = ST_EX_STRUCT_LIT;
+    memset(&e->struct_lit, 0, sizeof(e->struct_lit));
+    e->struct_lit.type_name = tname;
+    e->struct_lit.synth_variant = 1;
+    ST_field_init_t first = {.value = vid, .line = line, .col = col};
+    ST_da_append_arena(se->arena, &e->struct_lit.inits, first);
+    if (payload) {
+        ST_field_init_t second = {.value = payload, .line = payload->line, .col = payload->col};
+        ST_da_append_arena(se->arena, &e->struct_lit.inits, second);
+    }
+    return 1;
+}
+
+static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
+    b8 expects_union = expect && expect->kind == ST_TY_TAG_UNION;
+    ST_ctor_normalize(se, e, expects_union, expect);
+    if (e->kind != ST_EX_STRUCT_LIT)
+        return 0;
+    if (!e->struct_lit.type_name.len)
+        return 1;
+    if (e->struct_lit.generic_args.count || !expects_union)
+        return 0;
+    ST_sym_t *tmpl = ST_sym_find_in(&se->templates, e->struct_lit.type_name);
+    return tmpl && tmpl->decl && tmpl->decl->kind == ST_DE_TAG_UNION;
+}
+
 static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
     ST_complete_ty(se, ut);
     u32 n = e->struct_lit.inits.count;
     ST_string_t uname = ST_decl_display_name(ut->decl);
+    if (!e->struct_lit.synth_variant) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' values are written 'Type.Variant(payload)' or "
+                      "'.Variant(payload)', not as a brace literal",
+                      ST_sv_args(uname));
+        return NULL;
+    }
     if (n == 0 || n > 2) {
         ST_diag_error(&se->diag, e->line, e->col,
                       "'" ST_sv_fmt "' literal needs a variant name and, if that variant "
@@ -3036,7 +3347,7 @@ static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
     }
     if (has_payload && n != 2) {
         ST_diag_error(&se->diag, e->line, e->col,
-                      "'" ST_sv_fmt "' needs a payload value: '" ST_sv_fmt "{ " ST_sv_fmt ", .. }'",
+                      "'" ST_sv_fmt "' needs a payload value: '" ST_sv_fmt "." ST_sv_fmt "(value)'",
                       ST_sv_args(vname), ST_sv_args(uname), ST_sv_args(vname));
         return NULL;
     }
@@ -3044,7 +3355,7 @@ static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
         ST_ty_t *pt = ST_resolve_tyexpr(se, variant->payload);
         ST_field_init_t *pfi = &e->struct_lit.inits.items[1];
         ST_ty_t *vt;
-        if (pfi->value->kind == ST_EX_STRUCT_LIT && !pfi->value->struct_lit.type_name.len && pt)
+        if (pt && ST_lit_takes_expected(se, pfi->value, pt))
             vt = ST_type_struct_lit(se, pfi->value, pt);
         else
             vt = ST_type_expr(se, pfi->value);
@@ -3055,6 +3366,47 @@ static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
     }
     e->ty = ut;
     return ut;
+}
+
+static ST_ty_t *ST_infer_union_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) {
+    ST_ht_t bindings;
+    ST_ht_init(se->arena, &bindings, 8);
+    if (e->struct_lit.inits.count == 2 && e->struct_lit.inits.items[0].value->kind == ST_EX_IDENT) {
+        ST_string_t vname = e->struct_lit.inits.items[0].value->name;
+        ST_expr_t *pv = e->struct_lit.inits.items[1].value;
+        b8 untyped_lit = pv->kind == ST_EX_STRUCT_LIT && !pv->struct_lit.type_name.len;
+        ST_forrange(0, td->tag_union.variants.count) {
+            ST_variant_spec_t *v = &td->tag_union.variants.items[i];
+            if (!ST_string_eq(v->name, vname) || !v->payload || untyped_lit)
+                continue;
+            ST_ty_t *vt = ST_type_expr(se, pv);
+            if (vt)
+                ST_unify_tyexpr(se, v->payload, vt, &bindings, pv->line, pv->col);
+            break;
+        }
+    }
+
+    ST_tys_t args = {0};
+    ST_forrange(0, td->tag_union.generics.count) {
+        ST_string_t g = td->tag_union.generics.items[i];
+        ST_ht_generic_t k = {.tag = g.data, .size = g.len};
+        ST_ty_t *bound = (ST_ty_t *)ST_ht_get(&bindings, k).tag;
+        if (!bound) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "could not infer generic parameter '$" ST_sv_fmt
+                          "' for tag_union literal '" ST_sv_fmt "'; spell it out: " ST_sv_fmt
+                          "(..){ .. }",
+                          ST_sv_args(g), ST_sv_args(td->name), ST_sv_args(td->name));
+            ST_diag_note_in_file(se, td->file, td->line, td->col,
+                                 "'" ST_sv_fmt "' is declared here", ST_sv_args(td->name));
+            return NULL;
+        }
+        ST_da_append_arena(se->arena, &args, bound);
+    }
+    ST_ty_t *ut = ST_instantiate_tag_union(se, td, args, e->line, e->col);
+    if (!ut)
+        return NULL;
+    return ST_type_union_lit(se, e, ut);
 }
 
 static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
@@ -3115,9 +3467,10 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         : NULL;
 
     b8 is_struct_lit = lit_tmpl && lit_tmpl->decl && lit_tmpl->decl->kind == ST_DE_STRUCT;
+    b8 is_union_lit = lit_tmpl && lit_tmpl->decl && lit_tmpl->decl->kind == ST_DE_TAG_UNION;
 
     if (e->struct_lit.type_name.len && e->struct_lit.generic_args.count) {
-        if (!is_struct_lit)
+        if (!is_struct_lit && !is_union_lit)
             ST_diag_error(&se->diag, e->line, e->col, "'" ST_sv_fmt " ' is not a generic type",
                           ST_sv_args(e->struct_lit.type_name));
         else {
@@ -3129,12 +3482,22 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                     ok = 0;
                 ST_da_append_arena(se->arena, &args, at);
             }
+            if (ok && is_union_lit) {
+                ST_ty_t *ut = ST_instantiate_tag_union(se, lit_tmpl->decl, args, e->line, e->col);
+                return ut ? ST_type_union_lit(se, e, ut) : NULL;
+            }
             if (ok)
                 t = ST_instantiate_struct(se, lit_tmpl->decl, args, e->line, e->col);
         }
 
     } else if (is_struct_lit) {
         t = ST_infer_struct_lit(se, e, lit_tmpl->decl);
+    } else if (is_union_lit) {
+        ST_inst_info_t *expect_info =
+            expect && expect->kind == ST_TY_TAG_UNION ? ST_inst_info_find(se, expect) : NULL;
+        if (expect_info && expect_info->tmpl == lit_tmpl->decl)
+            return ST_type_union_lit(se, e, expect);
+        return ST_infer_union_lit(se, e, lit_tmpl->decl);
     } else if (ST_string_eq_cstr(e->struct_lit.type_name, "string")) {
         ST_expr_t *ptr_e = NULL, *len_e = NULL;
         ST_forrange(0, e->struct_lit.inits.count) {
@@ -3176,6 +3539,8 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         else
             t = ST_ty_for_decls(&se->tys, sym->decl);
     } else if (expect && expect->kind == ST_TY_TAG_UNION) {
+        if (expect->decl->tag_union.generics.count)
+            return ST_infer_union_lit(se, e, expect->decl);
         return ST_type_union_lit(se, e, expect);
     } else if (expect && expect->kind == ST_TY_STRUCT && expect->decl &&
                expect->decl->struct_.generics.count) {
@@ -3206,7 +3571,7 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                 continue;
             }
             ST_ty_t *vt;
-            if (fi->value->kind == ST_EX_STRUCT_LIT && !fi->value->struct_lit.type_name.len) {
+            if (ST_lit_takes_expected(se, fi->value, ety)) {
                 vt = ST_type_struct_lit(se, fi->value, ety);
                 fi->value->ty = vt;
             } else {
@@ -3283,7 +3648,7 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         }
 
         ST_ty_t *vt;
-        if (fi->value->kind == ST_EX_STRUCT_LIT && !fi->value->struct_lit.type_name.len && ft) {
+        if (ft && ST_lit_takes_expected(se, fi->value, ft)) {
             vt = ST_type_struct_lit(se, fi->value, ft);
             fi->value->ty = vt;
         } else {
@@ -3316,6 +3681,16 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
     if (!e)
         return NULL;
+    ST_expr_t *dot = ST_dot_field(e);
+    if (dot) {
+        ST_diag_error(&se->diag, dot->line, dot->col,
+                      "cannot infer the type of '." ST_sv_fmt "' here; it needs a destination of a "
+                      "known tag_union or enum type (a typed declaration, assignment, return "
+                      "value or struct field)",
+                      ST_sv_args(dot->field.name));
+        e->ty = NULL;
+        return NULL;
+    }
     if (se->expr_depth >= ST_MAX_EXPR_DEPTH) {
         ST_diag_error(&se->diag, e->line, e->col, "expression nested too deeply");
         e->ty = NULL;
@@ -3355,6 +3730,10 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
         t = ST_type_binary(se, e);
         break;
         case ST_EX_CALL: {
+            if (ST_ctor_normalize(se, e, 0, NULL)) {
+                t = ST_type_struct_lit(se, e, NULL);
+                break;
+            }
             ST_tys_t *rets = ST_type_call(se, e);
             if (!rets)
                 break;
@@ -3662,8 +4041,9 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
     ST_ty_t *dt = NULL;
     if (s->decl.te && !infer_count)
         dt = ST_resolve_tyexpr(se, s->decl.te);
-    b8 dt_is_generic_struct = dt && dt->kind == ST_TY_STRUCT && dt->decl &&
-        dt->decl->struct_.generics.count > 0;
+    b8 dt_is_generic_struct = dt && dt->decl &&
+        ((dt->kind == ST_TY_STRUCT && dt->decl->struct_.generics.count > 0) ||
+         (dt->kind == ST_TY_TAG_UNION && dt->decl->tag_union.generics.count > 0));
     b8 infers_from_lit = dt_is_generic_struct && s->decl.init &&
         s->decl.init->kind == ST_EX_STRUCT_LIT &&
         !s->decl.init->struct_lit.type_name.len;
@@ -3685,8 +4065,7 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
 
     ST_ty_t *it = NULL;
     if (s->decl.init) {
-        if (s->decl.init->kind == ST_EX_STRUCT_LIT && !s->decl.init->struct_lit.type_name.len &&
-            dt) {
+        if (dt && ST_lit_takes_expected(se, s->decl.init, dt)) {
             it = ST_type_struct_lit(se, s->decl.init, dt);
             s->decl.init->ty = it;
             if (infers_from_lit && it)
@@ -3786,7 +4165,7 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
     ST_ty_t *lt = ST_type_expr(se, s->assign.lhs);
     ST_ty_t *rt = {0};
     ST_expr_t *rv = s->assign.rhs;
-    if (rv->kind == ST_EX_STRUCT_LIT && !rv->struct_lit.type_name.len && lt) {
+    if (lt && ST_lit_takes_expected(se, rv, lt)) {
         rt = ST_type_struct_lit(se, rv, lt);
         rv->ty = rt;
     } else {
@@ -3930,7 +4309,7 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
         ST_expr_t *rv = s->ret.values.items[i];
         ST_ty_t *rt = (i < want && se->cur_rets) ? se->cur_rets->items[i] : NULL;
         ST_ty_t *t;
-        if (rv->kind == ST_EX_STRUCT_LIT && !rv->struct_lit.type_name.len && rt) {
+        if (rt && ST_lit_takes_expected(se, rv, rt)) {
             t = ST_type_struct_lit(se, rv, rt);
             rv->ty = t;
         } else
@@ -4306,6 +4685,7 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
                 ST_expr_t *access = ST_expr_new(se->arena, ST_EX_FIELD, s->line, s->col);
                 access->field.base = ST_clone_expr(se->arena, operand);
                 access->field.name = vs->items[i].name;
+                access->field.implicit_payload = 1;
 
                 ST_expr_t idx_lit = {0};
                 idx_lit.kind = ST_EX_INT;
@@ -4600,6 +4980,114 @@ static void ST_check_comptime_for(ST_sema_t *se, ST_stmt_t *s) {
     ST_check_stmt(se, s);
 }
 
+static b8 ST_is_simple_place(ST_expr_t *e) {
+    if (e->kind == ST_EX_IDENT)
+        return 1;
+    if (e->kind == ST_EX_UNARY && ST_string_eq_cstr(e->unary.op, "*"))
+        return ST_is_simple_place(e->unary.operand);
+    if (e->kind == ST_EX_FIELD)
+        return ST_is_simple_place(e->field.base);
+    return 0;
+}
+
+static b8 ST_prepare_union_switch(ST_sema_t *se, ST_stmt_t *s, ST_ty_t **ctp) {
+    ST_ty_t *ct = *ctp;
+    if (!ct)
+        return 0;
+    if (ct->kind == ST_TY_PTR && ct->inner && ct->inner->kind == ST_TY_TAG_UNION) {
+        ST_expr_t *d = ST_expr_new(se->arena, ST_EX_UNARY, s->switch_.cond->line, s->switch_.cond->col);
+        d->unary.op = ST_cstr_to_str("*");
+        d->unary.operand = s->switch_.cond;
+        s->switch_.cond = d;
+        ct = ST_type_expr(se, d);
+        *ctp = ct;
+    }
+    if (!ct || ct->kind != ST_TY_TAG_UNION)
+        return 0;
+
+    b8 has_bind = 0;
+    ST_forrange(0, s->switch_.cases.count) {
+        ST_case_t *c = &s->switch_.cases.items[i];
+        if (c->values.count == 1 && c->values.items[0]->kind == ST_EX_CALL)
+            has_bind = 1;
+    }
+    if (!has_bind)
+        return 0;
+
+    if (!ST_is_simple_place(s->switch_.cond)) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "__sw_%u_%u", s->line, s->col);
+        u8 *copy = ST_arena_push(se->arena, (u32)n);
+        memcpy(copy, buf, (size_t)n);
+        ST_string_t tmp = {.data = copy, .len = (u32)n};
+
+        ST_stmt_t *decl = ST_stmt_new(se->arena, ST_ST_DECL, s->line, s->col);
+        decl->decl.name = tmp;
+        decl->decl.init = s->switch_.cond;
+        ST_stmt_t *sw = ST_stmt_new(se->arena, ST_ST_SWITCH, s->line, s->col);
+        sw->switch_ = s->switch_;
+        sw->switch_.cond = ST_expr_new(se->arena, ST_EX_IDENT, s->line, s->col);
+        sw->switch_.cond->name = tmp;
+        ST_stmts_t blk = {0};
+        ST_da_append_arena(se->arena, &blk, decl);
+        ST_da_append_arena(se->arena, &blk, sw);
+        ST_rewrite_as_block(s, blk);
+        ST_check_stmt(se, s);
+        return 1;
+    }
+
+    ST_complete_ty(se, ct);
+    ST_forrange(0, s->switch_.cases.count) {
+        ST_case_t *c = &s->switch_.cases.items[i];
+        if (c->values.count != 1)
+            continue;
+        ST_expr_t *pv = c->values.items[0];
+        ST_expr_t *bind_expr = NULL;
+        if (pv->kind == ST_EX_CALL) {
+            if (pv->call.args.count != 1 || pv->call.args.items[0].value->kind != ST_EX_IDENT) {
+                ST_diag_error(&se->diag, pv->line, pv->col,
+                              "a variant pattern binds its payload to one name, e.g. "
+                              "'case Some(v)'");
+                continue;
+            }
+            bind_expr = pv->call.args.items[0].value;
+            pv = pv->call.callee;
+        }
+        if (pv->kind == ST_EX_FIELD) {
+            ST_expr_t *id = ST_expr_new(se->arena, ST_EX_IDENT, pv->line, pv->col);
+            id->name = pv->field.name;
+            pv = id;
+        }
+        c->values.items[0] = pv;
+        if (!bind_expr || ST_string_eq_cstr(bind_expr->name, "_") || pv->kind != ST_EX_IDENT)
+            continue;
+        ST_variant_spec_t *variant = NULL;
+        ST_forrange(0, ct->decl->tag_union.variants.count)
+            if (ST_string_eq(ct->decl->tag_union.variants.items[i].name, pv->name))
+                variant = &ct->decl->tag_union.variants.items[i];
+        if (!variant)
+            continue;
+        if (!ST_variant_has_payload(se, variant)) {
+            ST_diag_error(&se->diag, bind_expr->line, bind_expr->col,
+                          "variant '" ST_sv_fmt "' has no payload to bind",
+                          ST_sv_args(variant->name));
+            continue;
+        }
+        ST_expr_t *access = ST_expr_new(se->arena, ST_EX_FIELD, bind_expr->line, bind_expr->col);
+        access->field.base = ST_clone_expr(se->arena, s->switch_.cond);
+        access->field.name = variant->name;
+        access->field.implicit_payload = 1;
+        ST_stmt_t *bd = ST_stmt_new(se->arena, ST_ST_DECL, bind_expr->line, bind_expr->col);
+        bd->decl.name = bind_expr->name;
+        bd->decl.init = access;
+        ST_da_append_arena(se->arena, &c->body, bd);
+        for (u32 k = c->body.count - 1; k > 0; k--)
+            c->body.items[k] = c->body.items[k - 1];
+        c->body.items[0] = bd;
+    }
+    return 0;
+}
+
 static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
     if (!s)
         return;
@@ -4637,6 +5125,8 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 break;
             }
             ST_ty_t *ct = ST_type_expr(se, s->switch_.cond);
+            if (ST_prepare_union_switch(se, s, &ct))
+                break;
             if (ct && ct->kind == ST_TY_TAG_UNION) {
                 ST_complete_ty(se, ct);
                 ST_forrange(0, s->switch_.cases.count) {
@@ -5020,7 +5510,8 @@ static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
             continue;
         ST_string_t save_diag_file, save_diag_src;
         ST_diag_switch_file(se, d->file, &save_diag_file, &save_diag_src);
-        b8 is_generic_struct = d->kind == ST_DE_STRUCT && d->struct_.generics.count;
+        ST_strings_t *decl_generics = ST_decl_generics(d);
+        b8 is_generic_struct = decl_generics && decl_generics->count;
         b8 is_generic_fn = d->kind == ST_DE_FN && d->fn.sig.generics.count;
 
         if (is_generic_struct || is_generic_fn) {
@@ -5279,6 +5770,8 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
             ST_complete_ty(se, sym->t);
             break;
             case ST_DE_TAG_UNION:
+            if (d->tag_union.generics.count)
+                break;
             ST_complete_ty(se, sym->t);
             break;
             case ST_DE_ENUM:

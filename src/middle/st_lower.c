@@ -1436,6 +1436,10 @@ static ST_ir_inst_t *ST_lower_addr_of(ST_lower_ctx_t *c, ST_expr_t *e, ST_ty_t *
         return bind->slot;
     }
 
+    if (v->kind == ST_EX_CALL && v->ty &&
+        (v->ty->kind == ST_TY_STRUCT || v->ty->kind == ST_TY_TAG_UNION))
+        return ST_lower_expr(c, v);
+
     if (v->kind == ST_EX_FIELD) {
         ST_ir_inst_t *a = ST_lower_lvalue_addr(c, v);
         return a ? a : ST_ir_const_int(c->cur, ptr_ty, 0);
