@@ -1182,7 +1182,7 @@ static void ST_ct_compile_expr(ST_ct_compiler_t *cc, ST_expr_t *e) {
                 name = "struct"; // dispatchable category, not e.g. "Foo". See #fields() for the
                                  // per-field type, which is what actually varies per struct
             else if (t->kind == ST_TY_TAG_UNION)
-                name = "tag_union";
+                name = ST_keyword_names[ST_kunion];
             else if (t->kind == ST_TY_ARRAY)
                 name = "array"; // fixed-size [N]T. #fields() gives indexed element access
             else if (t->kind == ST_TY_DYN_ARRAY)

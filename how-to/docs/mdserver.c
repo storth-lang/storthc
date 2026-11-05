@@ -134,7 +134,7 @@ static void html_escape(FILE *out, const char *s) {
 }
 
 static const char *storth_keywords[] = { "fn",        "pub",    "struct",  "enum",  "enum_flag",
-                                         "tag_union", "extern", "using",   "if",    "else",
+                                         "union",     "extern", "using",   "if",    "else",
                                          "while",     "for",    "return",  "break", "continue",
                                          "defer",     "case",   "default", "goto",  "label",
                                          "then",      "static", "const",   NULL };

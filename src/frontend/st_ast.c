@@ -474,7 +474,7 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
             break;
         }
         case ST_DE_ENUM:
-        fprintf(out, "%s " ST_sv_fmt "\n", d->enum_.is_flag ? "enum_flag" : "enum",
+        fprintf(out, "%s " ST_sv_fmt "\n", d->enum_.is_flag ? ST_keyword_names[ST_kenum_flag] : ST_keyword_names[ST_kenum],
                 ST_sv_args(d->name));
         ST_forrange(0, d->enum_.variants.count) {
             ST_variant_spec_t *v = &d->enum_.variants.items[i];
@@ -485,7 +485,7 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
         }
         break;
         case ST_DE_TAG_UNION:
-        fprintf(out, "tag_union " ST_sv_fmt "\n", ST_sv_args(d->name));
+        fprintf(out, "%s " ST_sv_fmt "\n", ST_keyword_names[ST_kunion], ST_sv_args(d->name));
         ST_forrange(0, d->tag_union.variants.count) {
             ST_variant_spec_t *v = &d->tag_union.variants.items[i];
             ST_indent(out, depth + 1);

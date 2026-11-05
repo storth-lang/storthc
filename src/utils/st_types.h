@@ -21,7 +21,7 @@
     ST_KEYWORD(ST_knot, "not")                                                                     \
     ST_KEYWORD(ST_kdefault, "default")                                                             \
     ST_KEYWORD(ST_kenum_flag, "enum_flag")                                                         \
-    ST_KEYWORD(ST_ktag, "tag_union")                                                               \
+    ST_KEYWORD(ST_kunion, "union")                                                                 \
     ST_KEYWORD(ST_kcase, "case")                                                                   \
     ST_KEYWORD(ST_kreturn, "return")                                                               \
     ST_KEYWORD(ST_kusing, "using")                                                                 \

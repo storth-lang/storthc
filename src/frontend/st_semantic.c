@@ -249,6 +249,20 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
     return 0;
 }
 
+static void ST_retype_untyped(ST_expr_t *e, ST_ty_t *to) {
+    if (!e || !e->ty)
+        return;
+    if (e->ty->kind != ST_TY_UNTYPED_INT && e->ty->kind != ST_TY_UNTYPED_FLOAT)
+        return;
+    e->ty = to;
+    if (e->kind == ST_EX_UNARY) {
+        ST_retype_untyped(e->unary.operand, to);
+    } else if (e->kind == ST_EX_BINARY) {
+        ST_retype_untyped(e->bin.l, to);
+        ST_retype_untyped(e->bin.r, to);
+    }
+}
+
 static ST_ty_t *ST_ty_num_unify(ST_sema_t *se, ST_ty_t *a, ST_ty_t *b) {
     if (a->kind == ST_TY_ENUM && ST_ty_is_numeric(b))
         return b;
@@ -280,6 +294,8 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
 static ST_expr_t *ST_dot_field(ST_expr_t *e);
 static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors);
+static ST_ct_vm_t *ST_ct_vm_acquire(ST_sema_t *se);
+static void ST_ct_vm_release(ST_sema_t *se, ST_ct_vm_t *vm);
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
@@ -2901,6 +2917,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                               "argument '" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(sig->params.items[idx].name), ST_tstr(se, pt),
                               ST_tstr(se, at));
+            else if (pt && at && (pt->kind == ST_TY_INT || pt->kind == ST_TY_FLOAT))
+                ST_retype_untyped(arg->value, pt);
             if (idx < sig->params.count)
                 ST_check_const_param(se, &sig->params.items[idx], arg);
         }
@@ -2955,7 +2973,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
                                      "'" ST_sv_fmt "' is declared here",
                                      ST_sv_args(ST_sym_display_name(sym)));
-        }
+        } else if (pt && at && (pt->kind == ST_TY_INT || pt->kind == ST_TY_FLOAT))
+            ST_retype_untyped(arg->value, pt);
         if (sig && i < sig->params.count)
             ST_check_const_param(se, &sig->params.items[i], arg);
     }
@@ -2964,9 +2983,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             ST_arg_t *arg = &e->call.args.items[i];
             ST_arg_extern_decay(se, sym, NULL, arg);
             if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_INT)
-                arg->value->ty = se->tys.prim[ST_ti32];
+                ST_retype_untyped(arg->value, se->tys.prim[ST_ti32]);
             else if (arg->value->ty && arg->value->ty->kind == ST_TY_UNTYPED_FLOAT)
-                arg->value->ty = se->tys.prim[ST_tf32];
+                ST_retype_untyped(arg->value, se->tys.prim[ST_tf64]);
         }
     }
     if (fnty->has_any_pack) {
@@ -3448,9 +3467,9 @@ static ST_ty_t *ST_infer_union_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) {
         if (!bound) {
             ST_diag_error(&se->diag, e->line, e->col,
                           "could not infer generic parameter '$" ST_sv_fmt
-                          "' for tag_union literal '" ST_sv_fmt "'; spell it out: " ST_sv_fmt
+                          "' for %s literal '" ST_sv_fmt "'; spell it out: " ST_sv_fmt
                           "(..){ .. }",
-                          ST_sv_args(g), ST_sv_args(td->name), ST_sv_args(td->name));
+                          ST_sv_args(g), ST_keyword_names[ST_kunion], ST_sv_args(td->name), ST_sv_args(td->name));
             ST_diag_note_in_file(se, td->file, td->line, td->col,
                                  "'" ST_sv_fmt "' is declared here", ST_sv_args(td->name));
             return NULL;
@@ -3736,7 +3755,79 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
     return t;
 }
 
+static ST_ct_vm_t *ST_ct_vm_acquire(ST_sema_t *se) {
+    ST_ct_vm_t *vm;
+    if (se->ct_vm && !se->ct_vm_busy) {
+        vm = se->ct_vm;
+        se->ct_vm_busy = 1;
+    } else {
+        vm = ST_arena_push(se->arena, sizeof(*vm));
+        if (!se->ct_vm) {
+            se->ct_vm = vm;
+            se->ct_vm_busy = 1;
+        }
+    }
+    ST_ct_vm_init(vm);
+    return vm;
+}
+
+static void ST_ct_vm_release(ST_sema_t *se, ST_ct_vm_t *vm) {
+    if (vm == se->ct_vm)
+        se->ct_vm_busy = 0;
+}
+
 #define ST_MAX_EXPR_DEPTH 512
+
+static ST_ty_t *ST_type_comp_error(ST_sema_t *se, ST_expr_t *e) {
+    ST_exprs_t msg_args = e->comp_error.args;
+    b8 at_caller = 0;
+    if (msg_args.count >= 1 && msg_args.items[0]->kind == ST_EX_IDENT &&
+        (ST_string_eq_cstr(msg_args.items[0]->name, "caller") ||
+         ST_string_eq_cstr(msg_args.items[0]->name, "callee"))) {
+        at_caller = ST_string_eq_cstr(msg_args.items[0]->name, "caller");
+        msg_args.items++;
+        msg_args.count--;
+    }
+
+    ST_expr_t trimmed = *e;
+    trimmed.comp_error.args = msg_args;
+
+    b8 have_call_site =
+        at_caller && se->cur_fn_decl && se->cur_fn_decl->fn.has_call_site;
+    u32 report_line = have_call_site ? se->cur_fn_decl->fn.call_line : e->line;
+    u32 report_col = have_call_site ? se->cur_fn_decl->fn.call_col : e->col;
+    ST_string_t save_file, save_src;
+    if (have_call_site)
+        ST_diag_switch_file(se, se->cur_fn_decl->fn.call_file, &save_file, &save_src);
+
+    ST_ct_chunk_t chunk;
+    ST_ct_chunk_init(se->arena, &chunk);
+    ST_ct_compiler_t cc;
+    ST_ct_compiler_init(&cc, se->arena, &chunk);
+    ST_ct_compile_expr_return(&cc, &trimmed);
+    if (cc.failed) {
+        ST_diag_error(&se->diag, have_call_site ? report_line : cc.err_line,
+                      have_call_site ? report_col : cc.err_col, "%s", cc.err_msg);
+    } else {
+        ST_ct_vm_t *vm = ST_ct_vm_acquire(se);
+        ST_ct_val_t out;
+        ST_ct_status_t st = ST_ct_run(vm, &chunk, &out);
+        if (st == ST_CT_ERR_COMPTIME)
+            ST_diag_error(&se->diag, have_call_site ? report_line : vm->err_line,
+                          report_col, "%s", vm->err_msg);
+        else if (st == ST_CT_ERR_RUNTIME)
+            ST_diag_error(&se->diag, report_line, report_col,
+                          "internal: comptime VM error: %s", vm->err_msg);
+        ST_ct_vm_release(se, vm);
+    }
+
+    if (have_call_site)
+        ST_diag_restore_file(se, save_file, save_src);
+
+    se->hit_comp_error = 1;
+
+    return se->tys.prim[ST_tvoid];
+}
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
     if (!e)
@@ -3745,9 +3836,9 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
     if (dot) {
         ST_diag_error(&se->diag, dot->line, dot->col,
                       "cannot infer the type of '." ST_sv_fmt "' here; it needs a destination of a "
-                      "known tag_union or enum type (a typed declaration, assignment, return "
+                      "known %s or enum type (a typed declaration, assignment, return "
                       "value or struct field)",
-                      ST_sv_args(dot->field.name));
+                      ST_sv_args(dot->field.name), ST_keyword_names[ST_kunion]);
         e->ty = NULL;
         return NULL;
     }
@@ -3908,57 +3999,9 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_ASM:
         t = se->tys.untyped_int;
         break;
-        case ST_EX_COMP_ERROR: {
-            ST_exprs_t msg_args = e->comp_error.args;
-            b8 at_caller = 0;
-            if (msg_args.count >= 1 && msg_args.items[0]->kind == ST_EX_IDENT &&
-                (ST_string_eq_cstr(msg_args.items[0]->name, "caller") ||
-                 ST_string_eq_cstr(msg_args.items[0]->name, "callee"))) {
-                at_caller = ST_string_eq_cstr(msg_args.items[0]->name, "caller");
-                msg_args.items++;
-                msg_args.count--;
-            }
-
-            ST_expr_t trimmed = *e;
-            trimmed.comp_error.args = msg_args;
-
-            b8 have_call_site =
-                at_caller && se->cur_fn_decl && se->cur_fn_decl->fn.has_call_site;
-            u32 report_line = have_call_site ? se->cur_fn_decl->fn.call_line : e->line;
-            u32 report_col = have_call_site ? se->cur_fn_decl->fn.call_col : e->col;
-            ST_string_t save_file, save_src;
-            if (have_call_site)
-                ST_diag_switch_file(se, se->cur_fn_decl->fn.call_file, &save_file, &save_src);
-
-            ST_ct_chunk_t chunk;
-            ST_ct_chunk_init(se->arena, &chunk);
-            ST_ct_compiler_t cc;
-            ST_ct_compiler_init(&cc, se->arena, &chunk);
-            ST_ct_compile_expr_return(&cc, &trimmed);
-            if (cc.failed) {
-                ST_diag_error(&se->diag, have_call_site ? report_line : cc.err_line,
-                              have_call_site ? report_col : cc.err_col, "%s", cc.err_msg);
-            } else {
-                ST_ct_vm_t vm;
-                ST_ct_vm_init(&vm);
-                ST_ct_val_t out;
-                ST_ct_status_t st = ST_ct_run(&vm, &chunk, &out);
-                if (st == ST_CT_ERR_COMPTIME)
-                    ST_diag_error(&se->diag, have_call_site ? report_line : vm.err_line,
-                                  report_col, "%s", vm.err_msg);
-                else if (st == ST_CT_ERR_RUNTIME)
-                    ST_diag_error(&se->diag, report_line, report_col,
-                                  "internal: comptime VM error: %s", vm.err_msg);
-            }
-
-            if (have_call_site)
-                ST_diag_restore_file(se, save_file, save_src);
-
-            se->hit_comp_error = 1;
-
-            t = se->tys.prim[ST_tvoid];
-            break;
-        }
+        case ST_EX_COMP_ERROR:
+        t = ST_type_comp_error(se, e);
+        break;
         case ST_EX_PACK_FOLD: {
             if (!se->has_pack || !ST_string_eq(e->pack_fold.pack_name, se->cur_pack_name)) {
                 ST_diag_error(&se->diag, e->line, e->col,
@@ -4435,20 +4478,22 @@ static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 repo
             ST_diag_error(&se->diag, cc.err_line, cc.err_col, "%s", cc.err_msg);
         return 0;
     }
-    ST_ct_vm_t vm;
-    ST_ct_vm_init(&vm);
-    ST_ct_status_t st = ST_ct_run(&vm, &chunk, out);
+    ST_ct_vm_t *vm = ST_ct_vm_acquire(se);
+    ST_ct_status_t st = ST_ct_run(vm, &chunk, out);
     if (st == ST_CT_ERR_COMPTIME) {
         if (report_errors)
-            ST_diag_error(&se->diag, vm.err_line, e->col, "%s", vm.err_msg);
+            ST_diag_error(&se->diag, vm->err_line, e->col, "%s", vm->err_msg);
+        ST_ct_vm_release(se, vm);
         return 0;
     }
     if (st == ST_CT_ERR_RUNTIME) {
         if (report_errors)
             ST_diag_error(&se->diag, e->line, e->col, "internal: comptime VM error: %s",
-                          vm.err_msg);
+                          vm->err_msg);
+        ST_ct_vm_release(se, vm);
         return 0;
     }
+    ST_ct_vm_release(se, vm);
     return 1;
 }
 
@@ -4554,20 +4599,20 @@ static void ST_sema_run_comptime_blocks(ST_sema_t *se) {
             continue;
         }
 
-        ST_ct_vm_t vm;
-        ST_ct_vm_init(&vm);
+        ST_ct_vm_t *vm = ST_ct_vm_acquire(se);
         ST_ct_val_t result = {0};
-        ST_ct_status_t vst = ST_ct_run(&vm, &chunk, &result);
+        ST_ct_status_t vst = ST_ct_run(vm, &chunk, &result);
         if (vst != ST_CT_OK) {
-            ST_string_t vfile = ST_ct_chunk_file_at(&chunk, vm.err_ip);
+            ST_string_t vfile = ST_ct_chunk_file_at(&chunk, vm->err_ip);
             if (!vfile.len)
                 vfile = se->diag.file;
             if (vst == ST_CT_ERR_COMPTIME)
-                ST_diag_error_in_file(se, vfile, vm.err_line, s->col, "%s", vm.err_msg);
+                ST_diag_error_in_file(se, vfile, vm->err_line, s->col, "%s", vm->err_msg);
             else
-                ST_diag_error_in_file(se, vfile, vm.err_line, s->col,
-                                      "internal: comptime VM error: %s", vm.err_msg);
+                ST_diag_error_in_file(se, vfile, vm->err_line, s->col,
+                                      "internal: comptime VM error: %s", vm->err_msg);
         }
+        ST_ct_vm_release(se, vm);
     }
 }
 
@@ -4784,8 +4829,8 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
     }
     if (t->kind != ST_TY_STRUCT && t->kind != ST_TY_ARRAY) {
         ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
-                      "'fields(...)' needs a struct, a fixed-size array, or a tag_union, got '%s'",
-                      ST_tstr(se, t));
+                      "'fields(...)' needs a struct, a fixed-size array, or a %s, got '%s'",
+                      ST_keyword_names[ST_kunion], ST_tstr(se, t));
         ST_rewrite_as_block(s, (ST_stmts_t){0});
         return;
     }

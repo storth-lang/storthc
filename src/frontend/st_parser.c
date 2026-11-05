@@ -22,6 +22,10 @@ static b8 ST_tok_is_keyword(ST_token_t *t, const char *s) {
     return t && t->kind == ST_TKEYWORD && ST_string_eq_cstr(t->text, s);
 }
 
+static b8 ST_tok_is_kw(ST_token_t *t, ST_keyword_t kw) {
+    return ST_tok_is_keyword(t, ST_keyword_names[kw]);
+}
+
 static b8 ST_tok_is_ident(ST_token_t *t) {
     return t && t->kind == ST_TIDENT;
 }
@@ -32,8 +36,8 @@ static b8 ST_at_symbol(ST_parser_t *p, const char *s) {
     return ST_tok_is_symbol(ST_peek(p), s);
 }
 
-static b8 ST_at_keyword(ST_parser_t *p, const char *s) {
-    return ST_tok_is_keyword(ST_peek(p), s);
+static b8 ST_at_kw(ST_parser_t *p, ST_keyword_t kw) {
+    return ST_tok_is_kw(ST_peek(p), kw);
 }
 
 static b8 ST_at_then(ST_parser_t *p) {
@@ -204,10 +208,10 @@ static void ST_sync_decl(ST_parser_t *p) {
     i32 depth = 0;
     while (p->pos < p->n_tokens) {
         ST_token_t *t = ST_peek(p);
-        if (depth == 0 && (ST_tok_is_keyword(t, "fn") || ST_tok_is_keyword(t, "struct") ||
-                           ST_tok_is_keyword(t, "enum") || ST_tok_is_keyword(t, "enum_flag") ||
-                           ST_tok_is_keyword(t, "tag_union") || ST_tok_is_keyword(t, "extern") ||
-                           ST_tok_is_keyword(t, "const") || ST_tok_is_keyword(t, "pub")))
+        if (depth == 0 && (ST_tok_is_kw(t, ST_kfn) || ST_tok_is_kw(t, ST_kstruct) ||
+                           ST_tok_is_kw(t, ST_kenum) || ST_tok_is_kw(t, ST_kenum_flag) ||
+                           ST_tok_is_kw(t, ST_kunion) || ST_tok_is_kw(t, ST_kextern) ||
+                           ST_tok_is_kw(t, ST_kconst) || ST_tok_is_kw(t, ST_kpub)))
             return;
         if (ST_tok_is_symbol(t, "{"))
             depth++;
@@ -270,7 +274,7 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         ST_perr_here(p, "expected a type, got end of file");
         return NULL;
     }
-    if (ST_tok_is_keyword(t, "type_of")) {
+    if (ST_tok_is_kw(t, ST_ktype_of)) {
         p->pos++;
         if (!ST_expect_sym(p, "("))
             return NULL;
@@ -305,7 +309,7 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         te->inner = ST_parse_type(p);
         return te->inner ? te : NULL;
     }
-    if (ST_tok_is_keyword(t, "fn")) {
+    if (ST_tok_is_kw(t, ST_kfn)) {
         p->pos++;
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_FN, t->line, t->col);
         if (!ST_expect_sym(p, "("))
@@ -481,7 +485,7 @@ static ST_tyexpr_t *ST_try_type(ST_parser_t *p) {
     if (!t)
         return NULL;
     if (t->kind != ST_TTYPE && !ST_tok_is_ident(t) && !ST_tok_is_symbol(t, "*") &&
-        !ST_tok_is_symbol(t, "[") && !ST_tok_is_symbol(t, "$") && !ST_tok_is_keyword(t, "fn"))
+        !ST_tok_is_symbol(t, "[") && !ST_tok_is_symbol(t, "$") && !ST_tok_is_kw(t, ST_kfn))
         return NULL;
     p->suppress_errors++;
     ST_tyexpr_t *te = ST_parse_type(p);
@@ -609,18 +613,18 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             break;
     }
 
-    if (ST_tok_is_keyword(t, "true") || ST_tok_is_keyword(t, "false")) {
+    if (ST_tok_is_kw(t, ST_ktrue) || ST_tok_is_kw(t, ST_kfalse)) {
         p->pos++;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_BOOL, t->line, t->col);
         e->ival = ST_string_eq_cstr(t->text, "true");
         return e;
     }
-    if (ST_tok_is_keyword(t, "null")) {
+    if (ST_tok_is_kw(t, ST_knull)) {
         p->pos++;
         return ST_expr_new(p->arena, ST_EX_NULL, t->line, t->col);
     }
 
-    if (ST_tok_is_keyword(t, "sizeof") ||
+    if (ST_tok_is_kw(t, ST_ksizeof) ||
         (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "align_of") &&
          ST_tok_is_symbol(ST_peek2(p), "("))) {
         b8 is_align = ST_tok_is_ident(t);
@@ -647,7 +651,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
-    if (ST_tok_is_keyword(t, "type_of")) {
+    if (ST_tok_is_kw(t, ST_ktype_of)) {
         p->pos++;
         if (!ST_expect_sym(p, "("))
             return NULL;
@@ -660,7 +664,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
-    if (ST_tok_is_keyword(t, "type_info")) {
+    if (ST_tok_is_kw(t, ST_ktype_info)) {
         p->pos++;
         if (!ST_expect_sym(p, "("))
             return NULL;
@@ -948,7 +952,7 @@ static ST_expr_t *ST_parse_unary(ST_parser_t *p) {
     const char *op = NULL;
     if (ST_tok_is_symbol(t, "-"))
         op = "-";
-    else if (ST_tok_is_symbol(t, "!") || ST_tok_is_keyword(t, "not"))
+    else if (ST_tok_is_symbol(t, "!") || ST_tok_is_kw(t, ST_knot))
         op = "!";
     else if (ST_tok_is_symbol(t, "~"))
         op = "~";
@@ -1032,7 +1036,7 @@ static ST_string_t ST_span_between(ST_token_t *from, ST_token_t *to_excl, ST_str
 static ST_expr_t *ST_parse_cast_expr(ST_parser_t *p) {
     ST_token_t *e_start = ST_peek(p);
     ST_expr_t *e;
-    if (ST_at_keyword(p, "cast")) {
+    if (ST_at_kw(p, ST_kcast)) {
         ST_token_t *t = ST_peek(p);
         p->pos++;
         if (!ST_expect_sym(p, "("))
@@ -1172,7 +1176,7 @@ static b8 ST_is_lvalue(ST_expr_t *e) {
 static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime);
 
 static ST_stmt_t *ST_parse_if_else(ST_parser_t *p, ST_stmt_t *s, b8 is_comptime) {
-    if (ST_at_keyword(p, "else") || ST_at_symbol(p, "#else")) {
+    if (ST_at_kw(p, ST_kelse) || ST_at_symbol(p, "#else")) {
         ST_token_t *et = ST_peek(p);
         b8 else_is_comptime = ST_tok_is_symbol(et, "#else");
         if (is_comptime && !else_is_comptime) {
@@ -1186,7 +1190,7 @@ static ST_stmt_t *ST_parse_if_else(ST_parser_t *p, ST_stmt_t *s, b8 is_comptime)
             return NULL;
         }
         p->pos++;
-        if (ST_at_keyword(p, "if")) {
+        if (ST_at_kw(p, ST_kif)) {
             s->if_.else_stmt = ST_parse_if(p, is_comptime);
             if (!s->if_.else_stmt)
                 return NULL;
@@ -1239,7 +1243,7 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime) {
     while (scan < p->n_tokens && ST_tok_is_symbol(&p->tokens[scan], ";"))
         scan++;
     ST_token_t *first = ST_tok_at(p, scan);
-    if (ST_tok_is_keyword(first, "case") || ST_tok_is_keyword(first, "default") ||
+    if (ST_tok_is_kw(first, ST_kcase) || ST_tok_is_kw(first, ST_kdefault) ||
         ST_tok_is_symbol(first, "#case") || ST_tok_is_symbol(first, "#default")) {
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_SWITCH, t->line, t->col);
         s->switch_.cond = cond;
@@ -1250,8 +1254,8 @@ static ST_stmt_t *ST_parse_if(ST_parser_t *p, b8 force_comptime) {
                 continue;
             }
             ST_token_t *ct = ST_peek(p);
-            b8 is_case = ST_tok_is_keyword(ct, "case") || ST_tok_is_symbol(ct, "#case");
-            b8 is_default = ST_tok_is_keyword(ct, "default") || ST_tok_is_symbol(ct, "#default");
+            b8 is_case = ST_tok_is_kw(ct, ST_kcase) || ST_tok_is_symbol(ct, "#case");
+            b8 is_default = ST_tok_is_kw(ct, ST_kdefault) || ST_tok_is_symbol(ct, "#default");
             if (!is_case && !is_default) {
                 ST_perr_tok(p, ct, "expected 'case' or 'default' inside a switch body");
                 ST_sync_stmt(p);
@@ -1393,7 +1397,7 @@ static ST_stmt_t *ST_parse_decl_stmt(ST_parser_t *p, ST_token_t *name_tok) {
         s->decl.init = ST_parse_expr(p);
         if (!s->decl.init)
             return NULL;
-        if (ST_at_keyword(p, "static")) {
+        if (ST_at_kw(p, ST_kstatic)) {
             p->pos++;
             s->decl.is_static = 1;
         }
@@ -1567,7 +1571,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return NULL;
     }
 
-    if (ST_tok_is_keyword(t, "return")) {
+    if (ST_tok_is_kw(t, ST_kreturn)) {
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_RETURN, t->line, t->col);
         if (!ST_at_symbol(p, ";")) {
@@ -1588,12 +1592,12 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
-    if (ST_tok_is_keyword(t, "if") || ST_tok_is_symbol(t, "#if"))
+    if (ST_tok_is_kw(t, ST_kif) || ST_tok_is_symbol(t, "#if"))
         return ST_parse_if(p, 0);
-    if (ST_tok_is_keyword(t, "for") || ST_tok_is_symbol(t, "#for"))
+    if (ST_tok_is_kw(t, ST_kfor) || ST_tok_is_symbol(t, "#for"))
         return ST_parse_for(p);
 
-    if (ST_tok_is_keyword(t, "while")) {
+    if (ST_tok_is_kw(t, ST_kwhile)) {
         p->pos++;
         ST_token_t *maybe_ident = ST_peek(p);
         b8 has_assign =
@@ -1687,7 +1691,7 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
-    if (ST_tok_is_keyword(t, "defer")) {
+    if (ST_tok_is_kw(t, ST_kdefer)) {
         p->pos++;
         ST_stmt_t *s = ST_stmt_new(p->arena, ST_ST_DEFER, t->line, t->col);
         if (ST_at_symbol(p, "{")) {
@@ -1706,8 +1710,8 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
-    if (ST_tok_is_keyword(t, "break") || ST_tok_is_keyword(t, "continue")) {
-        b8 is_break = ST_tok_is_keyword(t, "break");
+    if (ST_tok_is_kw(t, ST_kbreak) || ST_tok_is_kw(t, ST_kcontinue)) {
+        b8 is_break = ST_tok_is_kw(t, ST_kbreak);
         p->pos++;
         ST_stmt_t *s =
             ST_stmt_new(p->arena, is_break ? ST_ST_BREAK : ST_ST_CONTINUE, t->line, t->col);
@@ -1716,8 +1720,8 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
         return s;
     }
 
-    if (ST_tok_is_keyword(t, "label") || ST_tok_is_keyword(t, "goto")) {
-        b8 is_label = ST_tok_is_keyword(t, "label");
+    if (ST_tok_is_kw(t, ST_klabel) || ST_tok_is_kw(t, ST_kgoto)) {
+        b8 is_label = ST_tok_is_kw(t, ST_klabel);
         p->pos++;
         ST_stmt_t *s =
             ST_stmt_new(p->arena, is_label ? ST_ST_LABEL : ST_ST_GODOWN, t->line, t->col);
@@ -1838,7 +1842,7 @@ static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
     while (p->pos < p->n_tokens && !ST_at_symbol(p, "}")) {
         if (p->n_errors >= ST_PARSE_MAX_ERRORS)
              return 0;
-        if (ST_tok_is_keyword(ST_peek(p), "fn")) {
+        if (ST_tok_is_kw(ST_peek(p), ST_kfn)) {
 	    ST_token_t *start_tok = ST_peek(p);
 	    ST_decl_t *nd = ST_parse_fn_decl(p, 0);
 	    if (!nd) {
@@ -1967,7 +1971,7 @@ static b8 ST_parse_struct_fields(ST_parser_t *p, ST_field_specs_t *out) {
             return 0;
         if (!ST_expect_sym(p, ":"))
             return 0;
-        if (ST_at_keyword(p, "struct")) {
+        if (ST_at_kw(p, ST_kstruct)) {
             ST_token_t *st = ST_peek(p);
             p->pos++;
             f.anon = ST_parse_struct_decl(p, (ST_string_t){0}, st->line, st->col);
@@ -2083,7 +2087,9 @@ static ST_decl_t *ST_parse_enum_decl(ST_parser_t *p, b8 is_flag, u32 line, u32 c
 
 static ST_decl_t *ST_parse_tag_union_decl(ST_parser_t *p, u32 line, u32 col) {
     ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TAG_UNION, line, col);
-    d->name = ST_expect_ident(p, "a tag_union name");
+    char what[48];
+    snprintf(what, sizeof(what), "a %s name", ST_keyword_names[ST_kunion]);
+    d->name = ST_expect_ident(p, what);
     if (!d->name.len)
         return NULL;
     if (!ST_parse_generic_list(p, &d->tag_union.generics))
@@ -2130,11 +2136,11 @@ static b8 ST_parse_impl_block(ST_parser_t *p) {
         return 0;
     while (!ST_at_symbol(p, "}") && p->pos < p->n_tokens) {
         b8 is_pub = 0;
-        if (ST_at_keyword(p, "pub")) {
+        if (ST_at_kw(p, ST_kpub)) {
             is_pub = 1;
             p->pos++;
         }
-        if (!ST_at_keyword(p, "fn")) {
+        if (!ST_at_kw(p, ST_kfn)) {
             ST_perr_here(p, "expected 'fn' inside an impl block");
             return 0;
         }
@@ -2203,9 +2209,9 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
         }
         if (!target) {
             ST_perr_tok(p, m->head,
-                        "impl target '" ST_sv_fmt "' must be a struct or tag_union declared in "
+                        "impl target '" ST_sv_fmt "' must be a struct or %s declared in "
                         "this file",
-                        ST_sv_args(m->type_name));
+                        ST_sv_args(m->type_name), ST_keyword_names[ST_kunion]);
             continue;
         }
         ST_strings_t decl_generics = target->kind == ST_DE_STRUCT ? target->struct_.generics
@@ -2304,7 +2310,7 @@ static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
                 return NULL;
             continue;
         }
-        if (!ST_tok_is_keyword(mt, "fn")) {
+        if (!ST_tok_is_kw(mt, ST_kfn)) {
             ST_perr_here(p,
                         "expected a method signature ('fn name(...) -> ret;') inside trait '" ST_sv_fmt "'",
                         ST_sv_args(d->name));
@@ -2352,7 +2358,7 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             sig->is_variadic = 1;
             continue;
         }
-        if (ST_at_keyword(p, "using")) {
+        if (ST_at_kw(p, ST_kusing)) {
             ST_perr_here(p, "'using' parameters are not supported in storthc yet");
             return 0;
         }
@@ -2524,7 +2530,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
     if (!t)
         return NULL;
     b8 is_pub = 0;
-    if (ST_tok_is_keyword(t, "pub")) {
+    if (ST_tok_is_kw(t, ST_kpub)) {
         is_pub = 1;
         p->pos++;
         t = ST_peek(p);
@@ -2568,7 +2574,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         }
     }
     if (wheres.count) {
-        if (!ST_tok_is_keyword(t, "fn")) {
+        if (!ST_tok_is_kw(t, ST_kfn)) {
             ST_perr_here(p, "'where' clauses are only allowed directly before a function declaration");
             return NULL;
         }
@@ -2593,7 +2599,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         return d;
     }
 
-    if (ST_tok_is_keyword(t, "struct")) {
+    if (ST_tok_is_kw(t, ST_kstruct)) {
         p->pos++;
         ST_string_t name = ST_expect_ident(p, "a struct name");
         if (!name.len)
@@ -2603,15 +2609,15 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             d->is_pub = is_pub;
         return d;
     }
-    if (ST_tok_is_keyword(t, "enum") || ST_tok_is_keyword(t, "enum_flag")) {
-        b8 is_flag = ST_tok_is_keyword(t, "enum_flag");
+    if (ST_tok_is_kw(t, ST_kenum) || ST_tok_is_kw(t, ST_kenum_flag)) {
+        b8 is_flag = ST_tok_is_kw(t, ST_kenum_flag);
         p->pos++;
         ST_decl_t *d = ST_parse_enum_decl(p, is_flag, t->line, t->col);
         if (d)
             d->is_pub = is_pub;
         return d;
     }
-    if (ST_tok_is_keyword(t, "tag_union")) {
+    if (ST_tok_is_kw(t, ST_kunion)) {
         p->pos++;
         ST_decl_t *d = ST_parse_tag_union_decl(p, t->line, t->col);
         if (d)
@@ -2625,7 +2631,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         p->impl_consumed = 1;
         return NULL;
     }
-    if (ST_tok_is_keyword(t, "using") && ST_tok_is_ident(ST_peek2(p))) {
+    if (ST_tok_is_kw(t, ST_kusing) && ST_tok_is_ident(ST_peek2(p))) {
         p->pos++;
         ST_string_t name = ST_expect_ident(p, "a type alias name after 'using'");
         if (!name.len)
@@ -2650,7 +2656,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         return d;
     }
 
-    if (ST_tok_is_keyword(t, "const")) {
+    if (ST_tok_is_kw(t, ST_kconst)) {
         p->pos++;
         t = ST_peek(p);
         ST_decl_t *d = ST_decl_new(p->arena, ST_DE_CONST, t ? t->line : 0, t ? t->col : 0);
@@ -2739,9 +2745,9 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         return d;
     }
-    if (ST_tok_is_keyword(t, "extern")) {
+    if (ST_tok_is_kw(t, ST_kextern)) {
         p->pos++;
-        if (ST_at_keyword(p, "fn")) {
+        if (ST_at_kw(p, ST_kfn)) {
             p->pos++;
             ST_token_t *nt = ST_peek(p);
             ST_decl_t *d = ST_decl_new(p->arena, ST_DE_EXTERN_FN, nt ? nt->line : t->line,
@@ -2779,7 +2785,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
             return NULL;
         return d;
     }
-    if (ST_tok_is_keyword(t, "fn"))
+    if (ST_tok_is_kw(t, ST_kfn))
         return ST_parse_fn_decl(p, is_pub);
 
     if (ST_tok_is_keyword(t, "impl"))
@@ -2800,7 +2806,7 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
         d->import_.alias = st->str;
         if (ST_tok_is_keyword(ST_peek(p), "as") ||
             (ST_tok_is_ident(ST_peek(p)) && ST_string_eq_cstr(ST_peek(p)->text, "as")) ||
-            ST_tok_is_keyword(ST_peek(p), "using") ||
+            ST_tok_is_kw(ST_peek(p), ST_kusing) ||
             (ST_tok_is_ident(ST_peek(p)) && ST_string_eq_cstr(ST_peek(p)->text, "using"))) {
             p->pos++;
             d->import_.alias = ST_expect_ident(p, "an alias after 'as'/'using'");
@@ -2819,9 +2825,9 @@ static ST_decl_t *ST_parse_top_decl(ST_parser_t *p) {
     }
 
     ST_perr_tok(p, t,
-                "expected a top-level declaration (fn, struct, enum, tag_union, "
+                "expected a top-level declaration (fn, struct, enum, %s, "
                 "const, extern), got '" ST_sv_fmt "'",
-                ST_sv_args(t->text));
+                ST_keyword_names[ST_kunion], ST_sv_args(t->text));
     return NULL;
 }
 

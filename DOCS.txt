@@ -55,7 +55,7 @@ Refer the type section to see all of the alignment and memory layout of structur
 Tag union and structs have the same declaration but fundamentally operate differently.
 
 `src_code
-tag_union Foo {
+union Foo {
     name: string;
     age: u32;
 }
@@ -65,7 +65,7 @@ In tag unions the concept comes from rust where we have an intrinsic tag(refer t
 that will store the id of the active member to make it so that inactive member is inaccessible.
 
 `src_code
-f : tag_union;
+f : union;
 f.tag = Foo.age;  // This will make name inaccessible member
 f.name = "Urmom"; // This is an invalid code because you are trying to access an inactive tag name
                   // while age is the acctive one meaning only f.age is accessible.

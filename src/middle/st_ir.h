@@ -390,10 +390,6 @@ ST_ir_inst_t *ST_ir_call_indirect(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_ty_t *fn
                                   ST_ir_inst_t *callee_ptr, ST_ir_inst_t **args, u32 n_args,
                                   u32 line, u32 col);
 
-// @note: ST_ir_mem_arg marks a call argument that must be passed per the SysV
-// MEMORY class (aggregates > 16 bytes): 'addr' points at the source value and
-// 'agg_ty' gives its real size, so the backend copies 'agg_ty->size' bytes onto
-// the outgoing stack instead of treating 'addr' itself as the argument value.
 ST_ir_inst_t *ST_ir_mem_arg(ST_ir_block_t *b, ST_ir_inst_t *addr, ST_ty_t *agg_ty, u32 line,
                             u32 col);
 

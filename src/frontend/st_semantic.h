@@ -6,6 +6,7 @@
 #include "../utils/st_srcmap.h"
 #include "./st_ast.h"
 #include "./st_types.h"
+#include "./comptime/st_comptime.h"
 
 #define ST_SEMA_MAX_ERRORS 20
 
@@ -75,6 +76,9 @@ typedef struct {
 
     u32 expr_depth;
     ST_stmts_t pending_comptime_blocks;
+
+    ST_ct_vm_t *ct_vm;
+    b8 ct_vm_busy;
 } ST_sema_t;
 
 b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string_t file,

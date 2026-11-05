@@ -1,9 +1,9 @@
 # 12 - Tag unions
 
-`tag_union` declares a type that holds exactly one of several named variants. A variant either carries a payload, written `Variant(Type)`, or carries nothing.
+`union` declares a type that holds exactly one of several named variants. A variant either carries a payload, written `Variant(Type)`, or carries nothing.
 
 ```rs
-pub tag_union Shape {
+pub union Shape {
     Circle(f64),
     Square(f64),
     Empty,
@@ -13,7 +13,7 @@ pub tag_union Shape {
 Variants are separated by commas. A tag union can be generic: the parameters are collected from the payloads, or listed explicitly as `Option($T)`.
 
 ```rs
-tag_union Option {
+union Option {
     Some($T),
     None,
 }
@@ -84,4 +84,4 @@ An `impl` block lives in the same file as its struct or tag union. Each method i
 
 A tag union can be a struct field, an array or slice element, and the payload of another tag union. A payload can be a scalar, struct, string, slice, array or another tag union.
 
-A zero-initialized tag union (a local declared without a value, or a struct field left unset) is the first variant with a zeroed payload, so declare `None` first in an option-like type: `tag_union Option { None, Some($T) }`.
+A zero-initialized tag union (a local declared without a value, or a struct field left unset) is the first variant with a zeroed payload, so declare `None` first in an option-like type: `union Option { None, Some($T) }`.

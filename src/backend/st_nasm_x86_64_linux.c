@@ -1,5 +1,6 @@
 #include "st_nasm.h"
 #include "st_dwarf.h"
+#include "../middle/st_abi.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -91,26 +92,26 @@ static void ST_fload(FILE *out, const char *reg, ST_ir_inst_t *v) {
     fprintf(out, "    movsd %s, [rbp%+d]\n", reg, ST_slot(v));
 }
 
-static u32 ST_tys_total_eightbytes(ST_tys_t *tys) {
-    u32 total = 0;
-    for (u32 i = 0; i < tys->count; i++) {
-        ST_ty_t *t = tys->items[i];
-        total += t ? (t->size + 7u) / 8u : 1;
-    }
-    return total;
-}
-
 static u32 ST_call_ret_count(ST_ir_inst_t *call_inst) {
     if (call_inst->kind == ST_IR_CALL_INDIRECT) {
         if (!call_inst->call_ind.fn_ty)
             return 1;
-        u32 total_eb = ST_tys_total_eightbytes(&call_inst->call_ind.fn_ty->rets);
+        u32 total_eb = ST_abi_ret_slots(&call_inst->call_ind.fn_ty->rets);
         return total_eb ? total_eb : 1;
     }
     if (!call_inst->call.callee || !call_inst->call.callee->ty)
         return 1;
-    u32 total_eb = ST_tys_total_eightbytes(&call_inst->call.callee->ty->rets);
+    u32 total_eb = ST_abi_ret_slots(&call_inst->call.callee->ty->rets);
     return total_eb ? total_eb : 1;
+}
+
+static b8 ST_call_ret0_is_float(ST_ir_inst_t *call_inst) {
+    ST_ty_t *fty = call_inst->kind == ST_IR_CALL_INDIRECT
+                       ? call_inst->call_ind.fn_ty
+                       : (call_inst->call.callee ? call_inst->call.callee->ty : NULL);
+    if (fty && fty->kind == ST_TY_FN && fty->rets.count > 0 && fty->rets.items[0])
+        return ST_ty_is_float(fty->rets.items[0]);
+    return call_inst->ty && ST_ty_is_float(call_inst->ty);
 }
 
 static i32 ST_ret_buf_off(ST_ir_inst_t *call_inst, u32 index) {
@@ -736,7 +737,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
         case ST_IR_CALL: {
             u32 rc = ST_call_ret_count(in);
             u32 reserved = 0;
-            if (rc > 2) {
+            if (ST_abi_ret_is_indirect(rc)) {
                 fprintf(out, "    lea rdi, [rbp%+d]\n", ST_ret_buf_off(in, 0));
                 reserved = 1;
             }
@@ -776,8 +777,8 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
                    fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
 	       else
 	           fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
-            } else if (rc > 2)
-	        if (in->ty && ST_ty_is_float(in->ty))
+            } else if (ST_abi_ret_is_indirect(rc))
+	        if (ST_call_ret0_is_float(in))
                     fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
                 else
 		    fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
@@ -787,7 +788,7 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
         case ST_IR_CALL_INDIRECT: {
             u32 rc = ST_call_ret_count(in);
             u32 reserved = 0;
-            if (rc > 2) {
+            if (ST_abi_ret_is_indirect(rc)) {
                 fprintf(out, "    lea rdi, [rbp%+d]\n", ST_ret_buf_off(in, 0));
                 reserved = 1;
             }
@@ -825,8 +826,8 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
                     fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
                 else
                     fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
-            } else if (rc > 2) {
-                if (in->ty && ST_ty_is_float(in->ty))
+            } else if (ST_abi_ret_is_indirect(rc)) {
+                if (ST_call_ret0_is_float(in))
                     fprintf(out, "    movsd xmm0, [rbp%+d]\n", ST_ret_buf_off(in, 0));
                 else
                     fprintf(out, "    mov rax, [rbp%+d]\n", ST_ret_buf_off(in, 0));
@@ -921,7 +922,8 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             break;
     }
     if (in->ty && in->ty->kind != ST_TY_VOID) {
-        if (ST_ty_is_float(in->ty))
+        b8 is_call = in->kind == ST_IR_CALL || in->kind == ST_IR_CALL_INDIRECT;
+        if (is_call ? ST_call_ret0_is_float(in) : ST_ty_is_float(in->ty))
             fprintf(out, "    movsd [rbp%+d], xmm0\n", ST_slot(in));
         else
             fprintf(out, "    mov [rbp%+d], rax\n", ST_slot(in));
@@ -1040,7 +1042,7 @@ static u32 ST_layout_fn(ST_ir_fn_t *fn, ST_gen_ctx_t *ctx) {
 
     ctx->fn = fn;
     ctx->hidden_ret_off = 0;
-    if (fn->ty && ST_tys_total_eightbytes(&fn->ty->rets) > 2) {
+    if (fn->ty && ST_abi_ret_is_indirect(ST_abi_ret_slots(&fn->ty->rets))) {
         cur += 8;
         ctx->hidden_ret_off = cur;
     }

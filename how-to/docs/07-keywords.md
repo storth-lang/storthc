@@ -9,7 +9,7 @@
 | `struct` | struct type |
 | `enum` | enum type |
 | `enum_flag` | enum meant for bit flags |
-| `tag_union` | tagged union, one of several named variants, some with a payload |
+| `union` | tagged union, one of several named variants, some with a payload |
 | `using` | `using Name = <type>;`, a type alias |
 | `extern` | `extern fn` / `extern var`, a symbol implemented outside storth |
 

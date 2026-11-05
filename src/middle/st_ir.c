@@ -383,9 +383,6 @@ ST_ir_inst_t *ST_ir_call(ST_ir_block_t *b, ST_ty_t *ret_ty, ST_string_t callee_n
     inst->call.callee_name = callee_name;
     inst->call.callee = callee;
 
-    b8 has_hidden_ret = ret_ty && ret_ty->kind == ST_TY_STRUCT && ret_ty->size > 16;
-    if (has_hidden_ret && n_args > 0)
-        inst->call.ret_buf_offset = 0;
     ST_forrange(0, n_args) {
         ST_da_append_arena(b->fn->arena, &inst->call.args, args[i]);
     }
