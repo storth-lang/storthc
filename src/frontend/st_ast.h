@@ -255,6 +255,7 @@ struct ST_stmt_t {
             ST_expr_t *cond;
             ST_cases_t cases;
             b8 is_comptime; // same '#if { case ... }' form, comptime-pruned
+            b8 exhaustive;
         } switch_;
         struct {
             ST_expr_t *cond;

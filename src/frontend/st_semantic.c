@@ -5240,9 +5240,14 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 break;
             if (ct && ct->kind == ST_TY_TAG_UNION) {
                 ST_complete_ty(se, ct);
+                u32 n_variants = ct->decl->tag_union.variants.count;
+                b8 *covered = ST_arena_push(se->arena, n_variants ? n_variants : 1);
+                memset(covered, 0, n_variants ? n_variants : 1);
+                b8 has_default = 0;
                 ST_forrange(0, s->switch_.cases.count) {
                     ST_case_t *c = &s->switch_.cases.items[i];
                     if (c->values.count == 0) {
+                        has_default = 1;
                         ST_check_body(se, &c->body);
                         continue;
                     }
@@ -5258,6 +5263,7 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                     ST_forrange(0, ct->decl->tag_union.variants.count)
                         if (ST_string_eq(ct->decl->tag_union.variants.items[i].name, vname)) {
                         found = 1;
+                        covered[i] = 1;
                         break;
                     }
                     if (!found) {
@@ -5272,6 +5278,33 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                     }
                     c->values.items[0]->ty = se->tys.prim[ST_ti64];
                     ST_check_body(se, &c->body);
+                }
+                if (!has_default) {
+                    char missing[256];
+                    u32 mlen = 0;
+                    u32 n_missing = 0;
+                    ST_forrange(0, n_variants) {
+                        if (covered[i])
+                            continue;
+                        ST_string_t vn = ct->decl->tag_union.variants.items[i].name;
+                        if (mlen < sizeof(missing))
+                            mlen += (u32)snprintf(missing + mlen, sizeof(missing) - mlen,
+                                                  "%s'%.*s'", n_missing ? ", " : "", (int)vn.len,
+                                                  (const char *)vn.data);
+                        n_missing++;
+                    }
+                    if (n_missing) {
+                        ST_diag_error(&se->diag, s->line, s->col,
+                                      "switch on '" ST_sv_fmt "' is not exhaustive, missing "
+                                      "variant%s %s; add the missing case%s or a 'default' branch",
+                                      ST_sv_args(ST_decl_display_name(ct->decl)),
+                                      n_missing == 1 ? "" : "s", missing,
+                                      n_missing == 1 ? "" : "s");
+                        ST_diag_note_in_file(se, ct->decl->file, ct->decl->line, ct->decl->col,
+                                             "'" ST_sv_fmt "' is declared here",
+                                             ST_sv_args(ST_decl_display_name(ct->decl)));
+                    } else
+                        s->switch_.exhaustive = 1;
                 }
                 break;
             }

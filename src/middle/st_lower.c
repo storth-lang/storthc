@@ -3477,7 +3477,10 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 }
                 c->defers.count = mark;
             } else if (!ST_ir_block_is_terminated(c->cur)) {
-                ST_ir_term_br(c->cur, join, s->line, s->col);
+                if (is_union && s->switch_.exhaustive)
+                    ST_ir_term_unreachable(c->cur, s->line, s->col);
+                else
+                    ST_ir_term_br(c->cur, join, s->line, s->col);
             }
 
             ST_ir_block_seal(join);
