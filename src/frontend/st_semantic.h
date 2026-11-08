@@ -50,6 +50,11 @@ typedef struct {
     ST_ty_ctx_t tys;
     ST_tys_t *cur_rets;
     ST_decl_t *cur_fn_decl;
+    struct {
+        ST_ty_t *ty;
+        ST_tyexpr_t *row;
+    } row_ctx[16];
+    u32 n_row_ctx;
     ST_ty_t *type_info_ty;
     ST_program_t *prog;
     ST_ht_t templates;

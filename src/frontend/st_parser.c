@@ -248,6 +248,8 @@ static b8 ST_expect_semi(ST_parser_t *p) {
     return 0;
 }
 
+static b8 ST_parse_row(ST_parser_t *p, ST_tyexpr_t *g);
+
 static ST_string_t ST_expect_ident(ST_parser_t *p, const char *what) {
     ST_token_t *t = ST_peek(p);
     if (ST_tok_is_ident(t)) {
@@ -2338,6 +2340,48 @@ static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
     return d;
 }
 
+
+static b8 ST_parse_row(ST_parser_t *p, ST_tyexpr_t *g) {
+    p->pos++;
+    g->has_row = 1;
+    for (;;) {
+        if (ST_at_symbol(p, "}"))
+            break;
+        if (ST_at_symbol(p, "...")) {
+            p->pos++;
+            g->row_open = 1;
+            break;
+        }
+        ST_token_t *ft = ST_peek(p);
+        ST_row_field_t rf = {.line = ft ? ft->line : 0, .col = ft ? ft->col : 0};
+        rf.name = ST_expect_ident(p, "a field name");
+        if (!rf.name.len)
+            return 0;
+        ST_forrange(0, g->row_fields.count) if (ST_string_eq(g->row_fields.items[i].name, rf.name)) {
+            ST_perr_here(p, "field '" ST_sv_fmt "' is listed twice in the row", ST_sv_args(rf.name));
+            return 0;
+        }
+        if (!ST_expect_sym(p, ":"))
+            return 0;
+        rf.te = ST_parse_type(p);
+        if (!rf.te)
+            return 0;
+        ST_da_append_arena(p->arena, &g->row_fields, rf);
+        if (ST_at_symbol(p, ",")) {
+            p->pos++;
+            continue;
+        }
+        break;
+    }
+    if (!ST_expect_sym(p, "}"))
+        return 0;
+    if (!g->row_fields.count && !g->row_open) {
+        ST_perr_here(p, "an empty row matches nothing; write '{ ... }' to accept any struct");
+        return 0;
+    }
+    return 1;
+}
+
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
     if (!ST_expect_sym(p, "("))
         return 0;
@@ -2377,6 +2421,19 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             p->pos++;
             param.te = ST_parse_type(p);
             if (!param.te)
+                return 0;
+        }
+
+        if (param.te && ST_at_symbol(p, "{")) {
+            ST_tyexpr_t *g = param.te;
+            while (g && g->kind == ST_TE_PTR)
+                g = g->inner;
+            if (!g || g->kind != ST_TE_NAME || !g->is_generic_param) {
+                ST_perr_here(p, "a field row '{ ... }' can only follow a generic parameter such "
+                                "as '$T'");
+                return 0;
+            }
+            if (!ST_parse_row(p, g))
                 return 0;
         }
 

@@ -245,6 +245,7 @@ static void ST_modrw_tyexpr(ST_module_rw_t *rw, ST_tyexpr_t *te) {
     ST_forrange(0, te->generic_args.count) ST_modrw_tyexpr(rw, te->generic_args.items[i]);
     ST_forrange(0, te->generic_constraints.count)
         ST_modrw_tyexpr(rw, te->generic_constraints.items[i]);
+    ST_forrange(0, te->row_fields.count) ST_modrw_tyexpr(rw, te->row_fields.items[i].te);
 }
 
 static void ST_modrw_body(ST_module_rw_t *rw, ST_stmts_t *body) {

@@ -15,6 +15,18 @@ struct ST_lower_defers_t {
     u32 count, capacity;
 };
 
+// Names whose binding was replaced by a shadowing declaration, so the previous
+// binding can be restored when the inner scope ends.
+typedef struct {
+    ST_string_t name;
+    void *old;
+} ST_lower_shadow_t;
+
+typedef struct {
+    ST_lower_shadow_t *items;
+    u32 count, capacity;
+} ST_lower_shadow_trail_t;
+
 typedef struct {
     ST_arena_t *arena;
     ST_ir_module_t *module;
@@ -26,6 +38,7 @@ typedef struct {
     ST_ir_fn_t *fn;
     ST_ir_block_t *cur;
     ST_ht_t scope;
+    ST_lower_shadow_trail_t shadows;
     ST_ht_t labels;
     ST_ht_t addr_taken;
     ST_lower_loop_t *loop;
@@ -55,6 +68,7 @@ typedef struct {
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
+static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s);
 static ST_ir_inst_t *ST_lower_asm_tokens(ST_lower_ctx_t *c, ST_token_t *tokens, u32 n_tokens,
                                          ST_ty_t *ty, u32 line, u32 col);
 static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
@@ -117,6 +131,12 @@ static ST_ir_block_t *ST_lower_label_block(ST_lower_ctx_t *c, ST_string_t name) 
 }
 
 static void ST_lower_scope_bind(ST_lower_ctx_t *c, ST_string_t name, ST_lower_bind_t *bind) {
+    ST_ht_generic_t prev =
+        ST_ht_get(&c->scope, (ST_ht_generic_t){.tag = name.data, .size = name.len});
+    if (prev.tag) {
+        ST_lower_shadow_t sh = {.name = name, .old = prev.tag};
+        ST_da_append_arena(c->arena, &c->shadows, sh);
+    }
     ST_ht_generic_t *hk = ST_arena_push(c->arena, sizeof(*hk));
     hk->tag = name.data;
     hk->size = name.len;
@@ -127,6 +147,17 @@ static ST_lower_bind_t *ST_lower_scope_find(ST_lower_ctx_t *c, ST_string_t name)
     ST_ht_generic_t val =
         ST_ht_get(&c->scope, (ST_ht_generic_t){.tag = name.data, .size = name.len});
     return (ST_lower_bind_t *)val.tag;
+}
+
+// Undo every shadowing declaration made since `mark`, newest first.
+static void ST_lower_scope_restore(ST_lower_ctx_t *c, u32 mark) {
+    while (c->shadows.count > mark) {
+        ST_lower_shadow_t sh = c->shadows.items[--c->shadows.count];
+        ST_ht_generic_t *hk = ST_arena_push(c->arena, sizeof(*hk));
+        hk->tag = sh.name.data;
+        hk->size = sh.name.len;
+        ST_ht_set(&c->scope, hk, (ST_ht_generic_t){.tag = sh.old, .size = 0});
+    }
 }
 
 static ST_lower_bind_t *ST_lower_bind_ssa(ST_lower_ctx_t *c, ST_string_t name, void *key,
@@ -588,7 +619,7 @@ static void ST_lower_array_elem_zero(ST_lower_ctx_t *c, ST_ir_inst_t *elem_base,
         ST_lower_struct_zero(c, elem_base, 0, ety, line, col);
     } else if (ety->kind == ST_TY_STRING) {
         ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
-        ST_ty_t *lty = c->sema->tys.prim[ST_ti32];
+        ST_ty_t *lty = c->sema->tys.prim[ST_ti64];
 
         ST_ir_inst_t *fp = ST_lower_field_ptr(c, elem_base, 0, dty, line, col);
         ST_ir_store(c->cur, dty, fp, ST_ir_const_int(c->cur, dty, 0), line, col);
@@ -696,7 +727,9 @@ static void ST_lower_struct_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off,
             ST_lower_raw_zero(c, base, foff, f->ty->size, line, col);
         } else if (f->ty->kind == ST_TY_STRING) {
             ST_ty_t *dty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
-            ST_ty_t *lty = c->sema->tys.prim[ST_ti32];
+            // The length is a full 64-bit field; zeroing only 32 bits left stack garbage in the
+            // upper half, so a "zero" string could report an enormous length.
+            ST_ty_t *lty = c->sema->tys.prim[ST_ti64];
 
             ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, foff, dty, line, col);
             ST_ir_store(c->cur, dty, fp, ST_ir_const_int(c->cur, dty, 0), line, col);
@@ -1096,8 +1129,13 @@ static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_in
     c->cur = fail_b;
 
     u32 str_idx = ST_ir_module_intern_str(c->module, c->diag.file);
+    // const_str yields the address of the interned {ptr, len} record, not of the
+    // characters, so load the data pointer out of the record (field at offset 0).
     ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tchar]);
-    ST_ir_inst_t *file_ptr = ST_ir_const_str(c->cur, ptr_ty, str_idx);
+    ST_ty_t *sptr_ty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tstring]);
+    ST_ir_inst_t *file_rec = ST_ir_const_str(c->cur, sptr_ty, str_idx);
+    ST_ir_inst_t *file_fld = ST_lower_field_ptr(c, file_rec, 0, ptr_ty, line, col);
+    ST_ir_inst_t *file_ptr = ST_ir_load(c->cur, ptr_ty, file_fld, line, col);
     ST_ir_inst_t *file_len = ST_ir_const_int(c->cur, i64ty, (i64)c->diag.file.len);
     ST_ir_inst_t *line_v = ST_ir_const_int(c->cur, i64ty, (i64)line);
     ST_ir_inst_t *col_v = ST_ir_const_int(c->cur, i64ty, (i64)col);
@@ -1169,6 +1207,14 @@ static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) 
             if (ST_string_eq_cstr(e->unary.op, "*"))
                 return ST_lower_expr(c, e->unary.operand);
             break;
+        // A string literal is a read-only {ptr, len} object. Generic instantiation
+        // can substitute a literal for a string parameter, so `key.len` becomes
+        // `"lit".len`; field access then needs the literal's address.
+        case ST_EX_STR:
+            return ST_lower_string_lit_addr(c, e);
+
+        case ST_EX_STR_FROM_RAW:
+            return ST_lower_str_from_raw_addr(c, e);
 
         case ST_EX_CALL:
             if (e->ty && (e->ty->kind == ST_TY_STRUCT || e->ty->kind == ST_TY_TAG_UNION ||
@@ -1360,7 +1406,7 @@ static ST_ir_op_t ST_lower_binop(ST_diag_t *diag, ST_expr_t *e, b8 is_f, b8 uns)
 }
 
 static ST_ir_op_t ST_lower_compound_op(ST_diag_t *diag, ST_string_t op, u32 line, u32 col,
-                                       b8 is_f) {
+                                       b8 is_f, b8 uns) {
     if (ST_string_eq_cstr(op, "+="))
         return is_f ? ST_IR_FADD : ST_IR_ADD;
     if (ST_string_eq_cstr(op, "-="))
@@ -1368,15 +1414,19 @@ static ST_ir_op_t ST_lower_compound_op(ST_diag_t *diag, ST_string_t op, u32 line
     if (ST_string_eq_cstr(op, "*="))
         return is_f ? ST_IR_FMUL : ST_IR_MUL;
     if (ST_string_eq_cstr(op, "/="))
-        return is_f ? ST_IR_FDIV : ST_IR_SDIV;
+        return is_f ? ST_IR_FDIV : (uns ? ST_IR_UDIV : ST_IR_SDIV);
     if (ST_string_eq_cstr(op, "%="))
-        return ST_IR_SREM;
+        return uns ? ST_IR_UREM : ST_IR_SREM;
     if (ST_string_eq_cstr(op, "&="))
         return ST_IR_AND;
     if (ST_string_eq_cstr(op, "|="))
         return ST_IR_OR;
     if (ST_string_eq_cstr(op, "^="))
         return ST_IR_XOR;
+    if (ST_string_eq_cstr(op, "<<="))
+        return ST_IR_SHL;
+    if (ST_string_eq_cstr(op, ">>="))
+        return uns ? ST_IR_LSHR : ST_IR_ASHR;
     ST_diag_error(diag, line, col, "internal: unsupported compound-assign operator '" ST_sv_fmt "'",
                   ST_sv_args(op));
     return ST_IR_ADD;
@@ -2066,7 +2116,8 @@ static void ST_lower_store_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
     if (!ST_string_eq_cstr(s->assign.op, "=")) {
         ST_ir_inst_t *cur = ST_ir_load(c->cur, ty, addr, s->line, s->col);
         ST_ir_op_t op =
-            ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col, ST_ty_is_float(ty));
+            ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col, ST_ty_is_float(ty),
+                                 ty && !ty->is_signed);
         rhs = ST_ir_binop(c->cur, op, ty, cur, rhs, s->line, s->col);
     }
     ST_ir_store(c->cur, ty, addr, rhs, s->line, s->col);
@@ -2560,7 +2611,26 @@ static b8 ST_lower_expr_is_noreturn_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     return cty && cty->kind == ST_TY_FN && cty->is_noreturn;
 }
 
+// Compound statements open a lexical scope: a declaration inside them that shadows an
+// outer name must not leak out once the statement is done (defers have already run).
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
+    u32 mark = c->shadows.count;
+    ST_lower_stmt_impl(c, s);
+    switch (s->kind) {
+        case ST_ST_IF:
+        case ST_ST_SWITCH:
+        case ST_ST_WHILE:
+        case ST_ST_FOR_RANGE:
+        case ST_ST_FOR_ARRAY:
+        case ST_ST_BLOCK:
+            ST_lower_scope_restore(c, mark);
+            break;
+        default:
+            break;
+    }
+}
+
+static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s) {
     if (s->kind != ST_ST_LABEL && ST_ir_block_is_terminated(c->cur))
         return;
     switch (s->kind) {
@@ -2611,6 +2681,9 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
 
             if (ty->kind == ST_TY_TAG_UNION) {
                 ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, ty, s->decl.name, s->line, s->col);
+                // A union declared without a value is its first variant with a zeroed payload.
+                if (!s->decl.init)
+                    ST_lower_raw_zero(c, slot, 0, ty->size, s->line, s->col);
                 if (s->decl.init) {
                     if (ST_lower_is_union_construct(s->decl.init))
                         ST_lower_union_construct_into(c, slot, 0, ty, s->decl.init);
@@ -2850,7 +2923,8 @@ static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s) {
             if (!ST_string_eq_cstr(s->assign.op, "=")) {
                 ST_ir_inst_t *cur = ST_ir_read_var(c->cur, bind->key, lhs->ty);
                 ST_ir_op_t op = ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col,
-                                                     ST_ty_is_float(lhs->ty));
+                                                     ST_ty_is_float(lhs->ty),
+                                                     lhs->ty && !lhs->ty->is_signed);
                 rhs = ST_ir_binop(c->cur, op, lhs->ty, cur, rhs, s->line, s->col);
             }
             ST_ir_write_var(c->cur, bind->key, rhs);
@@ -3595,6 +3669,7 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
     c->cur_fn_body = &d->fn.body;
     c->defers = (ST_lower_defers_t){0};
     ST_ht_init(c->arena, &c->scope, 16);
+    c->shadows.count = 0;
     ST_ht_init(c->arena, &c->addr_taken, 16);
     ST_ht_init(c->arena, &c->labels, 8);
     ST_ht_init(c->arena, &c->safe_array_roots, 8);

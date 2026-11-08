@@ -1210,6 +1210,13 @@ static ST_tyexpr_t *ST_clone_tyexpr(ST_arena_t *a, ST_tyexpr_t *te) {
         ST_da_append_arena(a, &n->generic_constraints,
                            ST_clone_tyexpr(a, te->generic_constraints.items[i]));
 
+    n->row_fields = (ST_row_fields_t){0};
+    ST_forrange(0, te->row_fields.count) {
+        ST_row_field_t rf = te->row_fields.items[i];
+        rf.te = ST_clone_tyexpr(a, rf.te);
+        ST_da_append_arena(a, &n->row_fields, rf);
+    }
+
     return n;
 }
 
@@ -1518,6 +1525,94 @@ static void ST_diagnostic_note_constraint(ST_sema_t *se, ST_tyexprs_t *constrain
 
 }
 
+static ST_ty_field_t *ST_struct_find_field(ST_ty_t *t, ST_string_t name) {
+    ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, name))
+        return &t->fields.items[i];
+    return NULL;
+}
+
+static ST_row_field_t *ST_row_find_field(ST_tyexpr_t *row, ST_string_t name) {
+    ST_forrange(0, row->row_fields.count) if (ST_string_eq(row->row_fields.items[i].name, name))
+        return &row->row_fields.items[i];
+    return NULL;
+}
+
+static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, u32 line, u32 col) {
+    if (!want || want->kind != ST_TY_STRUCT || want->is_trait_witness || !want->decl) {
+        ST_diag_error(&se->diag, line, col,
+                      "'%s' is not a struct, but '$" ST_sv_fmt "' requires a struct with fields",
+                      ST_tstr(se, want), ST_sv_args(pt->name));
+        ST_diag_note(&se->diag, pt->line, pt->col, "'$" ST_sv_fmt "' is declared here",
+                     ST_sv_args(pt->name));
+        return 0;
+    }
+    ST_complete_ty(se, want);
+    b8 ok = 1;
+    ST_forrange(0, pt->row_fields.count) {
+        ST_row_field_t *rf = &pt->row_fields.items[i];
+        ST_ty_field_t *sf = ST_struct_find_field(want, rf->name);
+        if (!sf) {
+            ST_diag_error(&se->diag, line, col,
+                          "'%s' is missing field '" ST_sv_fmt "' required by '$" ST_sv_fmt "'",
+                          ST_tstr(se, want), ST_sv_args(rf->name), ST_sv_args(pt->name));
+            ok = 0;
+            continue;
+        }
+        ST_ty_t *rt = ST_resolve_tyexpr(se, rf->te);
+        if (rt && sf->ty != rt && !ST_ty_equal(sf->ty, rt)) {
+            ST_diag_error(&se->diag, line, col,
+                          "field '" ST_sv_fmt "' of '%s' has type '%s', but '$" ST_sv_fmt
+                          "' requires '%s'",
+                          ST_sv_args(rf->name), ST_tstr(se, want), ST_tstr(se, sf->ty),
+                          ST_sv_args(pt->name), ST_tstr(se, rt));
+            ok = 0;
+        }
+    }
+    if (!pt->row_open) {
+        char extras[256];
+        u32 elen = 0;
+        u32 n_extra = 0;
+        ST_forrange(0, want->fields.count) {
+            ST_string_t fname = want->fields.items[i].name;
+            if (ST_row_find_field(pt, fname))
+                continue;
+            if (elen < sizeof(extras))
+                elen += (u32)snprintf(extras + elen, sizeof(extras) - elen, "%s'%.*s'",
+                                      n_extra ? ", " : "", (int)fname.len, (const char *)fname.data);
+            n_extra++;
+        }
+        if (n_extra) {
+            ST_diag_error(&se->diag, line, col,
+                          "'%s' has extra field%s %s that '$" ST_sv_fmt
+                          "' does not list; add '...' to the row to accept other fields",
+                          ST_tstr(se, want), n_extra == 1 ? "" : "s", extras,
+                          ST_sv_args(pt->name));
+            ok = 0;
+        }
+    }
+    if (!ok)
+        ST_diag_note(&se->diag, pt->line, pt->col, "'$" ST_sv_fmt "' is declared here",
+                     ST_sv_args(pt->name));
+    return ok;
+}
+
+static b8 ST_row_allows_field(ST_sema_t *se, ST_ty_t *t, ST_expr_t *e) {
+    ST_forrange(0, se->n_row_ctx) {
+        if (se->row_ctx[i].ty != t)
+            continue;
+        if (ST_row_find_field(se->row_ctx[i].row, e->field.name))
+            return 1;
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "field '" ST_sv_fmt "' is not declared in the row of '$" ST_sv_fmt
+                      "'; add it to the row or access only the listed fields",
+                      ST_sv_args(e->field.name), ST_sv_args(se->row_ctx[i].row->name));
+        ST_diag_note(&se->diag, se->row_ctx[i].row->line, se->row_ctx[i].row->col,
+                     "'$" ST_sv_fmt "' is declared here", ST_sv_args(se->row_ctx[i].row->name));
+        return 0;
+    }
+    return 1;
+}
+
 static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *bindings,
                           u32 arg_line, u32 arg_col) {
     if (!pt || !at)
@@ -1562,6 +1657,9 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
                     return 0;
                 }
             }
+
+            if (pt->has_row && !ST_row_check(se, pt, want, arg_line, arg_col))
+                return 0;
 
             ST_ht_generic_t k = { .tag = pt->name.data, .size = pt->name.len };
             ST_ht_generic_t found = ST_ht_get(bindings, k);
@@ -3039,9 +3137,11 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
 
     if (t->kind == ST_TY_STRUCT) {
         ST_complete_ty(se, t);
-        ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name,
-                                                         e->field.name)) return t->fields.items[i]
-            .ty;
+        ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, e->field.name)) {
+            if (se->n_row_ctx && !ST_row_allows_field(se, t, e))
+                return NULL;
+            return t->fields.items[i].ty;
+        }
         ST_diag_error(&se->diag, e->line, e->col, "'%s' has no field '" ST_sv_fmt "'",
                       ST_tstr(se, t), ST_sv_args(e->field.name));
         if (t->decl)
@@ -6065,6 +6165,26 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     if (se->has_pack && !d->fn.is_prototype)
         ST_pack_substitute_body(se, &d->fn.body);
 
+    u32 save_n_row_ctx = se->n_row_ctx;
+    if (sym->generic_bindings) {
+        ST_forrange(0, sig->params.count) {
+            ST_tyexpr_t *g = sig->params.items[i].te;
+            while (g && g->kind == ST_TE_PTR)
+                g = g->inner;
+            if (!g || g->kind != ST_TE_NAME || !g->is_generic_param || !g->has_row)
+                continue;
+            if (se->n_row_ctx >= 16)
+                break;
+            ST_ht_generic_t gk = {.tag = g->name.data, .size = g->name.len};
+            ST_ty_t *bound = (ST_ty_t *)ST_ht_get(sym->generic_bindings, gk).tag;
+            if (!bound || bound->kind != ST_TY_STRUCT)
+                continue;
+            se->row_ctx[se->n_row_ctx].ty = bound;
+            se->row_ctx[se->n_row_ctx].row = g;
+            se->n_row_ctx++;
+        }
+    }
+
     ST_scope_push(se);
     ST_declare_self_recursive(se, d);
     ST_declare_block_siblings(se, d);
@@ -6088,6 +6208,7 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
         ST_check_stmt(se, d->fn.body.items[i]);
     }
     se->cur_rets = NULL;
+    se->n_row_ctx = save_n_row_ctx;
 
     ST_scope_pop(se);
     se->labels = NULL;

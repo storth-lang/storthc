@@ -39,6 +39,17 @@ typedef enum {
     ST_TE_GENERIC_INST,
 } ST_tyexpr_kind_t;
 
+typedef struct {
+    ST_string_t name;
+    ST_tyexpr_t *te;
+    u32 line, col;
+} ST_row_field_t;
+
+typedef struct {
+    ST_row_field_t *items;
+    u32 count, capacity;
+} ST_row_fields_t;
+
 struct ST_tyexpr_t {
     ST_tyexpr_kind_t kind;
     u32 line, col;
@@ -54,6 +65,9 @@ struct ST_tyexpr_t {
     b8 is_generic_param;
     b8 is_negeated_constraint;
     ST_tyexprs_t generic_constraints; // '$T(A | B)'
+    ST_row_fields_t row_fields;
+    b8 has_row;
+    b8 row_open;
     ST_tyexprs_t generic_args;
     ST_expr_t *typeof_operand;
     ST_ty_t *resolved;
