@@ -241,6 +241,8 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
         return 1;
     if (from->kind == ST_TY_ARRAY && to->kind == ST_TY_SLICE && from->inner == to->inner)
         return 1;
+    if (from->kind == ST_TY_DYN_ARRAY && to->kind == ST_TY_SLICE && from->inner == to->inner)
+        return 1;
     if (from->kind == ST_TY_FN && to->kind == ST_TY_FN)
         return ST_ty_equal(from, to);
     if (from->kind == ST_TY_PTR && to->kind == ST_TY_PTR && from->inner->kind == ST_TY_FN &&
@@ -2878,6 +2880,79 @@ static b8 ST_tyexpr_shape_fits(ST_tyexpr_t *pt, ST_ty_t *at) {
     }
 }
 
+// A trailing '$T...' pack may be empty, so it doesn't count towards the required arguments.
+static u32 ST_fn_template_required(ST_fn_sig_t *sig) {
+    u32 required = sig->params.count - sig->wheres.count;
+    if (sig->has_generic_pack && required)
+        required--;
+    return required;
+}
+
+static b8 ST_fn_template_arity_ok(ST_decl_t *d, u32 n_args) {
+    ST_fn_sig_t *sig = &d->fn.sig;
+    u32 required = ST_fn_template_required(sig);
+    b8 accepts_more = sig->has_any_pack || sig->has_generic_pack || sig->is_variadic;
+    return n_args == required || (accepts_more && n_args >= required);
+}
+
+static b8 ST_has_generic_overload(ST_sema_t *se, ST_string_t name) {
+    ST_syms_t *ovl = ST_overload_find(se, name);
+    if (!ovl)
+        return 0;
+    for (u32 k = 0; k < ovl->count; k++) {
+        ST_sym_t *c = ovl->items[k];
+        if (c->kind == ST_SYM_FN && c->decl && c->decl->kind == ST_DE_FN &&
+            c->decl->fn.sig.generics.count)
+            return 1;
+    }
+    return 0;
+}
+
+// Does this non-generic function accept the call's arguments (arity incl. defaults, and the
+// argument types where they can be known in isolation)?
+static b8 ST_plain_fn_accepts(ST_sema_t *se, ST_sym_t *cand, ST_expr_t *call) {
+    if (!cand->t || !cand->decl || cand->decl->kind != ST_DE_FN)
+        return 0;
+    ST_fn_sig_t *sig = &cand->decl->fn.sig;
+    u32 n_args = call->call.args.count;
+    u32 n_params = cand->t->params.count;
+    b8 var = cand->t->is_variadic || cand->t->has_any_pack;
+    u32 min_args = 0;
+    for (u32 i = 0; i < sig->params.count; i++)
+        if (!sig->params.items[i].def && !sig->params.items[i].is_pack)
+            min_args++;
+    if (n_args < min_args || (!var && n_args > n_params))
+        return 0;
+    for (u32 k = 0; k < n_args && k < n_params; k++) {
+        ST_arg_t *arg = &call->call.args.items[k];
+        if (arg->name.len || ST_dot_field(arg->value) ||
+            (arg->value->kind == ST_EX_STRUCT_LIT && arg->value->struct_lit.is_bracket_lit))
+            continue;
+        if (arg->value->kind == ST_EX_IDENT) {
+            ST_sym_t *tsym = ST_sym_find(se, arg->value->name);
+            if (tsym && tsym->kind == ST_SYM_TYPE)
+                continue;
+        }
+        ST_ty_t *at = ST_type_expr(se, arg->value);
+        if (at && cand->t->params.items[k] && !ST_ty_coerces(se, at, cand->t->params.items[k]))
+            return 0;
+    }
+    return 1;
+}
+
+static ST_sym_t *ST_find_plain_overload(ST_sema_t *se, ST_string_t name, ST_expr_t *call) {
+    ST_syms_t *ovl = ST_overload_find(se, name);
+    if (!ovl)
+        return NULL;
+    for (u32 k = 0; k < ovl->count; k++) {
+        ST_sym_t *c = ovl->items[k];
+        if (c->kind == ST_SYM_FN && c->decl && c->decl->kind == ST_DE_FN &&
+            !c->decl->fn.sig.generics.count && ST_plain_fn_accepts(se, c, call))
+            return c;
+    }
+    return NULL;
+}
+
 static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, ST_expr_t *call) {
     u32 n_args = call->call.args.count;
     ST_syms_t *ovl = ST_overload_find(se, name);
@@ -2897,7 +2972,7 @@ static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, ST_expr
         ST_fn_sig_t *sig = &cand->decl->fn.sig;
         if (!fallback)
             fallback = cand->decl;
-        u32 required = sig->params.count - sig->wheres.count;
+        u32 required = ST_fn_template_required(sig);
         b8 accepts_more = sig->has_any_pack || sig->has_generic_pack || sig->is_variadic;
         if (n_args == required || (accepts_more && n_args >= required)) {
             if (!first_arity)
@@ -2948,6 +3023,34 @@ static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, ST_expr
 // @note: resolves every 'name...' pack-spread argument in 'e->call.args' (parsed by
 // ST_parse_call_args when a call argument is followed by '...') into real, separate
 // arguments
+// Copy of a side-effect free place expression (identifier / field chain), so that spreading
+// 'xs' into 'xs[0], xs[1], ...' never evaluates anything twice.
+static ST_expr_t *ST_clone_place(ST_sema_t *se, ST_expr_t *e) {
+    if (e->kind == ST_EX_IDENT) {
+        ST_expr_t *c = ST_expr_new(se->arena, ST_EX_IDENT, e->line, e->col);
+        c->name = e->name;
+        return c;
+    }
+    if (e->kind == ST_EX_FIELD && e->field.base) {
+        ST_expr_t *base = ST_clone_place(se, e->field.base);
+        if (!base)
+            return NULL;
+        ST_expr_t *c = ST_expr_new(se->arena, ST_EX_FIELD, e->line, e->col);
+        c->field.base = base;
+        c->field.name = e->field.name;
+        return c;
+    }
+    return NULL;
+}
+
+// @note: resolves every pack-spread argument in 'e->call.args', written '...name' (the
+// legacy postfix 'name...' is still accepted), and replaces it by one argument per element:
+//   - the enclosing function's own '$T...' pack  -> its elements
+//   - a '[a, b, c]' literal                      -> the literal's elements
+//   - a fixed array '[N]T' place                 -> xs[0] .. xs[N-1]
+//   - a slice local initialised from '[a, b, c]' -> xs[0] .. xs[N-1]
+// The element count must be known at compile time, since each call site is compiled for
+// exactly that many arguments.
 static void ST_expand_pack_spread_args(ST_sema_t *se, ST_expr_t *e) {
     b8 any_spread = 0;
     for (u32 i = 0; i < e->call.args.count; i++)
@@ -2965,24 +3068,64 @@ static void ST_expand_pack_spread_args(ST_sema_t *se, ST_expr_t *e) {
             ST_da_append_arena(se->arena, &new_args, *arg);
             continue;
         }
-        if (arg->value->kind != ST_EX_IDENT) {
-            ST_diag_error(&se->diag, arg->value->line, arg->value->col,
-                          "'...' after a call argument can only spread a bare '$T...' "
-                          "pack parameter name, not a general expression");
+        ST_expr_t *v = arg->value;
+
+        if (v->kind == ST_EX_IDENT && se->has_pack && ST_string_eq(v->name, se->cur_pack_name)) {
+            for (u32 k = 0; k < se->cur_pack_count; k++) {
+                ST_expr_t *elem = ST_expr_new(se->arena, ST_EX_IDENT, v->line, v->col);
+                elem->name = ST_pack_param_name(se, se->cur_pack_name, k);
+                ST_arg_t new_arg = {.name = (ST_string_t){0}, .value = elem};
+                ST_da_append_arena(se->arena, &new_args, new_arg);
+            }
             continue;
         }
-        if (!se->has_pack || !ST_string_eq(arg->value->name, se->cur_pack_name)) {
-            ST_diag_error(&se->diag, arg->value->line, arg->value->col,
-                          "'" ST_sv_fmt "...' isn't valid here: '" ST_sv_fmt "' must be "
-                          "this function's '$T...' pack parameter",
-                          ST_sv_args(arg->value->name), ST_sv_args(arg->value->name));
+
+        if (v->kind == ST_EX_STRUCT_LIT && v->struct_lit.is_bracket_lit) {
+            for (u32 k = 0; k < v->struct_lit.inits.count; k++) {
+                ST_arg_t new_arg = {.name = (ST_string_t){0},
+                                    .value = v->struct_lit.inits.items[k].value};
+                ST_da_append_arena(se->arena, &new_args, new_arg);
+            }
             continue;
         }
-        for (u32 k = 0; k < se->cur_pack_count; k++) {
-            ST_expr_t *elem =
-                ST_expr_new(se->arena, ST_EX_IDENT, arg->value->line, arg->value->col);
-            elem->name = ST_pack_param_name(se, se->cur_pack_name, k);
-            ST_arg_t new_arg = {.name = (ST_string_t){0}, .value = elem};
+
+        u32 n = 0;
+        b8 known = 0;
+        ST_ty_t *vt = ST_type_expr(se, v);
+        if (vt && vt->kind == ST_TY_ARRAY) {
+            n = (u32)vt->count;
+            known = 1;
+        } else if (vt && vt->kind == ST_TY_SLICE && v->kind == ST_EX_IDENT) {
+            ST_sym_t *vs = ST_sym_find(se, v->name);
+            if (vs && vs->kind == ST_SYM_VAR && vs->has_lit_len) {
+                n = vs->lit_len;
+                known = 1;
+            }
+        }
+        if (!known) {
+            if (!vt)
+                continue; // already diagnosed
+            ST_diag_error(&se->diag, v->line, v->col,
+                          "cannot spread a value of type '%s' into a call: its length isn't "
+                          "known at compile time. Spread a fixed array '[N]T', a '[a, b, c]' "
+                          "literal, a local initialised from one, or this function's own "
+                          "'$T...' pack",
+                          ST_tstr(se, vt));
+            continue;
+        }
+        if (!ST_clone_place(se, v)) {
+            ST_diag_error(&se->diag, v->line, v->col,
+                          "can only spread a plain variable or field access; store the value "
+                          "in a local first");
+            continue;
+        }
+        for (u32 k = 0; k < n; k++) {
+            ST_expr_t *idx_lit = ST_expr_new(se->arena, ST_EX_INT, v->line, v->col);
+            idx_lit->ival = (i64)k;
+            ST_expr_t *ix = ST_expr_new(se->arena, ST_EX_INDEX, v->line, v->col);
+            ix->index.base = ST_clone_place(se, v);
+            ix->index.index = idx_lit;
+            ST_arg_t new_arg = {.name = (ST_string_t){0}, .value = ix};
             ST_da_append_arena(se->arena, &new_args, new_arg);
         }
     }
@@ -3175,8 +3318,32 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                 sym = NULL;
             }
         }
+        // A plain function and generic templates may share a name (e.g. the base case of a
+        // recursive variadic: 'fn f() {..}' next to 'fn f(x: $T, rest: $U...) {..}').
+        // Prefer the plain function when it accepts the call, otherwise the template.
+        if (fn_tmpl && !ST_fn_template_arity_ok(fn_tmpl, e->call.args.count)) {
+            ST_sym_t *plain = ST_find_plain_overload(se, callee->name, e);
+            if (plain) {
+                fn_tmpl = NULL;
+                sym = plain;
+            }
+        } else if (!fn_tmpl && sym && sym->kind == ST_SYM_FN && sym->t && sym->decl &&
+                   sym->decl->kind == ST_DE_FN && !sym->decl->fn.sig.generics.count &&
+                   ST_has_generic_overload(se, callee->name) &&
+                   !ST_plain_fn_accepts(se, sym, e)) {
+            ST_sym_t *plain = ST_find_plain_overload(se, callee->name, e);
+            if (plain) {
+                sym = plain;
+            } else {
+                ST_decl_t *td = ST_select_fn_template(se, callee->name, e);
+                if (td && ST_fn_template_arity_ok(td, e->call.args.count)) {
+                    fn_tmpl = td;
+                    sym = NULL;
+                }
+            }
+        }
         if (!sym) {
-            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e);
+            ST_decl_t *tdecl = fn_tmpl ? fn_tmpl : ST_select_fn_template(se, callee->name, e);
             if (tdecl)
                 fn_tmpl = tdecl;
             else if (ST_sym_find_in(&se->templates, callee->name))
@@ -5018,6 +5185,14 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
     }
 
     ST_declare_local_ex(se, s->decl.name, t, s->line, s->col, s->decl.is_const);
+    if (t && t->kind == ST_TY_SLICE && s->decl.init && s->decl.init->kind == ST_EX_STRUCT_LIT &&
+        s->decl.init->struct_lit.is_bracket_lit) {
+        ST_sym_t *lsym = ST_sym_find_in(&se->scope->table, s->decl.name);
+        if (lsym && lsym->kind == ST_SYM_VAR) {
+            lsym->has_lit_len = 1;
+            lsym->lit_len = s->decl.init->struct_lit.inits.count;
+        }
+    }
 }
 
 static ST_expr_t *ST_lvalue_root_ident(ST_expr_t *e) {
@@ -5037,6 +5212,12 @@ static ST_expr_t *ST_lvalue_root_ident(ST_expr_t *e) {
 }
 
 static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
+    if (s->assign.lhs && s->assign.lhs->kind == ST_EX_IDENT) {
+        // reassigning a slice invalidates its remembered literal length
+        ST_sym_t *asym = ST_sym_find(se, s->assign.lhs->name);
+        if (asym && asym->kind == ST_SYM_VAR)
+            asym->has_lit_len = 0;
+    }
     ST_ty_t *lt = ST_type_expr(se, s->assign.lhs);
     ST_ty_t *rt = {0};
     ST_expr_t *rv = s->assign.rhs;
@@ -5649,39 +5830,6 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
     ST_check_stmt(se, s);
 }
 
-static void ST_check_comptime_for_pack(ST_sema_t *se, ST_stmt_t *s) {
-    ST_stmts_t unrolled = {0};
-    ST_forrange(0, se->cur_pack_count) {
-        ST_expr_t *idx_lit = ST_expr_new(se->arena, ST_EX_INT, s->line, s->col);
-        idx_lit->ival = (i64)i;
-
-        ST_expr_t *base = ST_expr_new(se->arena, ST_EX_IDENT, s->line, s->col);
-        base->name = se->cur_pack_name;
-
-        ST_expr_t *access = ST_expr_new(se->arena, ST_EX_INDEX, s->line, s->col);
-        access->index.base = base;
-        access->index.index = idx_lit;
-
-        ST_expr_t spec_lit = {0};
-        spec_lit.kind = ST_EX_INT;
-        spec_lit.line = s->line;
-        spec_lit.col = s->col;
-        spec_lit.ival = (i64)i;
-
-        ST_stmts_t copy = ST_clone_body(se->arena, &s->for_array.body);
-        ST_forrange(0, copy.count)
-            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.iter, access);
-        if (s->for_array.spec_iter.len)
-            ST_forrange(0, copy.count)
-            ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
-        ST_string_t no_target = {0};
-        ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
-        ST_append_unrolled_iter(se, &unrolled, copy, s);
-    }
-    ST_rewrite_as_block(s, unrolled);
-    ST_check_stmt(se, s);
-}
-
 static b8 ST_expr_contains_ident(ST_expr_t *e, ST_string_t name) {
     if (!e)
         return 0;
@@ -6172,11 +6320,18 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             b8 targets_pack = se->has_pack && s->for_array.target->kind == ST_EX_IDENT &&
                 ST_string_eq(s->for_array.target->name, se->cur_pack_name);
             b8 targets_fields = s->for_array.target->kind == ST_EX_FIELDS;
-            if (s->for_array.is_comptime || targets_pack || targets_fields) {
+            if (targets_pack) {
+                ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
+                              "cannot iterate the pack '" ST_sv_fmt "' with 'for'; process it "
+                              "recursively instead: take the first element and recurse on the "
+                              "rest, e.g. 'fn f(first: $T, rest: $U...) { ...; f(...rest); }' "
+                              "with a 'fn f() {}' base case",
+                              ST_sv_args(s->for_array.target->name));
+                break;
+            }
+            if (s->for_array.is_comptime || targets_fields) {
                 if (targets_fields)
                     ST_check_comptime_for_fields(se, s);
-                else if (targets_pack)
-                    ST_check_comptime_for_pack(se, s);
                 else
                     ST_check_comptime_for_array(se, s);
                 break;

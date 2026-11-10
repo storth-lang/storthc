@@ -32,3 +32,15 @@ if err {
     default { ... }
 }
 ```
+
+## Backing type
+
+An enum or enum_flag is stored as `u32` by default. Pick another integer type with `: type`:
+
+```rs
+enum Color { Red; Green; Blue; }          // u32, 4 bytes
+enum Small : u8 { A; B := 200; }          // 1 byte
+enum_flag Perm : i64 { Read; Write; }     // 8 bytes
+```
+
+A signed backing type such as `i32` is sign-extended when loaded.

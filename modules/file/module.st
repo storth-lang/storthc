@@ -79,7 +79,7 @@ fn die(type: logKind, msg: string, code := #code, args: $T...) -> void {
         case logKind.Error then libc.printf("%s:%d:%d: ERROR: ", code.filename, code.line, code.col);
     }
 
-    if msg != "" then libc.printf(msg, args...);
+    if msg != "" then libc.printf(msg, ...args);
     libc.exit(1);
 }
 // This will just print todo
@@ -89,7 +89,7 @@ pub fn todo(msg : string) -> void {
 
 // @bug: Cry why the fuck is the arg packing #code.
 pub fn log_error(msg : string,  args: $T...) -> void {
-    die(logKind.Error, msg, args...);
+    die(logKind.Error, msg, ...args);
 }
 
 // TODO: log errors if provided

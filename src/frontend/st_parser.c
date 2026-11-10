@@ -562,10 +562,14 @@ static b8 ST_parse_call_args(ST_parser_t *p, ST_args_t *out) {
             arg.name = t->text;
             p->pos += 2;
         }
+        if (ST_at_symbol(p, "...")) { // prefix form: f(...xs)
+            p->pos++;
+            arg.is_pack_spread = 1;
+        }
         arg.value = ST_parse_expr(p);
         if (!arg.value)
             return 0;
-        if (ST_at_symbol(p, "...")) {
+        if (ST_at_symbol(p, "...")) { // postfix form: f(xs...)
             p->pos++;
             arg.is_pack_spread = 1;
         }

@@ -31,7 +31,7 @@ static void ST_emit_sym(FILE *out, ST_string_t name, b8 rename_main) {
 
 static void ST_int_narrow(FILE *out, ST_ty_t *ty) {
     u32 size = ty && ty->size ? ty->size : 8;
-    b8 _signed = ty && ty->kind == ST_TY_INT && ty->is_signed;
+    b8 _signed = ty && (ty->kind == ST_TY_INT || ty->kind == ST_TY_ENUM) && ty->is_signed;
     switch (size) {
         case 1:
             fprintf(out, "    %s rax, al\n", _signed ? "movsx" : "movzx");
@@ -76,7 +76,7 @@ static i32 ST_ret_buf_off(ST_ir_inst_t *call_inst, u32 index) {
 
 static void ST_mem_load(FILE *out, ST_ty_t *ty) {
     u32 size = ty && ty->size ? ty->size : 8;
-    b8 _signed = ty && ty->kind == ST_TY_INT && ty->is_signed;
+    b8 _signed = ty && (ty->kind == ST_TY_INT || ty->kind == ST_TY_ENUM) && ty->is_signed;
     switch (size) {
         case 1:
             fprintf(out, "    %s rax, byte [rcx]\n", _signed ? "movsx" : "movzx");

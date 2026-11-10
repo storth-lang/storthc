@@ -174,8 +174,22 @@ ST_ty_t *ST_ty_for_decls(ST_ty_ctx_t *ctx, ST_decl_t *d) {
     ST_ty_t *t = ST_ty_alloc(ctx, kind, 0, 1);
     t->decl = d;
     if (kind == ST_TY_ENUM) {
-        t->size = 8;
-        t->align = 8;
+        // Backing integer type: `enum Foo : u8 { ... }`, default u32.
+        ST_ty_t *backing = ctx->prim[ST_tu32];
+        if (d->enum_.ty && d->enum_.ty->kind == ST_TE_NAME) {
+            ST_forrange(0, ST_ti64 + 1) {
+                ST_ty_t *cand = ctx->prim[i];
+                if (cand && cand->kind == ST_TY_INT &&
+                    ST_string_eq_cstr(d->enum_.ty->name, ST_type_names[i])) {
+                    backing = cand;
+                    break;
+                }
+            }
+        }
+        t->size = backing->size;
+        t->align = backing->align;
+        t->width = backing->width;
+        t->is_signed = backing->is_signed;
         t->state = ST_TY_STATE_DONE;
     }
     ST_decl_t **pd = ST_arena_push_zeroed(ctx->arena, sizeof(*pd));

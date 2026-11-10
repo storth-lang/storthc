@@ -29,6 +29,8 @@ typedef struct {
     ST_ht_t *generic_bindings;
     ST_string_t template_name;
     b8 is_const; // for ST_SYM_VAR: declared with '::'
+    b8 has_lit_len;  // for ST_SYM_VAR: a slice initialised from a '[a, b, c]' literal
+    u32 lit_len;     // ...and that literal's element count, usable by '...xs' spreads
     ST_tyexprs_t *generic_constraints;
 } ST_sym_t;
 

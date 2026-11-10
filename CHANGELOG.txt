@@ -1,5 +1,15 @@
 # Storth Programming Language
 
+2026:11:12
+- Enums and enum_flags are now backed by `u32` by default instead of 8 bytes, and `enum Foo : u8 {..}`
+  actually picks the integer type and size.
+- Variadic packs are processed recursively like C++ templates: `fn f(first: $T, rest: $U...)` with a
+  plain `fn f()` base case. A plain function and generic templates can share a name, and a
+  trailing pack may be empty.
+- `for x: pack` is removed and is now a compile error pointing at recursion.
+- `f(...xs)` spreads a fixed array, a `[a, b, c]` literal, or a local initialised from
+  one into a variadic call.
+
 2026:07:15
 - Added support for structs.
 - The intermediate representation correctly will auto dereference struct members.

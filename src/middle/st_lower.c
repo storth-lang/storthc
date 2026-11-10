@@ -484,9 +484,21 @@ static void ST_lower_union_construct_into(ST_lower_ctx_t *c, ST_ir_inst_t *base,
         ST_lower_raw_zero(c, base, off + 8, ut->size - 8, lit->line, lit->col);
 }
 
+// Sema may overwrite an identifier's type with the type it is being coerced to, so for a
+// local the binding's type is the one that actually describes its storage.
+static ST_ty_t *ST_lower_source_ty(ST_lower_ctx_t *c, ST_expr_t *v) {
+    if (v->kind == ST_EX_IDENT) {
+        ST_lower_bind_t *b = ST_lower_scope_find(c, v->name);
+        if (b && b->ty)
+            return b->ty;
+    }
+    return v->ty;
+}
+
 static void ST_lower_value_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *ty,
                                 ST_expr_t *v) {
     u32 line = v->line, col = v->col;
+    ST_ty_t *vty = ST_lower_source_ty(c, v);
     switch (ty->kind) {
         case ST_TY_STRUCT:
         ST_lower_struct_zero(c, base, off, ty, line, col);
@@ -528,6 +540,27 @@ static void ST_lower_value_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, 
         if (v->kind == ST_EX_STRUCT_LIT && v->struct_lit.is_bracket_lit && ty->kind == ST_TY_SLICE) {
             ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, off, ty, line, col);
             ST_lower_bracket_lit_into(c, dp, ty, v);
+        } else if (ty->kind == ST_TY_SLICE && vty && vty->kind == ST_TY_ARRAY &&
+                   vty->inner == ty->inner) {
+            // [N]T -> []T: build the {ptr, len} header from the array's address.
+            ST_ir_inst_t *arr_addr = ST_lower_lvalue_addr(c, v);
+            if (arr_addr) {
+                ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ty->inner);
+                ST_ir_inst_t *pf = ST_lower_field_ptr(c, base, off, ptr_ty, line, col);
+                ST_ir_store(c->cur, ptr_ty, pf, arr_addr, line, col);
+
+                ST_ty_t *len_ty = c->sema->tys.prim[ST_ti64];
+                ST_ir_inst_t *lf = ST_lower_field_ptr(c, base, off + 8, len_ty, line, col);
+                ST_ir_store(c->cur, len_ty, lf,
+                            ST_ir_const_int(c->cur, len_ty, (i64)vty->count), line, col);
+            }
+        } else if (ty->kind == ST_TY_SLICE && vty && vty->kind == ST_TY_DYN_ARRAY &&
+                   vty->inner == ty->inner) {
+            // [..]T -> []T: a dyn-array is {items, count, capacity}, a slice is
+            // {ptr, len}, so the first 16 bytes are already the slice header.
+            ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
+            if (src)
+                ST_lower_raw_copy(c, base, off, src, 0, ty->size, line, col);
         } else {
             ST_ir_inst_t *src = ST_lower_lvalue_addr(c, v);
             if (src)
@@ -896,7 +929,8 @@ static void ST_lower_struct_lit_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 
                     ST_lower_array_copy(c, base, off + (i32)foff, src, 0, fty, fi->value->line,
                                         fi->value->col);
             }
-        } else if (fty->kind == ST_TY_TAG_UNION) {
+        } else if (fty->kind == ST_TY_TAG_UNION || fty->kind == ST_TY_SLICE ||
+                   fty->kind == ST_TY_DYN_ARRAY) {
             ST_lower_value_into(c, base, off + (i32)foff, fty, fi->value);
         } else if (fty->kind == ST_TY_STRING) {
             ST_ir_inst_t *src = ST_lower_string_addr(c, fi->value);

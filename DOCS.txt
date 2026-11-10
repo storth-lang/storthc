@@ -73,7 +73,7 @@ f.name = "Urmom"; // This is an invalid code because you are trying to access an
 
 ### Enums and Enum_Flags
 Enums work the exact same way enums from C work. They are completely identical.
-The `: u32` is optional it means we can have optional specifier of types of enum by default it will be i64 but it is customizable.
+The `: u32` is optional, it is the integer type that backs the enum and by default it is u32. Any integer type (u8..u64, i8..i64) can be given and the enum takes that size.
 
 `src_code
 enum Foo : u32 {

@@ -24,7 +24,7 @@ static i32 ST_fasm_slot(ST_ir_inst_t *v) {
 
 static void ST_fasm_int_narrow(FILE *out, ST_ty_t *ty) {
     u32 size = ty && ty->size ? ty->size : 8;
-    b8 _signed = ty && ty->kind == ST_TY_INT && ty->is_signed;
+    b8 _signed = ty && (ty->kind == ST_TY_INT || ty->kind == ST_TY_ENUM) && ty->is_signed;
     switch (size) {
         case 1:
             fprintf(out, "%s rax, al\n", _signed ? "movsx" : "movzx");
@@ -64,7 +64,7 @@ static i32 ST_fasm_ret_buf_off(ST_ir_inst_t *call_inst, u32 index) {
 
 static void ST_fasm_mem_load(FILE *out, ST_ty_t *ty) {
     u32 size = ty && ty->size ? ty->size : 8;
-    b8 _signed = ty && ty->kind == ST_TY_INT && ty->is_signed;
+    b8 _signed = ty && (ty->kind == ST_TY_INT || ty->kind == ST_TY_ENUM) && ty->is_signed;
     switch (size) {
         case 1:
             fprintf(out, "    %s rax, byte [rcx]\n", _signed ? "movsx" : "movzx");
