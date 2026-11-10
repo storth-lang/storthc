@@ -68,6 +68,7 @@ struct ST_tyexpr_t {
     ST_row_fields_t row_fields;
     b8 has_row;
     b8 row_open;
+    b8 row_is_union;
     ST_tyexprs_t generic_args;
     ST_expr_t *typeof_operand;
     ST_ty_t *resolved;

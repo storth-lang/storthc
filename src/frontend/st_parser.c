@@ -1997,11 +1997,12 @@ static void ST_collect_generic_te(ST_parser_t *p, ST_tyexpr_t *te, ST_strings_t 
     if (te->kind == ST_TE_NAME) {
         if (!te->is_generic_param)
             return;
-        ST_forrange(0, out->count)
-            if (ST_string_eq(out->items[i], te->name))
-                return;
-
-        ST_da_append_arena(p->arena, out, te->name);
+        b8 present = 0;
+        ST_forrange(0, out->count) if (ST_string_eq(out->items[i], te->name)) present = 1;
+        if (!present)
+            ST_da_append_arena(p->arena, out, te->name);
+        ST_forrange(0, te->row_fields.count)
+            ST_collect_generic_te(p, te->row_fields.items[i].te, out);
         return;
     }
     ST_collect_generic_te(p, te->inner, out);
@@ -2361,11 +2362,26 @@ static b8 ST_parse_row(ST_parser_t *p, ST_tyexpr_t *g) {
             ST_perr_here(p, "field '" ST_sv_fmt "' is listed twice in the row", ST_sv_args(rf.name));
             return 0;
         }
-        if (!ST_expect_sym(p, ":"))
+        b8 is_variant = !ST_at_symbol(p, ":");
+        if (g->row_fields.count && is_variant != g->row_is_union) {
+            ST_perr_here(p, "a row lists either fields ('name: Type') or variants ('Name(Type)'), "
+                            "not both");
             return 0;
-        rf.te = ST_parse_type(p);
-        if (!rf.te)
-            return 0;
+        }
+        g->row_is_union = is_variant;
+        if (is_variant) {
+            if (ST_at_symbol(p, "(")) {
+                p->pos++;
+                rf.te = ST_parse_type(p);
+                if (!rf.te || !ST_expect_sym(p, ")"))
+                    return 0;
+            }
+        } else {
+            p->pos++;
+            rf.te = ST_parse_type(p);
+            if (!rf.te)
+                return 0;
+        }
         ST_da_append_arena(p->arena, &g->row_fields, rf);
         if (ST_at_symbol(p, ",")) {
             p->pos++;

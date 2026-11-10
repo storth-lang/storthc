@@ -32,6 +32,32 @@ typedef struct {
     ST_tyexprs_t *generic_constraints;
 } ST_sym_t;
 
+typedef struct {
+    ST_decl_t *tmpl;
+    ST_ht_t *bindings;
+    b8 has_pack;
+    u32 n_pack_args;
+    b8 has_bound_str;
+    ST_string_t bound_str_param;
+    ST_string_t bound_str_value;
+} ST_pending_standin_t;
+
+typedef struct {
+    ST_pending_standin_t *items;
+    u32 count, capacity;
+} ST_pending_standins_t;
+
+typedef struct {
+    ST_string_t name;
+    ST_diag_loc_t locs[16];
+    u32 n_locs;
+} ST_standin_fail_t;
+
+typedef struct {
+    ST_standin_fail_t **items;
+    u32 count, capacity;
+} ST_standin_fails_t;
+
 typedef struct ST_scope_t ST_scope_t;
 
 struct ST_scope_t {
@@ -50,11 +76,12 @@ typedef struct {
     ST_ty_ctx_t tys;
     ST_tys_t *cur_rets;
     ST_decl_t *cur_fn_decl;
-    struct {
-        ST_ty_t *ty;
-        ST_tyexpr_t *row;
-    } row_ctx[16];
-    u32 n_row_ctx;
+    u32 in_standin;
+    u32 n_standins;
+    ST_pending_standins_t pending_standins;
+    u32 n_pending_done;
+    ST_strings_t standin_done;
+    ST_standin_fails_t standin_fails;
     ST_ty_t *type_info_ty;
     ST_program_t *prog;
     ST_ht_t templates;

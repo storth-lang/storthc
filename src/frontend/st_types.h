@@ -64,6 +64,9 @@ struct ST_ty_t {
     ST_ty_state_t state;
     b8 is_trait_witness;
     ST_decl_t *trait_decl;
+    b8 is_standin;
+    b8 standin_open;
+    ST_tyexpr_t *standin_row;
 };
 
 typedef struct {

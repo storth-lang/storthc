@@ -1213,7 +1213,7 @@ static ST_tyexpr_t *ST_clone_tyexpr(ST_arena_t *a, ST_tyexpr_t *te) {
     n->row_fields = (ST_row_fields_t){0};
     ST_forrange(0, te->row_fields.count) {
         ST_row_field_t rf = te->row_fields.items[i];
-        rf.te = ST_clone_tyexpr(a, rf.te);
+        rf.te = rf.te ? ST_clone_tyexpr(a, rf.te) : NULL;
         ST_da_append_arena(a, &n->row_fields, rf);
     }
 
@@ -1525,6 +1525,48 @@ static void ST_diagnostic_note_constraint(ST_sema_t *se, ST_tyexprs_t *constrain
 
 }
 
+static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *bindings,
+                          u32 arg_line, u32 arg_col);
+
+static b8 ST_tyexpr_mentions_generic(ST_tyexpr_t *te) {
+    if (!te)
+        return 0;
+    if (te->kind == ST_TE_NAME && te->is_generic_param)
+        return 1;
+    if (ST_tyexpr_mentions_generic(te->inner))
+        return 1;
+    for (u32 k = 0; k < te->fn_params.count; k++)
+        if (ST_tyexpr_mentions_generic(te->fn_params.items[k]))
+            return 1;
+    for (u32 k = 0; k < te->fn_rets.count; k++)
+        if (ST_tyexpr_mentions_generic(te->fn_rets.items[k]))
+            return 1;
+    for (u32 k = 0; k < te->generic_args.count; k++)
+        if (ST_tyexpr_mentions_generic(te->generic_args.items[k]))
+            return 1;
+    return 0;
+}
+
+static ST_tyexpr_t *ST_find_generic_use(ST_tyexpr_t *te, ST_string_t name) {
+    if (!te)
+        return NULL;
+    if (te->kind == ST_TE_NAME && te->is_generic_param && ST_string_eq(te->name, name))
+        return te;
+    ST_tyexpr_t *r = ST_find_generic_use(te->inner, name);
+    if (r)
+        return r;
+    for (u32 k = 0; k < te->fn_params.count; k++)
+        if ((r = ST_find_generic_use(te->fn_params.items[k], name)))
+            return r;
+    for (u32 k = 0; k < te->fn_rets.count; k++)
+        if ((r = ST_find_generic_use(te->fn_rets.items[k], name)))
+            return r;
+    for (u32 k = 0; k < te->generic_args.count; k++)
+        if ((r = ST_find_generic_use(te->generic_args.items[k], name)))
+            return r;
+    return NULL;
+}
+
 static ST_ty_field_t *ST_struct_find_field(ST_ty_t *t, ST_string_t name) {
     ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, name))
         return &t->fields.items[i];
@@ -1537,7 +1579,114 @@ static ST_row_field_t *ST_row_find_field(ST_tyexpr_t *row, ST_string_t name) {
     return NULL;
 }
 
-static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, u32 line, u32 col) {
+static ST_variant_spec_t *ST_union_find_variant(ST_ty_t *t, ST_string_t name) {
+    ST_variant_specs_t *vs = &t->decl->tag_union.variants;
+    ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, name))
+        return &vs->items[i];
+    return NULL;
+}
+
+static b8 ST_row_check_union(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, ST_ht_t *bindings,
+                             u32 line, u32 col) {
+    if (!want || want->kind != ST_TY_TAG_UNION || want->is_trait_witness || !want->decl) {
+        ST_diag_error(&se->diag, line, col,
+                      "'%s' is not a tag union, but '$" ST_sv_fmt "' requires one with variants",
+                      ST_tstr(se, want), ST_sv_args(pt->name));
+        ST_diag_note(&se->diag, pt->line, pt->col, "'$" ST_sv_fmt "' is declared here",
+                     ST_sv_args(pt->name));
+        return 0;
+    }
+    ST_complete_ty(se, want);
+    b8 ok = 1;
+    ST_forrange(0, pt->row_fields.count) {
+        ST_row_field_t *rf = &pt->row_fields.items[i];
+        ST_variant_spec_t *sv = ST_union_find_variant(want, rf->name);
+        if (!sv) {
+            ST_diag_error(&se->diag, line, col,
+                          "'%s' is missing variant '" ST_sv_fmt "' required by '$" ST_sv_fmt "'",
+                          ST_tstr(se, want), ST_sv_args(rf->name), ST_sv_args(pt->name));
+            ok = 0;
+            continue;
+        }
+        if ((rf->te != NULL) != (sv->payload != NULL)) {
+            ST_diag_error(&se->diag, line, col,
+                          "variant '" ST_sv_fmt "' of '%s' %s a payload, but the row of '$" ST_sv_fmt
+                          "' says it %s",
+                          ST_sv_args(rf->name), ST_tstr(se, want), sv->payload ? "has" : "has no",
+                          ST_sv_args(pt->name), rf->te ? "has one" : "has none");
+            ok = 0;
+            continue;
+        }
+        if (!rf->te)
+            continue;
+        if (ST_tyexpr_mentions_generic(rf->te)) {
+            ST_ty_t *vt0 = ST_resolve_tyexpr(se, sv->payload);
+            if (vt0) {
+                u32 before = se->diag.n_errors;
+                if (!ST_unify_tyexpr(se, rf->te, vt0, bindings, line, col)) {
+                    if (se->diag.n_errors == before)
+                        ST_diag_error(&se->diag, line, col,
+                                      "variant '" ST_sv_fmt "' of '%s' carries '%s', which conflicts "
+                                      "with what '$" ST_sv_fmt "' needs for it",
+                                      ST_sv_args(rf->name), ST_tstr(se, want), ST_tstr(se, vt0),
+                                      ST_sv_args(pt->name));
+                    ok = 0;
+                }
+            }
+            continue;
+        }
+        ST_ty_t *rt = ST_resolve_tyexpr(se, rf->te);
+        ST_ty_t *vt = ST_resolve_tyexpr(se, sv->payload);
+        if (rt && vt && vt != rt && !ST_ty_equal(vt, rt)) {
+            ST_diag_error(&se->diag, line, col,
+                          "variant '" ST_sv_fmt "' of '%s' carries '%s', but '$" ST_sv_fmt
+                          "' requires '%s'",
+                          ST_sv_args(rf->name), ST_tstr(se, want), ST_tstr(se, vt),
+                          ST_sv_args(pt->name), ST_tstr(se, rt));
+            ok = 0;
+        }
+    }
+    if (!pt->row_open && want->is_standin && want->standin_open && want->standin_row) {
+        ST_diag_error(&se->diag, line, col,
+                      "'$" ST_sv_fmt "' may have variants beyond its row, so it cannot satisfy the "
+                      "closed row of '$" ST_sv_fmt "'; add '...' to the row of '$" ST_sv_fmt "'",
+                      ST_sv_args(want->standin_row->name), ST_sv_args(pt->name),
+                      ST_sv_args(pt->name));
+        ok = 0;
+    }
+    if (!pt->row_open) {
+        char extras[256];
+        u32 elen = 0;
+        u32 n_extra = 0;
+        ST_variant_specs_t *vs = &want->decl->tag_union.variants;
+        ST_forrange(0, vs->count) {
+            ST_string_t vn = vs->items[i].name;
+            if (ST_row_find_field(pt, vn))
+                continue;
+            if (elen < sizeof(extras))
+                elen += (u32)snprintf(extras + elen, sizeof(extras) - elen, "%s'%.*s'",
+                                      n_extra ? ", " : "", (int)vn.len, (const char *)vn.data);
+            n_extra++;
+        }
+        if (n_extra) {
+            ST_diag_error(&se->diag, line, col,
+                          "'%s' has extra variant%s %s that '$" ST_sv_fmt
+                          "' does not list; add '...' to the row to accept other variants",
+                          ST_tstr(se, want), n_extra == 1 ? "" : "s", extras,
+                          ST_sv_args(pt->name));
+            ok = 0;
+        }
+    }
+    if (!ok)
+        ST_diag_note(&se->diag, pt->line, pt->col, "'$" ST_sv_fmt "' is declared here",
+                     ST_sv_args(pt->name));
+    return ok;
+}
+
+static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, ST_ht_t *bindings, u32 line,
+                       u32 col) {
+    if (pt->row_is_union)
+        return ST_row_check_union(se, pt, want, bindings, line, col);
     if (!want || want->kind != ST_TY_STRUCT || want->is_trait_witness || !want->decl) {
         ST_diag_error(&se->diag, line, col,
                       "'%s' is not a struct, but '$" ST_sv_fmt "' requires a struct with fields",
@@ -1558,6 +1707,19 @@ static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, u32 line, 
             ok = 0;
             continue;
         }
+        if (ST_tyexpr_mentions_generic(rf->te)) {
+            u32 before = se->diag.n_errors;
+            if (!ST_unify_tyexpr(se, rf->te, sf->ty, bindings, line, col)) {
+                if (se->diag.n_errors == before)
+                    ST_diag_error(&se->diag, line, col,
+                                  "field '" ST_sv_fmt "' of '%s' has type '%s', which conflicts with "
+                                  "what '$" ST_sv_fmt "' needs for it",
+                                  ST_sv_args(rf->name), ST_tstr(se, want), ST_tstr(se, sf->ty),
+                                  ST_sv_args(pt->name));
+                ok = 0;
+            }
+            continue;
+        }
         ST_ty_t *rt = ST_resolve_tyexpr(se, rf->te);
         if (rt && sf->ty != rt && !ST_ty_equal(sf->ty, rt)) {
             ST_diag_error(&se->diag, line, col,
@@ -1567,6 +1729,14 @@ static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, u32 line, 
                           ST_sv_args(pt->name), ST_tstr(se, rt));
             ok = 0;
         }
+    }
+    if (!pt->row_open && want->is_standin && want->standin_open && want->standin_row) {
+        ST_diag_error(&se->diag, line, col,
+                      "'$" ST_sv_fmt "' may have fields beyond its row, so it cannot satisfy the "
+                      "closed row of '$" ST_sv_fmt "'; add '...' to the row of '$" ST_sv_fmt "'",
+                      ST_sv_args(want->standin_row->name), ST_sv_args(pt->name),
+                      ST_sv_args(pt->name));
+        ok = 0;
     }
     if (!pt->row_open) {
         char extras[256];
@@ -1594,23 +1764,6 @@ static b8 ST_row_check(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *want, u32 line, 
         ST_diag_note(&se->diag, pt->line, pt->col, "'$" ST_sv_fmt "' is declared here",
                      ST_sv_args(pt->name));
     return ok;
-}
-
-static b8 ST_row_allows_field(ST_sema_t *se, ST_ty_t *t, ST_expr_t *e) {
-    ST_forrange(0, se->n_row_ctx) {
-        if (se->row_ctx[i].ty != t)
-            continue;
-        if (ST_row_find_field(se->row_ctx[i].row, e->field.name))
-            return 1;
-        ST_diag_error(&se->diag, e->line, e->col,
-                      "field '" ST_sv_fmt "' is not declared in the row of '$" ST_sv_fmt
-                      "'; add it to the row or access only the listed fields",
-                      ST_sv_args(e->field.name), ST_sv_args(se->row_ctx[i].row->name));
-        ST_diag_note(&se->diag, se->row_ctx[i].row->line, se->row_ctx[i].row->col,
-                     "'$" ST_sv_fmt "' is declared here", ST_sv_args(se->row_ctx[i].row->name));
-        return 0;
-    }
-    return 1;
 }
 
 static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *bindings,
@@ -1658,7 +1811,7 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
                 }
             }
 
-            if (pt->has_row && !ST_row_check(se, pt, want, arg_line, arg_col))
+            if (pt->has_row && !ST_row_check(se, pt, want, bindings, arg_line, arg_col))
                 return 0;
 
             ST_ht_generic_t k = { .tag = pt->name.data, .size = pt->name.len };
@@ -1763,6 +1916,129 @@ static ST_string_t ST_pack_param_name(ST_sema_t *se, ST_string_t base, u32 k) {
     u8 *nb = ST_arena_push(se->arena, (u32)n);
     memcpy(nb, buf, (u32)n);
     return (ST_string_t){.data = nb, .len = (u32)n};
+}
+
+static ST_tyexpr_t *ST_row_param_te(ST_tyexpr_t *te) {
+    while (te && te->kind == ST_TE_PTR)
+        te = te->inner;
+    if (te && te->kind == ST_TE_NAME && te->is_generic_param && te->has_row)
+        return te;
+    return NULL;
+}
+
+static b8 ST_template_has_row(ST_decl_t *tmpl) {
+    for (u32 k = 0; k < tmpl->fn.sig.params.count; k++)
+        if (ST_row_param_te(tmpl->fn.sig.params.items[k].te))
+            return 1;
+    return 0;
+}
+
+static b8 ST_generic_is_row_bound(ST_decl_t *tmpl, ST_string_t g) {
+    for (u32 k = 0; k < tmpl->fn.sig.params.count; k++) {
+        ST_tyexpr_t *te = ST_row_param_te(tmpl->fn.sig.params.items[k].te);
+        if (te && ST_string_eq(te->name, g))
+            return 1;
+    }
+    return 0;
+}
+
+static ST_tyexpr_t *ST_row_generic_use(ST_decl_t *tmpl, ST_string_t g) {
+    for (u32 k = 0; k < tmpl->fn.sig.params.count; k++) {
+        ST_tyexpr_t *rt = ST_row_param_te(tmpl->fn.sig.params.items[k].te);
+        if (!rt)
+            continue;
+        for (u32 m = 0; m < rt->row_fields.count; m++) {
+            ST_tyexpr_t *use = ST_find_generic_use(rt->row_fields.items[m].te, g);
+            if (use)
+                return use;
+        }
+    }
+    return NULL;
+}
+
+static b8 ST_generic_row_determined(ST_decl_t *tmpl, ST_string_t g) {
+    if (!ST_row_generic_use(tmpl, g))
+        return 0;
+    for (u32 k = 0; k < tmpl->fn.sig.params.count; k++) {
+        ST_tyexpr_t *te = tmpl->fn.sig.params.items[k].te;
+        if (ST_row_param_te(te))
+            continue;
+        if (ST_find_generic_use(te, g))
+            return 0;
+    }
+    return 1;
+}
+
+static b8 ST_row_template_pure(ST_decl_t *tmpl) {
+    if (!ST_template_has_row(tmpl))
+        return 0;
+    for (u32 k = 0; k < tmpl->fn.sig.generics.count; k++) {
+        ST_string_t g = tmpl->fn.sig.generics.items[k];
+        if (!ST_generic_is_row_bound(tmpl, g) && !ST_generic_row_determined(tmpl, g))
+            return 0;
+    }
+    return 1;
+}
+
+static ST_standin_fail_t *ST_standin_failure(ST_sema_t *se, ST_string_t name) {
+    for (u32 k = 0; k < se->standin_fails.count; k++)
+        if (ST_string_eq(se->standin_fails.items[k]->name, name))
+            return se->standin_fails.items[k];
+    return NULL;
+}
+
+static void ST_queue_standin(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bindings, b8 has_pack,
+                             u32 n_pack_args, b8 has_bound_str, ST_string_t bound_str_param,
+                             ST_string_t bound_str_value) {
+    char key[1024];
+    u32 len = (u32)snprintf(key, sizeof(key), ST_sv_fmt "|%u|", ST_sv_args(tmpl->name), tmpl->line);
+    ST_tyexpr_t *pack_te = NULL;
+    if (has_pack && tmpl->fn.sig.params.count)
+        pack_te = tmpl->fn.sig.params.items[tmpl->fn.sig.params.count - 1].te;
+    for (u32 k = 0; k < tmpl->fn.sig.generics.count; k++) {
+        ST_string_t g = tmpl->fn.sig.generics.items[k];
+        if (ST_generic_is_row_bound(tmpl, g))
+            continue;
+        b8 is_pack = pack_te && pack_te->kind == ST_TE_NAME && pack_te->is_generic_param &&
+            ST_string_eq(pack_te->name, g);
+        u32 n = is_pack ? n_pack_args : 1;
+        for (u32 j = 0; j < n; j++) {
+            char nm[96];
+            int nl = is_pack ? snprintf(nm, sizeof(nm), ST_sv_fmt "#%u", ST_sv_args(g), j)
+                             : snprintf(nm, sizeof(nm), ST_sv_fmt, ST_sv_args(g));
+            ST_ht_generic_t hk = {.tag = nm, .size = (u32)nl};
+            void *b = ST_ht_get(bindings, hk).tag;
+            if (len < sizeof(key))
+                len += (u32)snprintf(key + len, sizeof(key) - len, "%p;", b);
+        }
+    }
+    if (has_bound_str) {
+        u64 h = 1469598103934665603ULL;
+        for (u32 k = 0; k < bound_str_value.len; k++) {
+            h ^= (u64)bound_str_value.data[k];
+            h *= 1099511628211ULL;
+        }
+        if (len < sizeof(key))
+            len += (u32)snprintf(key + len, sizeof(key) - len, "s%llx", (unsigned long long)h);
+    }
+    if (len >= sizeof(key))
+        len = (u32)sizeof(key) - 1;
+    for (u32 k = 0; k < se->standin_done.count; k++) {
+        ST_string_t prev = se->standin_done.items[k];
+        if (prev.len == len && memcmp(prev.data, key, len) == 0)
+            return;
+    }
+    u8 *kb = ST_arena_push(se->arena, len);
+    memcpy(kb, key, len);
+    ST_da_append_arena(se->arena, &se->standin_done, ((ST_string_t){.data = kb, .len = len}));
+    ST_pending_standin_t pe = {.tmpl = tmpl,
+                               .bindings = bindings,
+                               .has_pack = has_pack,
+                               .n_pack_args = n_pack_args,
+                               .has_bound_str = has_bound_str,
+                               .bound_str_param = bound_str_param,
+                               .bound_str_value = bound_str_value};
+    ST_da_append_arena(se->arena, &se->pending_standins, pe);
 }
 
 static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bindings,
@@ -1920,8 +2196,12 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     se->stamp_tyexprs = save_s;
     se->generic_bindings = save_b;
 
-    if (se->prog)
+    if (se->prog && !se->in_standin)
         ST_da_append_arena(se->arena, &se->prog->decls, inst);
+
+    if (!se->in_standin && ST_template_has_row(tmpl) && !ST_row_template_pure(tmpl))
+        ST_queue_standin(se, tmpl, pb, has_pack, n_pack_args, has_bound_str, bound_str_param,
+                         bound_str_value);
 
     return sym;
 }
@@ -2291,6 +2571,12 @@ static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
         ST_diag_error(&se->diag, e->line, e->col,
                       "invalid operands to '" ST_sv_fmt "': '%s' and '%s'", ST_sv_args(op),
                       ST_tstr(se, l), ST_tstr(se, r));
+        ST_ty_t *opq = l && l->is_standin && !l->standin_row ? l : r;
+        if (opq && opq->is_standin && !opq->standin_row)
+            ST_diag_note(&se->diag, e->line, e->col,
+                         "'%s' has no known type here; constrain it as '%s(f32, f64)' to use "
+                         "arithmetic",
+                         ST_tstr(se, opq), ST_tstr(se, opq));
         return NULL;
     }
     return u;
@@ -3137,10 +3423,24 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
 
     if (t->kind == ST_TY_STRUCT) {
         ST_complete_ty(se, t);
-        ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, e->field.name)) {
-            if (se->n_row_ctx && !ST_row_allows_field(se, t, e))
-                return NULL;
+        ST_forrange(0, t->fields.count) if (ST_string_eq(t->fields.items[i].name, e->field.name))
             return t->fields.items[i].ty;
+        if (t->is_standin && t->standin_row) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "field '" ST_sv_fmt "' is not declared in the row of '$" ST_sv_fmt
+                          "'; add it to the row or access only the listed fields",
+                          ST_sv_args(e->field.name), ST_sv_args(t->standin_row->name));
+            ST_diag_note(&se->diag, t->standin_row->line, t->standin_row->col,
+                         "'$" ST_sv_fmt "' is declared here", ST_sv_args(t->standin_row->name));
+            return NULL;
+        }
+        if (t->is_standin) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'%s' is a generic type with no known fields, so '" ST_sv_fmt
+                          "' cannot be accessed; list the field in a row, or constrain it as "
+                          "'%s(A, B)'",
+                          ST_tstr(se, t), ST_sv_args(e->field.name), ST_tstr(se, t));
+            return NULL;
         }
         ST_diag_error(&se->diag, e->line, e->col, "'%s' has no field '" ST_sv_fmt "'",
                       ST_tstr(se, t), ST_sv_args(e->field.name));
@@ -4602,6 +4902,13 @@ static void ST_rewrite_as_block(ST_stmt_t *s, ST_stmts_t body) {
     s->block = body;
 }
 
+static void ST_append_unrolled_iter(ST_sema_t *se, ST_stmts_t *unrolled, ST_stmts_t copy,
+                                    ST_stmt_t *s) {
+    ST_stmt_t *blk = ST_stmt_new(se->arena, ST_ST_BLOCK, s->line, s->col);
+    blk->block = copy;
+    ST_da_append_arena(se->arena, unrolled, blk);
+}
+
 static void ST_check_comptime_if(ST_sema_t *se, ST_stmt_t *s) {
     ST_ct_val_t cond;
     if (!ST_ct_eval_expr(se, s->if_.cond, &cond, 1)) {
@@ -4970,7 +5277,7 @@ static void ST_check_comptime_for_fields(ST_sema_t *se, ST_stmt_t *s) {
             ST_string_t no_target = {0};
             ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
         }
-        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+        ST_append_unrolled_iter(se, &unrolled, copy, s);
     }
 
     ST_rewrite_as_block(s, unrolled);
@@ -5004,7 +5311,7 @@ static void ST_check_comptime_for_pack(ST_sema_t *se, ST_stmt_t *s) {
             ST_ast_substitute_stmt(se, copy.items[i], s->for_array.spec_iter, &spec_lit);
         ST_string_t no_target = {0};
         ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
-        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+        ST_append_unrolled_iter(se, &unrolled, copy, s);
     }
     ST_rewrite_as_block(s, unrolled);
     ST_check_stmt(se, s);
@@ -5131,7 +5438,7 @@ static void ST_check_comptime_for_array(ST_sema_t *se, ST_stmt_t *s) {
             ST_string_t no_target = {0};
             ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
         }
-        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+        ST_append_unrolled_iter(se, &unrolled, copy, s);
 
         if (ch == '%')
             spec++;
@@ -5185,7 +5492,7 @@ static void ST_check_comptime_for(ST_sema_t *se, ST_stmt_t *s) {
             ST_string_t no_target = {0};
             ST_forrange(0, copy.count) ST_ast_substitute_stmt(se, copy.items[i], no_target, NULL);
         }
-        ST_forrange(0, copy.count) ST_da_append_arena(se->arena, &unrolled, copy.items[i]);
+        ST_append_unrolled_iter(se, &unrolled, copy, s);
     }
     ST_rewrite_as_block(s, unrolled);
     ST_check_stmt(se, s);
@@ -5393,7 +5700,15 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                                                   (const char *)vn.data);
                         n_missing++;
                     }
-                    if (n_missing) {
+                    if (!n_missing && ct->is_standin && ct->standin_open && ct->standin_row) {
+                        ST_diag_error(&se->diag, s->line, s->col,
+                                      "the row of '$" ST_sv_fmt "' is open, so it may have other "
+                                      "variants; add a 'default' branch",
+                                      ST_sv_args(ct->standin_row->name));
+                        ST_diag_note(&se->diag, ct->standin_row->line, ct->standin_row->col,
+                                     "'$" ST_sv_fmt "' is declared here",
+                                     ST_sv_args(ct->standin_row->name));
+                    } else if (n_missing) {
                         ST_diag_error(&se->diag, s->line, s->col,
                                       "switch on '" ST_sv_fmt "' is not exhaustive, missing "
                                       "variant%s %s; add the missing case%s or a 'default' branch",
@@ -6119,6 +6434,13 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
 
     ST_string_t save_diag_file, save_diag_src;
     ST_diag_switch_file(se, d->file, &save_diag_file, &save_diag_src);
+    ST_standin_fail_t *inst_fail = NULL;
+    if (!se->in_standin && sym->template_name.len)
+        inst_fail = ST_standin_failure(se, sym->template_name);
+    if (inst_fail) {
+        se->diag.supp = inst_fail->locs;
+        se->diag.n_supp = inst_fail->n_locs;
+    }
     ST_decl_t *save_cur_fn_decl = se->cur_fn_decl;
     se->cur_fn_decl = d;
     b8 save_hit_comp_error = se->hit_comp_error;
@@ -6165,26 +6487,6 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     if (se->has_pack && !d->fn.is_prototype)
         ST_pack_substitute_body(se, &d->fn.body);
 
-    u32 save_n_row_ctx = se->n_row_ctx;
-    if (sym->generic_bindings) {
-        ST_forrange(0, sig->params.count) {
-            ST_tyexpr_t *g = sig->params.items[i].te;
-            while (g && g->kind == ST_TE_PTR)
-                g = g->inner;
-            if (!g || g->kind != ST_TE_NAME || !g->is_generic_param || !g->has_row)
-                continue;
-            if (se->n_row_ctx >= 16)
-                break;
-            ST_ht_generic_t gk = {.tag = g->name.data, .size = g->name.len};
-            ST_ty_t *bound = (ST_ty_t *)ST_ht_get(sym->generic_bindings, gk).tag;
-            if (!bound || bound->kind != ST_TY_STRUCT)
-                continue;
-            se->row_ctx[se->n_row_ctx].ty = bound;
-            se->row_ctx[se->n_row_ctx].row = g;
-            se->n_row_ctx++;
-        }
-    }
-
     ST_scope_push(se);
     ST_declare_self_recursive(se, d);
     ST_declare_block_siblings(se, d);
@@ -6208,7 +6510,6 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
         ST_check_stmt(se, d->fn.body.items[i]);
     }
     se->cur_rets = NULL;
-    se->n_row_ctx = save_n_row_ctx;
 
     ST_scope_pop(se);
     se->labels = NULL;
@@ -6223,20 +6524,225 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     se->generic_bindings = save_bindings;
     se->cur_fn_decl = save_cur_fn_decl;
     se->hit_comp_error = save_hit_comp_error;
+    if (inst_fail) {
+        se->diag.supp = NULL;
+        se->diag.n_supp = 0;
+    }
     ST_diag_restore_file(se, save_diag_file, save_diag_src);
+}
+
+static ST_ty_t *ST_make_standin(ST_sema_t *se, ST_decl_t *tmpl, ST_tyexpr_t *g) {
+    ST_decl_t *sd = ST_decl_new(se->arena, g->row_is_union ? ST_DE_TAG_UNION : ST_DE_STRUCT,
+                                g->line, g->col);
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "row$" ST_sv_fmt "$%u", ST_sv_args(g->name), se->n_standins++);
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    sd->name = (ST_string_t){.data = nb, .len = (u32)n};
+    n = snprintf(buf, sizeof(buf), "$" ST_sv_fmt, ST_sv_args(g->name));
+    nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    sd->display_name = (ST_string_t){.data = nb, .len = (u32)n};
+    sd->file = tmpl->file;
+    ST_forrange(0, g->row_fields.count) {
+        ST_row_field_t *rf = &g->row_fields.items[i];
+        if (g->row_is_union) {
+            ST_variant_spec_t v = {.name = rf->name, .line = rf->line, .col = rf->col};
+            v.payload = rf->te ? ST_clone_tyexpr(se->arena, rf->te) : NULL;
+            ST_da_append_arena(se->arena, &sd->tag_union.variants, v);
+            continue;
+        }
+        ST_field_spec_t f = {.name = rf->name, .line = rf->line, .col = rf->col};
+        f.te = ST_clone_tyexpr(se->arena, rf->te);
+        ST_da_append_arena(se->arena, &sd->struct_.fields, f);
+    }
+    ST_ty_t *t = ST_ty_for_decls(&se->tys, sd);
+    t->is_standin = 1;
+    t->standin_open = g->row_open;
+    t->standin_row = g;
+    return t;
+}
+
+static ST_ty_t *ST_make_opaque(ST_sema_t *se, ST_decl_t *tmpl, ST_string_t g) {
+    ST_decl_t *sd = ST_decl_new(se->arena, ST_DE_STRUCT, tmpl->line, tmpl->col);
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "opaque$" ST_sv_fmt "$%u", ST_sv_args(g), se->n_standins++);
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    sd->name = (ST_string_t){.data = nb, .len = (u32)n};
+    n = snprintf(buf, sizeof(buf), "$" ST_sv_fmt, ST_sv_args(g));
+    nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    sd->display_name = (ST_string_t){.data = nb, .len = (u32)n};
+    sd->file = tmpl->file;
+    ST_ty_t *t = ST_ty_for_decls(&se->tys, sd);
+    t->is_standin = 1;
+    t->standin_open = 1;
+    t->standin_row = NULL;
+    return t;
+}
+
+static ST_ht_t *ST_copy_bindings(ST_sema_t *se, ST_ht_t *src) {
+    ST_ht_t *dst = ST_arena_push_zeroed(se->arena, sizeof(*dst));
+    ST_ht_init(se->arena, dst, 16);
+    for (u32 k = 0; k < src->capacity; k++) {
+        ST_ht_generic_t *key = src->slots[k].key;
+        ST_ht_generic_t *val = src->slots[k].value;
+        if (!key || key == (ST_ht_generic_t *)1 || !val)
+            continue;
+        ST_ht_set(dst, key, *val);
+    }
+    return dst;
+}
+
+static ST_ht_t *ST_standin_bindings(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *base) {
+    ST_ht_t *b;
+    if (base) {
+        b = ST_copy_bindings(se, base);
+    } else {
+        b = ST_arena_push_zeroed(se->arena, sizeof(*b));
+        ST_ht_init(se->arena, b, 16);
+    }
+    ST_ty_t *made[16];
+    ST_string_t made_names[16];
+    u32 n_made = 0;
+    for (u32 k = 0; k < tmpl->fn.sig.params.count && n_made < 16; k++) {
+        ST_tyexpr_t *g = ST_row_param_te(tmpl->fn.sig.params.items[k].te);
+        if (!g)
+            continue;
+        b8 dup = 0;
+        for (u32 m = 0; m < n_made; m++)
+            if (ST_string_eq(made_names[m], g->name))
+                dup = 1;
+        if (dup)
+            continue;
+        ST_ty_t *t = ST_make_standin(se, tmpl, g);
+        made[n_made] = t;
+        made_names[n_made] = g->name;
+        n_made++;
+        ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
+        hk->tag = g->name.data;
+        hk->size = g->name.len;
+        ST_ht_set(b, hk, (ST_ht_generic_t){.tag = t});
+    }
+    ST_ht_t *save_b = se->generic_bindings;
+    se->generic_bindings = b;
+    for (u32 m = 0; m < n_made; m++)
+        ST_complete_ty(se, made[m]);
+    se->generic_bindings = save_b;
+    return b;
+}
+
+static void ST_run_standin(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *bindings, b8 has_pack,
+                           u32 n_pack_args, b8 has_bound_str, ST_string_t bound_str_param,
+                           ST_string_t bound_str_value) {
+    b8 save_flag = se->hit_comp_error;
+    ST_diag_t *dg = &se->diag;
+    ST_standin_fail_t *fail = ST_standin_failure(se, tmpl->name);
+    dg->supp = fail ? fail->locs : NULL;
+    dg->n_supp = fail ? fail->n_locs : 0;
+    dg->recording = 1;
+    dg->n_rec = 0;
+    se->in_standin++;
+    ST_sym_t *sym = ST_instantiate_fn_ex(se, tmpl, bindings, has_pack, n_pack_args, has_bound_str,
+                                         bound_str_param, bound_str_value, tmpl->line, tmpl->col);
+    if (sym && sym->decl) {
+        sym->decl->fn.has_call_site = 0;
+        ST_check_fn_body(se, sym, sym->decl);
+    }
+    se->in_standin--;
+    se->hit_comp_error = save_flag;
+    dg->recording = 0;
+    dg->supp = NULL;
+    dg->n_supp = 0;
+    if (!dg->n_rec)
+        return;
+    if (!fail) {
+        fail = ST_arena_push_zeroed(se->arena, sizeof(*fail));
+        fail->name = tmpl->name;
+        ST_da_append_arena(se->arena, &se->standin_fails, fail);
+    }
+    for (u32 k = 0; k < dg->n_rec && fail->n_locs < 16; k++)
+        fail->locs[fail->n_locs++] = dg->rec[k];
+}
+
+static void ST_check_row_standin(ST_sema_t *se, ST_decl_t *tmpl) {
+    if (!ST_row_template_pure(tmpl))
+        return;
+    enum { MAX_GEN = 4, MAX_ALTS = 8, MAX_RUNS = 16 };
+    ST_string_t names[MAX_GEN];
+    ST_ty_t *alts[MAX_GEN][MAX_ALTS];
+    u32 n_alts[MAX_GEN];
+    u32 n_gen = 0;
+    for (u32 k = 0; k < tmpl->fn.sig.generics.count; k++) {
+        ST_string_t g = tmpl->fn.sig.generics.items[k];
+        if (ST_generic_is_row_bound(tmpl, g))
+            continue;
+        if (n_gen == MAX_GEN)
+            return;
+        names[n_gen] = g;
+        n_alts[n_gen] = 0;
+        ST_tyexpr_t *use = ST_row_generic_use(tmpl, g);
+        if (use && use->generic_constraints.count) {
+            b8 positive = 1;
+            for (u32 c = 0; c < use->generic_constraints.count; c++)
+                if (use->generic_constraints.items[c]->is_negeated_constraint)
+                    positive = 0;
+            for (u32 c = 0; positive && c < use->generic_constraints.count && n_alts[n_gen] < MAX_ALTS;
+                 c++) {
+                ST_ty_t *ct = ST_resolve_tyexpr(se, use->generic_constraints.items[c]);
+                if (ct)
+                    alts[n_gen][n_alts[n_gen]++] = ct;
+            }
+        }
+        if (!n_alts[n_gen])
+            alts[n_gen][n_alts[n_gen]++] = ST_make_opaque(se, tmpl, g);
+        n_gen++;
+    }
+    u32 idx[MAX_GEN] = {0};
+    for (u32 run = 0; run < MAX_RUNS; run++) {
+        ST_ht_t *base = ST_arena_push_zeroed(se->arena, sizeof(*base));
+        ST_ht_init(se->arena, base, 16);
+        for (u32 k = 0; k < n_gen; k++) {
+            ST_ht_generic_t *hk = ST_arena_push(se->arena, sizeof(*hk));
+            hk->tag = names[k].data;
+            hk->size = names[k].len;
+            ST_ht_set(base, hk, (ST_ht_generic_t){.tag = alts[k][idx[k]]});
+        }
+        ST_ht_t *b = ST_standin_bindings(se, tmpl, base);
+        ST_run_standin(se, tmpl, b, 0, 0, 0, (ST_string_t){0}, (ST_string_t){0});
+        u32 pos = 0;
+        while (pos < n_gen && ++idx[pos] == n_alts[pos])
+            idx[pos++] = 0;
+        if (pos == n_gen)
+            break;
+    }
+}
+
+static void ST_drain_standins(ST_sema_t *se) {
+    while (se->n_pending_done < se->pending_standins.count) {
+        ST_pending_standin_t pe = se->pending_standins.items[se->n_pending_done++];
+        ST_ht_t *b = ST_standin_bindings(se, pe.tmpl, pe.bindings);
+        ST_run_standin(se, pe.tmpl, b, pe.has_pack, pe.n_pack_args, pe.has_bound_str,
+                       pe.bound_str_param, pe.bound_str_value);
+    }
 }
 
 static void ST_sema_check(ST_sema_t *se, ST_program_t *prog) {
     ST_forrange(0, prog->decls.count) {
+        ST_drain_standins(se);
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
+        if (d->kind == ST_DE_FN && d->fn.sig.generics.count && !d->fn.is_prototype)
+            ST_check_row_standin(se, d);
         ST_sym_t *sym = ST_sym_for_decl(se, d);
         if (!sym)
             continue;
         if (d->kind == ST_DE_FN)
             ST_check_fn_body(se, sym, d);
     }
+    ST_drain_standins(se);
 }
 
 static void ST_default_expr(ST_sema_t *se, ST_expr_t *e);
