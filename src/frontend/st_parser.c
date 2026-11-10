@@ -269,6 +269,7 @@ static ST_decl_t *ST_parse_method_decl(ST_parser_t *p, b8 is_pub);
 static b8 ST_parse_generic_list(ST_parser_t *p, ST_strings_t *out);
 static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern);
 static void ST_collect_generic_te(ST_parser_t *p, ST_tyexpr_t *te, ST_strings_t *out);
+static void ST_witness_rewrite_self(ST_arena_t *a, ST_tyexpr_t *te, ST_tyexpr_t *self_te);
 
 static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
     ST_token_t *t = ST_peek(p);
@@ -386,6 +387,23 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_NAME, t->line, t->col);
         te->name = pname;
         te->is_generic_param = 1;
+        if (ST_at_symbol(p, "(") && ST_tok_is_symbol(ST_tok_at(p, p->pos + 1), "$")) {
+            p->pos++;
+            te->kind = ST_TE_GENERIC_INST;
+            while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
+                if (ST_at_symbol(p, ",")) {
+                    p->pos++;
+                    continue;
+                }
+                ST_tyexpr_t *harg = ST_parse_type(p);
+                if (!harg)
+                    return NULL;
+                ST_da_append_arena(p->arena, &te->generic_args, harg);
+            }
+            if (!ST_expect_sym(p, ")"))
+                return NULL;
+            return te;
+        }
         if (ST_at_symbol(p, "(")) {
             p->pos++; // consume '('
             for (;;) {
@@ -475,6 +493,9 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
 
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_NAME, t->line, t->col);
         te->name = t->text;
+        for (u32 tpi = 0; tpi < p->type_params.count; tpi++)
+            if (ST_string_eq(p->type_params.items[tpi], t->text))
+                te->is_generic_param = 1;
         return te;
     }
     ST_perr_tok(p, t, "expected a type, got '" ST_sv_fmt "'", ST_sv_args(t->text));
@@ -839,6 +860,22 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
                 p->fn_name_stack.count--;
                 if (!body_ok)
                     return NULL;
+                if (gargs.count) {
+                    ST_forrange(0, ti->trait_impl.body.count) {
+                        ST_stmt_t *bs = ti->trait_impl.body.items[i];
+                        if (bs->kind != ST_ST_NESTED_FN || !bs->nested_fn ||
+                            bs->nested_fn->kind != ST_DE_FN)
+                            continue;
+                        ST_decl_t *nd = bs->nested_fn;
+                        nd->fn.self_te = gargs.items[0];
+                        ST_forrange(0, nd->fn.sig.params.count)
+                            ST_witness_rewrite_self(p->arena, nd->fn.sig.params.items[i].te,
+                                                    gargs.items[0]);
+                        ST_forrange(0, nd->fn.sig.rets.count)
+                            ST_witness_rewrite_self(p->arena, nd->fn.sig.rets.items[i],
+                                                    gargs.items[0]);
+                    }
+                }
                 if (!ST_expect_sym(p, "}"))
                     return NULL;
                 return ti;
@@ -1900,6 +1937,23 @@ static ST_decl_t *ST_parse_method_decl(ST_parser_t *p, b8 is_pub) {
     return d;
 }
 
+static void ST_register_type_param(ST_parser_t *p, ST_fn_sig_t *sig) {
+    if (!sig->params.count)
+        return;
+    ST_param_t *pm = &sig->params.items[sig->params.count - 1];
+    if (!pm->te || pm->te->kind != ST_TE_NAME || pm->te->is_generic_param ||
+        pm->te->module_alias.len || !ST_string_eq_cstr(pm->te->name, "Type_Info"))
+        return;
+    pm->is_type_param = 1;
+    ST_da_append_arena(p->arena, &p->type_params, pm->name);
+    b8 have = 0;
+    for (u32 g = 0; g < sig->generics.count; g++)
+        if (ST_string_eq(sig->generics.items[g], pm->name))
+            have = 1;
+    if (!have)
+        ST_da_append_arena(p->arena, &sig->generics, pm->name);
+}
+
 static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
     ST_token_t *t = ST_peek(p);
     p->pos++;
@@ -1916,8 +1970,11 @@ static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
         d->display_name = d->name;
         d->name = ST_mangle_nested_fn(p->arena, parent, d->display_name);
     }
-    if (!ST_parse_fn_sig(p, &d->fn.sig, 0))
+    u32 type_params_save = p->type_params.count;
+    if (!ST_parse_fn_sig(p, &d->fn.sig, 0)) {
+        p->type_params.count = type_params_save;
         return NULL;
+    }
     ST_forrange(0, d->fn.sig.params.count)
         ST_collect_generic_te(p, d->fn.sig.params.items[i].te, &d->fn.sig.generics);
     ST_forrange(0, d->fn.sig.rets.count)
@@ -1925,6 +1982,7 @@ static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
     if (ST_at_symbol(p, ";")) {
         p->pos++;
         d->fn.is_prototype = 1;
+        p->type_params.count = type_params_save;
         return d;
     }
     if (!ST_expect_sym(p, "{"))
@@ -1932,6 +1990,7 @@ static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
     ST_da_append_arena(p->arena, &p->fn_name_stack, d->name);
     b8 body_ok = ST_parse_body(p, &d->fn.body);
     p->fn_name_stack.count--;
+    p->type_params.count = type_params_save;
     if (!body_ok)
         return NULL;
     if (!ST_expect_sym(p, "}"))
@@ -2004,6 +2063,12 @@ static void ST_collect_generic_te(ST_parser_t *p, ST_tyexpr_t *te, ST_strings_t 
         ST_forrange(0, te->row_fields.count)
             ST_collect_generic_te(p, te->row_fields.items[i].te, out);
         return;
+    }
+    if (te->kind == ST_TE_GENERIC_INST && te->is_generic_param) {
+        b8 present = 0;
+        ST_forrange(0, out->count) if (ST_string_eq(out->items[i], te->name)) present = 1;
+        if (!present)
+            ST_da_append_arena(p->arena, out, te->name);
     }
     ST_collect_generic_te(p, te->inner, out);
     ST_forrange(0,te->fn_params.count) ST_collect_generic_te(p, te->fn_params.items[i], out);
@@ -2254,6 +2319,59 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
     }
 }
 
+static void ST_trait_rewrite_self(ST_tyexpr_t *te, ST_string_t generic_name) {
+    if (!te)
+        return;
+    if (te->kind == ST_TE_GENERIC_INST && !te->is_generic_param && !te->module_alias.len &&
+        ST_string_eq_cstr(te->name, "Self")) {
+        te->is_generic_param = 1;
+        te->name = generic_name;
+    }
+    if (te->kind == ST_TE_NAME) {
+        if (!te->is_generic_param && !te->module_alias.len &&
+            ST_string_eq_cstr(te->name, "Self")) {
+            te->is_generic_param = 1;
+            te->name = generic_name;
+        }
+        return;
+    }
+    ST_trait_rewrite_self(te->inner, generic_name);
+    ST_forrange(0, te->fn_params.count)
+        ST_trait_rewrite_self(te->fn_params.items[i], generic_name);
+    ST_forrange(0, te->fn_rets.count)
+        ST_trait_rewrite_self(te->fn_rets.items[i], generic_name);
+    ST_forrange(0, te->generic_args.count)
+        ST_trait_rewrite_self(te->generic_args.items[i], generic_name);
+}
+
+static void ST_witness_rewrite_self(ST_arena_t *a, ST_tyexpr_t *te, ST_tyexpr_t *self_te) {
+    if (!te)
+        return;
+    if (te->kind == ST_TE_GENERIC_INST && !te->is_generic_param && !te->module_alias.len &&
+        ST_string_eq_cstr(te->name, "Self") && self_te->kind == ST_TE_NAME) {
+        te->name = self_te->name;
+        te->module_alias = self_te->module_alias;
+        te->is_generic_param = self_te->is_generic_param;
+    }
+    if (te->kind == ST_TE_NAME) {
+        if (!te->is_generic_param && !te->module_alias.len &&
+            ST_string_eq_cstr(te->name, "Self")) {
+            u32 line = te->line, col = te->col;
+            *te = *self_te;
+            te->line = line;
+            te->col = col;
+        }
+        return;
+    }
+    ST_witness_rewrite_self(a, te->inner, self_te);
+    ST_forrange(0, te->fn_params.count)
+        ST_witness_rewrite_self(a, te->fn_params.items[i], self_te);
+    ST_forrange(0, te->fn_rets.count)
+        ST_witness_rewrite_self(a, te->fn_rets.items[i], self_te);
+    ST_forrange(0, te->generic_args.count)
+        ST_witness_rewrite_self(a, te->generic_args.items[i], self_te);
+}
+
 static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
     ST_decl_t *d = ST_decl_new(p->arena, ST_DE_TRAIT, line, col);
     d->name = ST_expect_ident(p, "a trait name");
@@ -2324,7 +2442,10 @@ static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
         m.name = ST_expect_ident(p, "a method name");
         if (!m.name.len)
             return NULL;
-        if (!ST_parse_fn_sig(p, &m.sig, 0))
+        u32 type_params_save = p->type_params.count;
+        b8 sig_ok = ST_parse_fn_sig(p, &m.sig, 0);
+        p->type_params.count = type_params_save;
+        if (!sig_ok)
             return NULL;
         if (!m.sig.has_ret_ann) {
             ST_perr(p, m.line, m.col,
@@ -2334,6 +2455,29 @@ static ST_decl_t *ST_parse_trait_decl(ST_parser_t *p, u32 line, u32 col) {
         }
         if (!ST_expect_semi(p))
             return NULL;
+        if (d->trait_.generics.count) {
+            ST_string_t self_generic = d->trait_.generics.items[0];
+            ST_forrange(0, m.sig.params.count)
+                ST_trait_rewrite_self(m.sig.params.items[i].te, self_generic);
+            ST_forrange(0, m.sig.rets.count)
+                ST_trait_rewrite_self(m.sig.rets.items[i], self_generic);
+        }
+        ST_strings_t found = {0};
+        ST_forrange(0, m.sig.params.count)
+            ST_collect_generic_te(p, m.sig.params.items[i].te, &found);
+        ST_forrange(0, m.sig.rets.count)
+            ST_collect_generic_te(p, m.sig.rets.items[i], &found);
+        ST_forrange(0, found.count) {
+            b8 is_trait_generic = 0;
+            for (u32 g = 0; g < d->trait_.generics.count; g++)
+                if (ST_string_eq(d->trait_.generics.items[g], found.items[i]))
+                    is_trait_generic = 1;
+            for (u32 g = 0; g < m.sig.generics.count; g++)
+                if (ST_string_eq(m.sig.generics.items[g], found.items[i]))
+                    is_trait_generic = 1;
+            if (!is_trait_generic)
+                ST_da_append_arena(p->arena, &m.sig.generics, found.items[i]);
+        }
         ST_da_append_arena(p->arena, &d->trait_.methods, m);
     }
     if (!ST_expect_sym(p, "}"))
@@ -2543,6 +2687,7 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             return 0;
         }
         ST_da_append_arena(p->arena, &sig->params, param);
+        ST_register_type_param(p, sig);
     }
     if (!ST_expect_sym(p, ")"))
         return 0;

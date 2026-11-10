@@ -36,6 +36,7 @@ typedef struct {
     ST_impl_methods_t impl_methods;
     b8 impl_consumed;
     ST_strings_t fn_name_stack;
+    ST_strings_t type_params;
     u32 next_block_id;
     u32 next_trait_impl_id;
     b8 in_comptime_scope;

@@ -297,6 +297,7 @@ static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 repo
 static ST_ct_vm_t *ST_ct_vm_acquire(ST_sema_t *se);
 static void ST_ct_vm_release(ST_sema_t *se, ST_ct_vm_t *vm);
 static b8 ST_variant_has_payload(ST_sema_t *se, ST_variant_spec_t *v);
+static ST_tyexpr_t *ST_expr_to_tyexpr(ST_sema_t *se, ST_expr_t *e);
 static ST_ty_t *ST_resolve_tyexpr(ST_sema_t *se, ST_tyexpr_t *te);
 static void ST_complete_ty(ST_sema_t *se, ST_ty_t *t);
 static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t target,
@@ -425,7 +426,7 @@ b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out) {
         case ST_EX_SIZEOF: {
             ST_ty_t *t;
             if (e->tyop.te) {
-                t = ST_resolve_tyexpr(se, e->tyop.te);
+                t = e->tyop.te->resolved ? e->tyop.te->resolved : ST_resolve_tyexpr(se, e->tyop.te);
             } else {
                 t = e->tyop.operand ? e->tyop.operand->ty : NULL;
             }
@@ -742,12 +743,19 @@ static ST_ty_t *ST_instantiate_trait_witness(ST_sema_t *se, ST_decl_t *trait, ST
     for (u32 k = 0; k < trait->trait_.methods.count; k++) {
         ST_trait_method_t *m = &trait->trait_.methods.items[k];
         ST_tyexpr_t *fnte = ST_tyexpr_new(se->arena, ST_TE_FN, m->line, m->col);
+        if (m->sig.generics.count) {
+            fnte = ST_tyexpr_new(se->arena, ST_TE_PTR, m->line, m->col);
+            fnte->inner = ST_tyexpr_new(se->arena, ST_TE_NAME, m->line, m->col);
+            fnte->inner->name = ST_cstr_to_str("void");
+        }
         fnte->fn_is_variadic = m->sig.is_variadic;
         fnte->fn_is_noreturn = m->sig.is_noreturn;
-        for (u32 p = 0; p < m->sig.params.count; p++)
-            ST_da_append_arena(se->arena, &fnte->fn_params, m->sig.params.items[p].te);
-        for (u32 r = 0; r < m->sig.rets.count; r++)
-            ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[r]);
+        if (!m->sig.generics.count) {
+            for (u32 p = 0; p < m->sig.params.count; p++)
+                ST_da_append_arena(se->arena, &fnte->fn_params, m->sig.params.items[p].te);
+            for (u32 r = 0; r < m->sig.rets.count; r++)
+                ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[r]);
+        }
 
         u32 dup_idx = 0;
         for (u32 j = 0; j < k; j++)
@@ -888,12 +896,35 @@ static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
     u32 n_methods = trait->trait_.methods.count;
     b8 *supplied = ST_arena_push_zeroed(se->arena, n_methods ? n_methods : 1);
     ST_field_inits_t inits = {0};
+    ST_strings_t generic_methods = {0};
+    ST_strings_t generic_names = {0};
 
     for (u32 i = 0; i < e->trait_impl.body.count; i++) {
         ST_stmt_t *s = e->trait_impl.body.items[i];
         if (s->kind == ST_ST_NESTED_FN) {
             ST_decl_t *nd = s->nested_fn;
             ST_string_t bare = nd->display_name.len ? nd->display_name : nd->name;
+
+            i32 gidx = -1;
+            for (u32 gi = 0; gi < trait->trait_.methods.count; gi++) {
+                ST_trait_method_t *gm = &trait->trait_.methods.items[gi];
+                if (gm->sig.generics.count && ST_string_eq(gm->name, bare) &&
+                    gm->sig.params.count == nd->fn.sig.params.count) {
+                    gidx = (i32)gi;
+                    break;
+                }
+            }
+            if (gidx >= 0) {
+                if (!nd->fn.sig.generics.count)
+                    ST_diag_error(&se->diag, nd->line, nd->col,
+                                  "'" ST_sv_fmt "' is generic in trait '" ST_sv_fmt
+                                  "', so its implementation must be generic too",
+                                  ST_sv_args(bare), ST_sv_args(trait->name));
+                ST_da_append_arena(se->arena, &generic_methods, bare);
+                ST_da_append_arena(se->arena, &generic_names, nd->name);
+                supplied[gidx] = 1;
+                continue;
+            }
 
             ST_expr_t *ref = ST_expr_new(se->arena, ST_EX_IDENT, nd->line, nd->col);
             ref->name = nd->name;
@@ -995,6 +1026,8 @@ static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
     e->struct_lit.generic_args = (ST_tyexprs_t){0};
     e->struct_lit.inits = inits;
     e->struct_lit.is_bracket_lit = 0;
+    e->struct_lit.generic_impl_methods = generic_methods;
+    e->struct_lit.generic_impl_names = generic_names;
 
     return witness_ty;
 }
@@ -1015,6 +1048,9 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                 if (self_te)
                     return ST_resolve_tyexpr(se, self_te);
             }
+            if (!te->is_generic_param && ST_string_eq_cstr(te->name, "Self") && se->cur_fn_decl &&
+                se->cur_fn_decl->kind == ST_DE_FN && se->cur_fn_decl->fn.self_te)
+                return ST_resolve_tyexpr(se, se->cur_fn_decl->fn.self_te);
             if (te->is_generic_param) {
                 if (se->generic_bindings) {
                     ST_ht_generic_t k = {.tag = te->name.data, .size = te->name.len};
@@ -1103,6 +1139,59 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
         case ST_TE_TYPEOF:
         return ST_type_expr(se, te->typeof_operand);
         case ST_TE_GENERIC_INST: {
+            if (!te->is_generic_param && !te->module_alias.len &&
+                ST_string_eq_cstr(te->name, "Self") && se->cur_fn_decl &&
+                se->cur_fn_decl->kind == ST_DE_FN && se->cur_fn_decl->fn.self_te &&
+                se->cur_fn_decl->fn.self_te->kind == ST_TE_NAME) {
+                ST_tyexpr_t *wself = se->cur_fn_decl->fn.self_te;
+                ST_tyexpr_t tmp = *te;
+                tmp.name = wself->name;
+                tmp.module_alias = wself->module_alias;
+                tmp.is_generic_param = wself->is_generic_param;
+                return ST_resolve_tyexpr_raw(se, &tmp);
+            }
+            if (te->is_generic_param) {
+                ST_ty_t *ctor = NULL;
+                if (se->generic_bindings) {
+                    ST_ht_generic_t hk = {.tag = te->name.data, .size = te->name.len};
+                    ctor = (ST_ty_t *)ST_ht_get(se->generic_bindings, hk).tag;
+                }
+                if (!ctor) {
+                    ST_diag_error(&se->diag, te->line, te->col,
+                                  "generic parameter '$" ST_sv_fmt
+                                  "' used outside of instansiation",
+                                  ST_sv_args(te->name));
+                    return NULL;
+                }
+                ST_decl_t *cdecl = ctor->decl;
+                ST_strings_t *cgen = cdecl ? ST_decl_generics(cdecl) : NULL;
+                if (!cgen || !cgen->count) {
+                    ST_diag_error(&se->diag, te->line, te->col,
+                                  "'$" ST_sv_fmt "' is bound to '%s', which is not a generic type "
+                                  "and cannot take arguments",
+                                  ST_sv_args(te->name), ST_tstr(se, ctor));
+                    return NULL;
+                }
+                ST_tys_t hargs = {0};
+                b8 hok = 1;
+                ST_forrange(0, te->generic_args.count) {
+                    ST_ty_t *at = ST_resolve_tyexpr(se, te->generic_args.items[i]);
+                    if (!at)
+                        hok = 0;
+                    ST_da_append_arena(se->arena, &hargs, at);
+                }
+                if (!hok)
+                    return NULL;
+                if (hargs.count != cgen->count) {
+                    ST_diag_error(&se->diag, te->line, te->col,
+                                  "'$" ST_sv_fmt "' is bound to '%s', which takes %u type "
+                                  "argument%s, got %u",
+                                  ST_sv_args(te->name), ST_tstr(se, ctor), cgen->count,
+                                  cgen->count == 1 ? "" : "s", hargs.count);
+                    return NULL;
+                }
+                return ST_instantiate_generic(se, cdecl, hargs, te->line, te->col);
+            }
             ST_sym_t *tmpl = ST_sym_find_in(&se->templates, te->name);
             if (!tmpl) {
                 ST_sym_t *gsym = ST_sym_find_in(&se->types, te->name);
@@ -1866,6 +1955,13 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
                                      arg_line, arg_col))
                     return 0;
             }
+            ST_forrange(0, pt->fn_rets.count) {
+                if (i >= at->rets.count)
+                    break;
+                if (!ST_unify_tyexpr(se, pt->fn_rets.items[i], at->rets.items[i], bindings,
+                                     arg_line, arg_col))
+                    return 0;
+            }
             return 1;
         }
 
@@ -1875,6 +1971,34 @@ static b8 ST_unify_tyexpr(ST_sema_t *se, ST_tyexpr_t *pt, ST_ty_t *at, ST_ht_t *
             ST_inst_info_t *info = ST_inst_info_find(se, at);
             if (!info)
                 return 1;
+
+            if (pt->is_generic_param) {
+                ST_ty_t *ctor = ST_ty_for_decls(&se->tys, info->tmpl);
+                ST_ht_generic_t ck = {.tag = pt->name.data, .size = pt->name.len};
+                ST_ty_t *cbound = (ST_ty_t *)ST_ht_get(bindings, ck).tag;
+                if (cbound) {
+                    if (cbound != ctor && !ST_ty_equal(cbound, ctor)) {
+                        ST_diag_error(&se->diag, arg_line, arg_col,
+                                      "generic parameter '$" ST_sv_fmt "' was already inferred as "
+                                      "'%s' from an earlier argument, but this one is '%s'",
+                                      ST_sv_args(pt->name), ST_tstr(se, cbound),
+                                      ST_tstr(se, ctor));
+                        return 0;
+                    }
+                } else {
+                    ST_ht_generic_t *cbk = ST_arena_push(se->arena, sizeof(*cbk));
+                    cbk->tag = pt->name.data;
+                    cbk->size = pt->name.len;
+                    ST_ht_set(bindings, cbk, (ST_ht_generic_t){.tag = ctor, .size = 0});
+                }
+                if (pt->generic_args.count != info->args.count)
+                    return 1;
+                ST_forrange(0, pt->generic_args.count)
+                    if (!ST_unify_tyexpr(se, pt->generic_args.items[i], info->args.items[i],
+                                         bindings, arg_line, arg_col))
+                    return 0;
+                return 1;
+            }
 
             ST_sym_t *tsym = ST_sym_find_in(&se->templates, pt->name);
             if (!tsym || tsym->decl != info->tmpl)
@@ -2047,6 +2171,10 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
                                       u32 line, u32 col) {
     i32 pack_idx = has_pack ? (i32)tmpl->fn.sig.params.count - 1 : -1;
     ST_tyexpr_t *pack_elem_te = pack_idx >= 0 ? tmpl->fn.sig.params.items[pack_idx].te : NULL;
+    ST_strings_t where_params = se->pending_where_params;
+    ST_strings_t where_syms = se->pending_where_syms;
+    se->pending_where_params = (ST_strings_t){0};
+    se->pending_where_syms = (ST_strings_t){0};
 
     ST_tys_t args = {0};
     ST_forrange(0, tmpl->fn.sig.generics.count) {
@@ -2095,6 +2223,22 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
             char buf[64];
             int n = snprintf(buf, sizeof(buf), "$a%u",
                              tmpl->fn.sig.params.count - tmpl->fn.sig.wheres.count);
+            // Overloads of the same arity (e.g. 'slice([]$T, ...)' and 'slice(*[]$T, ...)')
+            // would still mangle identically; add the template's index in the overload
+            // list so each gets its own instance instead of reusing the first one.
+            u32 tmpl_idx = 0, same_arity = 0;
+            for (u32 k = 0; k < ovl->count; k++) {
+                ST_decl_t *od = ovl->items[k]->decl;
+                if (!od || od->kind != ST_DE_FN || !od->fn.sig.generics.count)
+                    continue;
+                if (od->fn.sig.params.count - od->fn.sig.wheres.count ==
+                    tmpl->fn.sig.params.count - tmpl->fn.sig.wheres.count)
+                    same_arity++;
+                if (od == tmpl)
+                    tmpl_idx = k;
+            }
+            if (same_arity > 1)
+                n += snprintf(buf + n, sizeof(buf) - (u32)n, "$o%u", tmpl_idx);
             u8 *combined = ST_arena_push(se->arena, mangled.len + (u32)n);
             memcpy(combined, mangled.data, mangled.len);
             memcpy(combined + mangled.len, buf, (u32)n);
@@ -2121,6 +2265,21 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
         memcpy(nb, buf, (u32)n);
         mangled = (ST_string_t){.data = nb, .len = (u32)n};
     }
+    if (where_syms.count) {
+        u32 total = mangled.len;
+        ST_forrange(0, where_syms.count)
+            total += 2 + where_syms.items[i].len;
+        u8 *nb = ST_arena_push(se->arena, total);
+        memcpy(nb, mangled.data, mangled.len);
+        u32 off = mangled.len;
+        ST_forrange(0, where_syms.count) {
+            nb[off++] = '$';
+            nb[off++] = 'w';
+            memcpy(nb + off, where_syms.items[i].data, where_syms.items[i].len);
+            off += where_syms.items[i].len;
+        }
+        mangled = (ST_string_t){.data = nb, .len = off};
+    }
     ST_ht_generic_t key = { .tag = mangled.data, .size = mangled.len };
     ST_sym_t *existing = ST_ht_get(&se->fn_instantiations, key).tag;
     if (existing)
@@ -2146,6 +2305,9 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
     inst->fn.sig.generics = (ST_strings_t){0};
     inst->fn.is_prototype = tmpl->fn.is_prototype;
     inst->fn.is_method = tmpl->fn.is_method;
+    inst->fn.self_te = tmpl->fn.self_te;
+    inst->fn.where_static_params = where_params;
+    inst->fn.where_static_syms = where_syms;
     inst->fn.body = ST_clone_body(se->arena, &tmpl->fn.body);
 
     inst->fn.has_bound_str = has_bound_str;
@@ -2170,6 +2332,14 @@ static ST_sym_t *ST_instantiate_fn_ex(ST_sema_t *se, ST_decl_t *tmpl, ST_ht_t *b
         inst->fn.had_pack = 1;
         inst->fn.pack_name = pack_param.name;
         inst->fn.pack_count = n_pack_args;
+    }
+
+    {
+        ST_params_t kept = {0};
+        ST_forrange(0, inst->fn.sig.params.count)
+            if (!inst->fn.sig.params.items[i].is_type_param)
+                ST_da_append_arena(se->arena, &kept, inst->fn.sig.params.items[i]);
+        inst->fn.sig.params = kept;
     }
 
     ST_ht_t *pb = ST_arena_push_zeroed(se->arena, sizeof(*pb));
@@ -2685,13 +2855,40 @@ static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *call
     return 1;
 }
 
-static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, u32 n_args) {
+// @note: cheap structural check of a generic parameter's type expression against a concrete
+// argument type: only looks at pointer/slice/array shape, never binds anything. Used to tell
+// same-arity generic overloads apart (e.g. 'slice(array: []$T, ...)' vs 'slice(array: *[]$T, ...)')
+static b8 ST_tyexpr_shape_fits(ST_tyexpr_t *pt, ST_ty_t *at) {
+    if (!pt || !at)
+        return 1;
+    switch (pt->kind) {
+        case ST_TE_PTR:
+            if (at->kind != ST_TY_PTR)
+                return 0;
+            return ST_tyexpr_shape_fits(pt->inner, at->inner);
+        case ST_TE_ARRAY:
+            if (pt->is_dynamic)
+                return at->kind == ST_TY_DYN_ARRAY && ST_tyexpr_shape_fits(pt->inner, at->inner);
+            if (!pt->count_expr)
+                return (at->kind == ST_TY_SLICE || at->kind == ST_TY_ARRAY) &&
+                    ST_tyexpr_shape_fits(pt->inner, at->inner);
+            return at->kind == ST_TY_ARRAY && ST_tyexpr_shape_fits(pt->inner, at->inner);
+        default:
+            return 1;
+    }
+}
+
+static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, ST_expr_t *call) {
+    u32 n_args = call->call.args.count;
     ST_syms_t *ovl = ST_overload_find(se, name);
     if (!ovl || !ovl->count) {
         ST_sym_t *tsym = ST_sym_find_in(&se->templates, name);
         return (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN) ? tsym->decl : NULL;
     }
     ST_decl_t *fallback = NULL;
+    ST_decl_t *first_arity = NULL;
+    u32 n_arity = 0;
+    ST_decl_t *arity_match[16];
     for (u32 i = 0; i < ovl->count; i++) {
         ST_sym_t *cand = ovl->items[i];
         if (cand->kind != ST_SYM_FN || !cand->decl || cand->decl->kind != ST_DE_FN ||
@@ -2702,10 +2899,50 @@ static ST_decl_t *ST_select_fn_template(ST_sema_t *se, ST_string_t name, u32 n_a
             fallback = cand->decl;
         u32 required = sig->params.count - sig->wheres.count;
         b8 accepts_more = sig->has_any_pack || sig->has_generic_pack || sig->is_variadic;
-        if (n_args == required || (accepts_more && n_args >= required))
-            return cand->decl;
+        if (n_args == required || (accepts_more && n_args >= required)) {
+            if (!first_arity)
+                first_arity = cand->decl;
+            if (n_arity < 16)
+                arity_match[n_arity++] = cand->decl;
+        }
     }
-    return fallback;
+    if (n_arity < 2)
+        return first_arity ? first_arity : fallback;
+
+    // Several generic overloads accept this many arguments: pick the first one whose
+    // parameter shapes fit the actual argument types.
+    ST_ty_t *arg_tys[16] = {0};
+    u32 n_typed = n_args < 16 ? n_args : 16;
+    for (u32 k = 0; k < n_typed; k++) {
+        ST_arg_t *arg = &call->call.args.items[k];
+        // literals that take their type from the parameter can't be typed in isolation
+        if (arg->name.len || ST_dot_field(arg->value) ||
+            (arg->value->kind == ST_EX_STRUCT_LIT && arg->value->struct_lit.is_bracket_lit))
+            continue;
+        if (arg->value->kind == ST_EX_IDENT) {
+            ST_sym_t *tsym = ST_sym_find(se, arg->value->name);
+            if (tsym && tsym->kind == ST_SYM_TYPE)
+                continue;
+        }
+        arg_tys[k] = ST_type_expr(se, arg->value);
+    }
+    for (u32 c = 0; c < n_arity; c++) {
+        ST_fn_sig_t *sig = &arity_match[c]->fn.sig;
+        b8 fits = 1;
+        for (u32 k = 0; k < n_typed && k < sig->params.count; k++) {
+            if (call->call.args.items[k].name.len)
+                continue;
+            if (sig->has_generic_pack && k + 1 >= sig->params.count)
+                break;
+            if (!ST_tyexpr_shape_fits(sig->params.items[k].te, arg_tys[k])) {
+                fits = 0;
+                break;
+            }
+        }
+        if (fits)
+            return arity_match[c];
+    }
+    return first_arity;
 }
 
 // @note: resolves every 'name...' pack-spread argument in 'e->call.args' (parsed by
@@ -2825,11 +3062,99 @@ static b8 ST_try_method_call(ST_sema_t *se, ST_expr_t *e) {
     return 1;
 }
 
+static i32 ST_try_witness_generic_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    ST_expr_t *base = callee->field.base;
+    if (!base || base->kind != ST_EX_IDENT)
+        return 0;
+    ST_ty_t *bt = ST_type_expr(se, base);
+    if (!bt || !bt->is_trait_witness || !bt->trait_decl)
+        return 0;
+    ST_decl_t *trait = bt->trait_decl;
+    ST_string_t mname = callee->field.name;
+
+    ST_trait_method_t *tm = NULL;
+    for (u32 i = 0; i < trait->trait_.methods.count; i++) {
+        ST_trait_method_t *c = &trait->trait_.methods.items[i];
+        if (c->sig.generics.count && ST_string_eq(c->name, mname) &&
+            (c->sig.params.count == e->call.args.count ||
+             c->sig.params.count == e->call.args.count + 1)) {
+            tm = c;
+            break;
+        }
+    }
+    if (!tm)
+        return 0;
+
+    ST_sym_t *wsym = NULL;
+    if (se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN)
+        for (u32 i = 0; i < se->cur_fn_decl->fn.where_static_params.count; i++)
+            if (ST_string_eq(se->cur_fn_decl->fn.where_static_params.items[i], base->name)) {
+                wsym = ST_sym_find_in(&se->globals, se->cur_fn_decl->fn.where_static_syms.items[i]);
+                break;
+            }
+    if (!wsym)
+        wsym = ST_sym_find(se, base->name);
+    ST_expr_t *init = NULL;
+    if (wsym && wsym->decl) {
+        if (wsym->decl->kind == ST_DE_CONST)
+            init = wsym->decl->const_.value;
+        else if (wsym->decl->kind == ST_DE_GLOBAL)
+            init = wsym->decl->global_.init;
+    }
+    if (!init || init->kind != ST_EX_STRUCT_LIT) {
+        ST_diag_error(&se->diag, callee->line, callee->col,
+                      "'" ST_sv_fmt "' has its own generic parameters, so it can only be called "
+                      "on a named witness known at compile time (a global declared as "
+                      "'name := " ST_sv_fmt "(...) { ... };', or a 'where' witness)",
+                      ST_sv_args(mname), ST_sv_args(trait->name));
+        return -1;
+    }
+
+    ST_string_t impl_name = {0};
+    for (u32 i = 0; i < init->struct_lit.generic_impl_methods.count; i++)
+        if (ST_string_eq(init->struct_lit.generic_impl_methods.items[i], mname)) {
+            impl_name = init->struct_lit.generic_impl_names.items[i];
+            break;
+        }
+    if (!impl_name.len)
+        return 0;
+
+    b8 inject_self = 0;
+    u32 self_idx = 0;
+    for (u32 i = 0; i < bt->fields.count; i++)
+        if (ST_string_eq_cstr(bt->fields.items[i].name, "self")) {
+            inject_self = tm->sig.params.count == e->call.args.count + 1;
+            self_idx = i;
+            break;
+        }
+
+    callee->kind = ST_EX_IDENT;
+    callee->name = impl_name;
+    if (inject_self) {
+        ST_expr_t *self_ref = ST_expr_new(se->arena, ST_EX_FIELD, base->line, base->col);
+        self_ref->field.base = base;
+        self_ref->field.name = ST_cstr_to_str("self");
+        self_ref->ty = bt->fields.items[self_idx].ty;
+        ST_arg_t first = {.value = self_ref};
+        ST_da_append_arena(se->arena, &e->call.args, first);
+        for (u32 k = e->call.args.count - 1; k > 0; k--)
+            e->call.args.items[k] = e->call.args.items[k - 1];
+        e->call.args.items[0] = first;
+    }
+    return 1;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
-    if (callee && callee->kind == ST_EX_FIELD && callee->field.base && ST_try_method_call(se, e))
-        callee = e->call.callee;
+    if (callee && callee->kind == ST_EX_FIELD && callee->field.base) {
+        i32 wr = ST_try_witness_generic_call(se, e);
+        if (wr < 0)
+            return NULL;
+        if (wr > 0 || ST_try_method_call(se, e))
+            callee = e->call.callee;
+    }
     ST_sym_t *sym = NULL;
     ST_ty_t *fnty = NULL;
 
@@ -2844,14 +3169,14 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             callee->name = sym->decl->name;
         if (sym && sym->kind == ST_SYM_FN && !sym->t && sym->decl &&
             sym->decl->kind == ST_DE_FN && sym->decl->fn.sig.generics.count) {
-            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e->call.args.count);
+            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e);
             if (tdecl) {
                 fn_tmpl = tdecl;
                 sym = NULL;
             }
         }
         if (!sym) {
-            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e->call.args.count);
+            ST_decl_t *tdecl = ST_select_fn_template(se, callee->name, e);
             if (tdecl)
                 fn_tmpl = tdecl;
             else if (ST_sym_find_in(&se->templates, callee->name))
@@ -3005,6 +3330,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
 
     ST_forrange(0, e->call.args.count) {
         ST_expr_t *av = e->call.args.items[i].value;
+        if (fn_tmpl && i < fn_tmpl->fn.sig.params.count &&
+            fn_tmpl->fn.sig.params.items[i].is_type_param)
+            continue;
         if (av->kind == ST_EX_IDENT) {
             ST_sym_t *tsym = ST_sym_find(se, av->name);
             if (tsym && tsym->kind == ST_SYM_TYPE) {
@@ -3129,6 +3457,24 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             if (idx < tsig->params.count && idx < 64)
                 fixed_vals[idx] = arg->value;
 
+            if (idx < tsig->params.count && tsig->params.items[idx].is_type_param) {
+                ST_tyexpr_t *tte = ST_expr_to_tyexpr(se, arg->value);
+                ST_ty_t *targ = tte ? ST_resolve_tyexpr(se, tte) : NULL;
+                if (!targ) {
+                    ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                                  "argument '" ST_sv_fmt "' expects a type",
+                                  ST_sv_args(tsig->params.items[idx].name));
+                    unify_ok = 0;
+                    continue;
+                }
+                ST_string_t tname = tsig->params.items[idx].name;
+                ST_ht_generic_t *tbk = ST_arena_push(se->arena, sizeof(*tbk));
+                tbk->tag = tname.data;
+                tbk->size = tname.len;
+                ST_ht_set(&bindings, tbk, (ST_ht_generic_t){.tag = targ, .size = 0});
+                continue;
+            }
+
             b8 literal_fits_bound = 0;
             if (idx < tsig->params.count && tsig->params.items[idx].te && arg->value->ty &&
                 tsig->params.items[idx].te->is_generic_param &&
@@ -3181,6 +3527,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             }
             e->call.args = new_call_args;
         }
+        se->pending_where_params.count = 0;
+        se->pending_where_syms.count = 0;
         if (unify_ok && tsig->wheres.count) {
             ST_ht_t *save_gb = se->generic_bindings;
             se->generic_bindings = &bindings;
@@ -3225,6 +3573,12 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                     unify_ok = 0;
                     continue;
                 }
+                for (u32 gm = 0; gm < trait->trait_.methods.count; gm++)
+                    if (trait->trait_.methods.items[gm].sig.generics.count) {
+                        ST_da_append_arena(se->arena, &se->pending_where_params, w->witness_name);
+                        ST_da_append_arena(se->arena, &se->pending_where_syms, match->name);
+                        break;
+                    }
                 ST_string_t inject_name = match->name;
                 if (match->kind == ST_SYM_CONST && match->t && match->t->is_trait_witness) {
                     char buf[300];
@@ -3248,6 +3602,16 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         }
         if (!unify_ok)
             return NULL;
+
+        {
+            ST_args_t kept = {0};
+            ST_forrange(0, e->call.args.count) {
+                if (i < tsig->params.count && tsig->params.items[i].is_type_param)
+                    continue;
+                ST_da_append_arena(se->arena, &kept, e->call.args.items[i]);
+            }
+            e->call.args = kept;
+        }
 
         sym = ST_instantiate_fn_ex(se, fn_tmpl, &bindings, pack_idx >= 0, n_pack_args,
                                    has_bound_str, bound_str_param, bound_str_value, e->line,
@@ -4325,8 +4689,10 @@ static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e) {
                 : NULL;
             if (e->tyop.te) {
                 ST_ty_t *st = ST_resolve_tyexpr(se, e->tyop.te);
-                if (st)
+                if (st) {
                     ST_complete_ty(se, st);
+                    e->tyop.te->resolved = st;
+                }
             } else if (tsym && tsym->kind == ST_SYM_TYPE) {
                 ST_ty_t *st = ST_ty_for_decls(&se->tys, tsym->decl);
                 if (st) {
@@ -5022,7 +5388,6 @@ static void ST_sema_run_comptime_blocks(ST_sema_t *se) {
         ST_ct_vm_release(se, vm);
     }
 }
-
 
 static void ST_ast_substitute_expr(ST_sema_t *se, ST_expr_t *e, ST_string_t target,
                                    ST_expr_t *replacement) {
@@ -6450,6 +6815,8 @@ static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
     b8 save_stamp = se->stamp_tyexprs;
     if (sym->generic_bindings) {
         se->generic_bindings = sym->generic_bindings;
+        se->stamp_tyexprs = 1;
+    } else if (d->fn.is_method || d->fn.self_te) {
         se->stamp_tyexprs = 1;
     }
 

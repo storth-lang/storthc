@@ -71,6 +71,8 @@ void ST_dump_tyexpr(FILE *out, ST_tyexpr_t *te) {
         break;
         
         case ST_TE_GENERIC_INST:
+        if (te->is_generic_param)
+            fputc('$', out);
         fprintf(out, ST_sv_fmt, ST_sv_args(te->name));
         fputs("(", out);
         ST_forrange(0, te->generic_args.count) {

@@ -169,6 +169,8 @@ struct ST_expr_t {
             ST_field_inits_t inits;
             b8 is_bracket_lit;
             b8 synth_variant;
+            ST_strings_t generic_impl_methods;
+            ST_strings_t generic_impl_names;
         } struct_lit;
         struct {
             ST_tyexpr_t *te;
@@ -360,6 +362,7 @@ typedef struct {
     u32 line, col;
     b8 is_pack;  // 'name: any...'
     b8 is_const; // 'name :: T' caller's argument must be a compile-time constant
+    b8 is_type_param;
 } ST_param_t;
 
 typedef struct {
@@ -456,6 +459,9 @@ struct ST_decl_t {
             ST_string_t bound_str_value; // the literal value bound at this call site
             b8 has_call_site;
             b8 is_method;
+            ST_tyexpr_t *self_te;
+            ST_strings_t where_static_params;
+            ST_strings_t where_static_syms;
             ST_string_t call_file;
             u32 call_line, call_col;
             u32 decl_block_id; // >0 for a nested 'fn' declared inside another function's

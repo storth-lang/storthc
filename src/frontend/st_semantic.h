@@ -94,6 +94,8 @@ typedef struct {
 
     b8 stamp_tyexprs;
     u32 n_fn_instances;
+    ST_strings_t pending_where_params;
+    ST_strings_t pending_where_syms;
     u32 n_witness_aliases; // see ST_type_call's 'where' handling
 
     b8 has_pack;
