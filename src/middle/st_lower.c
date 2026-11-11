@@ -1143,8 +1143,8 @@ static ST_ir_inst_t *ST_lower_short_or(ST_lower_ctx_t *c, ST_expr_t *e) {
 // @note: ST_lower_bounds_check emits a runtime 'if idx >= len: trap' guard at
 // the current insertion point. A single unsigned comparison covers both
 // directions at once
-static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_inst_t *len,
-                                  u32 line, u32 col) {
+static void ST_lower_bounds_check_op(ST_lower_ctx_t *c, ST_ir_op_t fail_op, ST_ir_inst_t *idx,
+                                     ST_ir_inst_t *len, u32 line, u32 col) {
     ST_ty_t *i64ty = c->sema->tys.prim[ST_ti64];
     ST_ty_t *boolty = c->sema->tys.prim[ST_tbool];
 
@@ -1153,7 +1153,7 @@ static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_in
     ST_ir_inst_t *len64 =
         (len->ty && len->ty->size == 8) ? len : ST_ir_cast(c->cur, i64ty, len, line, col);
 
-    ST_ir_inst_t *oob = ST_ir_binop(c->cur, ST_IR_ICMP_UGE, boolty, idx64, len64, line, col);
+    ST_ir_inst_t *oob = ST_ir_binop(c->cur, fail_op, boolty, idx64, len64, line, col);
 
     ST_ir_block_t *fail_b = ST_ir_block_new(c->fn, "bounds_fail");
     ST_ir_block_t *ok_b = ST_ir_block_new(c->fn, "bounds_ok");
@@ -1180,6 +1180,81 @@ static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_in
 
     ST_ir_block_seal(ok_b);
     c->cur = ok_b;
+}
+
+static void ST_lower_bounds_check(ST_lower_ctx_t *c, ST_ir_inst_t *idx, ST_ir_inst_t *len,
+                                  u32 line, u32 col) {
+    ST_lower_bounds_check_op(c, ST_IR_ICMP_UGE, idx, len, line, col);
+}
+
+static ST_ir_inst_t *ST_lower_to_i64(ST_lower_ctx_t *c, ST_ir_inst_t *v, u32 line, u32 col) {
+    ST_ty_t *i64ty = c->sema->tys.prim[ST_ti64];
+    if (v->ty && v->ty->size == 8)
+        return v;
+    return ST_ir_cast(c->cur, i64ty, v, line, col);
+}
+
+static ST_ir_inst_t *ST_lower_slice_expr_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
+    ST_expr_t *b = e->index.base;
+    ST_expr_t *range = e->index.index;
+    ST_expr_t *hi_e = range->bin.r;
+    b8 open_hi = ST_expr_is_open_end(hi_e);
+    ST_ty_t *bt = b->ty;
+    ST_ty_t *i64ty = c->sema->tys.prim[ST_ti64];
+    ST_ir_inst_t *base = NULL;
+    ST_ir_inst_t *len = NULL;
+    ST_ty_t *ety = NULL;
+
+    if (!bt || !e->ty)
+        return NULL;
+
+    if (bt->kind == ST_TY_PTR) {
+        ety = bt->inner;
+        base = ST_lower_expr(c, b);
+    } else if (bt->kind == ST_TY_ARRAY) {
+        ety = bt->inner;
+        base = ST_lower_lvalue_addr(c, b);
+        len = ST_ir_const_int(c->cur, i64ty, (i64)bt->count);
+    } else if (bt->kind == ST_TY_SLICE || bt->kind == ST_TY_DYN_ARRAY ||
+               bt->kind == ST_TY_STRING) {
+        ety = bt->kind == ST_TY_STRING ? c->sema->tys.prim[ST_tchar] : bt->inner;
+        ST_ir_inst_t *hdr = ST_lower_lvalue_addr(c, b);
+        if (!hdr)
+            return NULL;
+        ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ety);
+        ST_ir_inst_t *pf = ST_lower_field_ptr(c, hdr, 0, ptr_ty, e->line, e->col);
+        base = ST_ir_load(c->cur, ptr_ty, pf, e->line, e->col);
+        ST_ir_inst_t *lf = ST_lower_field_ptr(c, hdr, 8, i64ty, e->line, e->col);
+        len = ST_ir_load(c->cur, i64ty, lf, e->line, e->col);
+    } else {
+        ST_diag_error(&c->diag, e->line, e->col, "internal: cannot slice this type");
+        return NULL;
+    }
+    if (!base)
+        return NULL;
+
+    ST_ir_inst_t *lo = ST_lower_expr(c, range->bin.l);
+    ST_ir_inst_t *hi = open_hi ? len : ST_lower_expr(c, hi_e);
+    if (!lo || !hi)
+        return NULL;
+    lo = ST_lower_to_i64(c, lo, e->line, e->col);
+    hi = ST_lower_to_i64(c, hi, e->line, e->col);
+
+    if (len && !open_hi)
+        ST_lower_bounds_check_op(c, ST_IR_ICMP_UGT, hi, len, e->line, e->col);
+    ST_lower_bounds_check_op(c, ST_IR_ICMP_UGT, lo, hi, e->line, e->col);
+
+    ST_ty_t *ptr_ty = ST_ty_ptr(&c->sema->tys, ety);
+    u32 scale = ety->size ? ety->size : 1;
+    ST_ir_inst_t *start = ST_ir_addr(c->cur, ptr_ty, base, lo, scale, 0, e->line, e->col);
+    ST_ir_inst_t *count = ST_ir_binop(c->cur, ST_IR_SUB, i64ty, hi, lo, e->line, e->col);
+
+    ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, e->ty, (ST_string_t){0}, e->line, e->col);
+    ST_ir_inst_t *sp = ST_lower_field_ptr(c, slot, 0, ptr_ty, e->line, e->col);
+    ST_ir_store(c->cur, ptr_ty, sp, start, e->line, e->col);
+    ST_ir_inst_t *sl = ST_lower_field_ptr(c, slot, 8, i64ty, e->line, e->col);
+    ST_ir_store(c->cur, i64ty, sl, count, e->line, e->col);
+    return slot;
 }
 
 #define ST_MAX_LOWER_DEPTH 512
@@ -1320,6 +1395,8 @@ static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) 
             return ST_lower_field_ptr(c, base, (i32)foff, fty, e->line, e->col);
         }
         case ST_EX_INDEX: {
+            if (ST_expr_is_slice_range(e->index.index))
+                return ST_lower_slice_expr_addr(c, e);
             ST_expr_t *b = e->index.base;
             ST_ty_t *bt = b->ty;
             ST_ir_inst_t *base;

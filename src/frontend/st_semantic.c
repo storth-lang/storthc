@@ -3205,6 +3205,149 @@ static b8 ST_try_method_call(ST_sema_t *se, ST_expr_t *e) {
     return 1;
 }
 
+static ST_tyexpr_t *ST_expr_as_tyexpr(ST_sema_t *se, ST_expr_t *e) {
+    switch (e->kind) {
+        case ST_EX_IDENT: {
+            ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
+            te->name = e->name;
+            return te;
+        }
+        case ST_EX_UNARY: {
+            if (!ST_string_eq_cstr(e->unary.op, "*"))
+                break;
+            ST_tyexpr_t *inner = ST_expr_as_tyexpr(se, e->unary.operand);
+            if (!inner)
+                return NULL;
+            ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_PTR, e->line, e->col);
+            te->inner = inner;
+            return te;
+        }
+        case ST_EX_CALL: {
+            if (!e->call.callee || e->call.callee->kind != ST_EX_IDENT)
+                break;
+            ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_GENERIC_INST, e->line, e->col);
+            te->name = e->call.callee->name;
+            for (u32 i = 0; i < e->call.args.count; i++) {
+                ST_arg_t *a = &e->call.args.items[i];
+                if (a->name.len || a->is_pack_spread)
+                    return NULL;
+                ST_tyexpr_t *sub = ST_expr_as_tyexpr(se, a->value);
+                if (!sub)
+                    return NULL;
+                ST_da_append_arena(se->arena, &te->generic_args, sub);
+            }
+            return te;
+        }
+        default:
+        break;
+    }
+    ST_diag_error(&se->diag, e->line, e->col,
+                  "expected a type here: a trait instance is written 'trait(Type).method(...)'");
+    return NULL;
+}
+
+static void ST_witness_scan(ST_sema_t *se, ST_ht_t *ht, ST_ty_t *want, b8 is_global_level,
+                            ST_syms_t *out) {
+    for (u32 i = 0; i < ht->capacity; i++) {
+        ST_ht_generic_t *k = ht->slots[i].key;
+        ST_ht_generic_t *v = ht->slots[i].value;
+        if (!k || k == (ST_ht_generic_t *)1 || !v || !v->tag)
+            continue;
+        ST_sym_t *sym = v->tag;
+        if (sym->kind != ST_SYM_VAR && sym->kind != ST_SYM_GLOBAL && sym->kind != ST_SYM_CONST)
+            continue;
+        if (!sym->t || !ST_ty_equal(sym->t, want))
+            continue;
+        if (memchr(sym->name.data, '$', sym->name.len))
+            continue;
+        if (is_global_level && sym->decl && !sym->decl->is_pub &&
+            !ST_string_eq(sym->decl->file, se->diag.file))
+            continue;
+        b8 seen = 0;
+        for (u32 j = 0; j < out->count; j++)
+            if (out->items[j] == sym)
+                seen = 1;
+        if (!seen)
+            ST_da_append_arena(se->arena, out, sym);
+    }
+}
+
+static ST_sym_t *ST_find_witness_by_type(ST_sema_t *se, ST_ty_t *want, u32 line, u32 col) {
+    ST_syms_t hits = {0};
+    for (ST_scope_t *s = se->scope; s && !hits.count; s = s->parent)
+        ST_witness_scan(se, &s->table, want, 0, &hits);
+    if (!hits.count)
+        ST_witness_scan(se, &se->globals, want, 1, &hits);
+    if (!hits.count) {
+        ST_diag_error(&se->diag, line, col,
+                      "no implementation of '%s' is in scope; declare one with "
+                      "'name := %s { ... };'",
+                      ST_tstr(se, want), ST_tstr(se, want));
+        return NULL;
+    }
+    if (hits.count > 1) {
+        ST_diag_error(&se->diag, line, col,
+                      "ambiguous implementation of '%s': '" ST_sv_fmt "' and '" ST_sv_fmt
+                      "' are both in scope; call the method on one of them by name",
+                      ST_tstr(se, want), ST_sv_args(hits.items[0]->name),
+                      ST_sv_args(hits.items[1]->name));
+        return NULL;
+    }
+    return hits.items[0];
+}
+
+static i32 ST_try_trait_instance_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    ST_expr_t *inst = callee->field.base;
+    if (!inst || inst->kind != ST_EX_CALL || !inst->call.callee ||
+        inst->call.callee->kind != ST_EX_IDENT)
+        return 0;
+    ST_sym_t *tsym = ST_sym_find(se, inst->call.callee->name);
+    if (!tsym || tsym->kind != ST_SYM_TYPE || !tsym->decl || tsym->decl->kind != ST_DE_TRAIT)
+        return 0;
+    ST_decl_t *trait = tsym->decl;
+
+    if (inst->call.args.count != trait->trait_.generics.count) {
+        ST_diag_error(&se->diag, inst->line, inst->col,
+                      "trait '" ST_sv_fmt "' expects %u type argument(s), got %u",
+                      ST_sv_args(trait->name), trait->trait_.generics.count,
+                      inst->call.args.count);
+        return -1;
+    }
+    ST_tys_t targs = {0};
+    for (u32 i = 0; i < inst->call.args.count; i++) {
+        ST_arg_t *a = &inst->call.args.items[i];
+        ST_tyexpr_t *te = a->name.len || a->is_pack_spread ? NULL : ST_expr_as_tyexpr(se, a->value);
+        if (!te) {
+            if (a->name.len || a->is_pack_spread)
+                ST_diag_error(&se->diag, a->value->line, a->value->col,
+                              "a trait instance takes plain type arguments");
+            return -1;
+        }
+        ST_ty_t *ty = ST_resolve_tyexpr(se, te);
+        if (!ty)
+            return -1;
+        ST_da_append_arena(se->arena, &targs, ty);
+    }
+    ST_ty_t *want = ST_instantiate_trait_witness(se, trait, targs, inst->line, inst->col);
+    if (!want)
+        return -1;
+    ST_sym_t *w = ST_find_witness_by_type(se, want, inst->line, inst->col);
+    if (!w)
+        return -1;
+    if (ST_sym_find(se, w->name) != w) {
+        ST_diag_error(&se->diag, inst->line, inst->col,
+                      "the implementation of '%s' named '" ST_sv_fmt "' is shadowed here by "
+                      "another binding of the same name",
+                      ST_tstr(se, want), ST_sv_args(w->name));
+        return -1;
+    }
+    inst->kind = ST_EX_IDENT;
+    inst->name = w->name;
+    inst->ty = NULL;
+    return 1;
+}
+
 static i32 ST_try_witness_generic_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expr_t *callee = e->call.callee;
     ST_expr_t *base = callee->field.base;
@@ -3292,6 +3435,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
     if (callee && callee->kind == ST_EX_FIELD && callee->field.base) {
+        if (ST_try_trait_instance_call(se, e) < 0)
+            return NULL;
         i32 wr = ST_try_witness_generic_call(se, e);
         if (wr < 0)
             return NULL;
@@ -4030,7 +4175,81 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+static ST_ty_t *ST_type_slice_expr(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *range = e->index.index;
+    ST_expr_t *lo = range->bin.l;
+    ST_expr_t *hi = range->bin.r;
+    b8 open_hi = ST_expr_is_open_end(hi);
+
+    ST_ty_t *bt = ST_type_expr(se, e->index.base);
+    ST_ty_t *lt = ST_type_expr(se, lo);
+    ST_ty_t *ht = open_hi ? NULL : ST_type_expr(se, hi);
+    range->ty = se->tys.prim[ST_ti64];
+
+    if (lt && !ST_ty_is_int(lt))
+        ST_diag_error(&se->diag, lo->line, lo->col,
+                      "slice bound must be an integer, got '%s'", ST_tstr(se, lt));
+    if (ht && !ST_ty_is_int(ht))
+        ST_diag_error(&se->diag, hi->line, hi->col,
+                      "slice bound must be an integer, got '%s'", ST_tstr(se, ht));
+    if (!bt)
+        return NULL;
+
+    i64 lo_c = 0, hi_c = 0;
+    b8 lo_known = ST_const_eval(se, lo, &lo_c);
+    b8 hi_known = !open_hi && ST_const_eval(se, hi, &hi_c);
+    if (lo_known && lo_c < 0) {
+        ST_diag_error(&se->diag, lo->line, lo->col, "slice lower bound '%lld' is negative",
+                      (long long)lo_c);
+        return NULL;
+    }
+    if (hi_known && hi_c < 0) {
+        ST_diag_error(&se->diag, hi->line, hi->col, "slice upper bound '%lld' is negative",
+                      (long long)hi_c);
+        return NULL;
+    }
+    if (lo_known && hi_known && lo_c > hi_c) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "slice lower bound '%lld' is greater than its upper bound '%lld'",
+                      (long long)lo_c, (long long)hi_c);
+        return NULL;
+    }
+
+    switch (bt->kind) {
+        case ST_TY_ARRAY:
+        if ((hi_known && (u64)hi_c > bt->count) || (lo_known && (u64)lo_c > bt->count)) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "slice bound '%lld' is out of bound for array of length %llu",
+                          (long long)(hi_known && (u64)hi_c > bt->count ? hi_c : lo_c),
+                          (unsigned long long)bt->count);
+            return NULL;
+        }
+        return ST_ty_slice(&se->tys, bt->inner);
+        case ST_TY_SLICE:
+        case ST_TY_DYN_ARRAY:
+        return ST_ty_slice(&se->tys, bt->inner);
+        case ST_TY_STRING:
+        return bt;
+        case ST_TY_PTR:
+        if (bt->inner->kind == ST_TY_VOID)
+            break;
+        if (open_hi) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "slicing a pointer needs an explicit upper bound, a pointer has no length");
+            return NULL;
+        }
+        return ST_ty_slice(&se->tys, bt->inner);
+        default:
+        break;
+    }
+    ST_diag_error(&se->diag, e->line, e->col, "cannot slice a value of type '%s'",
+                  ST_tstr(se, bt));
+    return NULL;
+}
+
 static ST_ty_t *ST_type_index(ST_sema_t *se, ST_expr_t *e) {
+    if (ST_expr_is_slice_range(e->index.index))
+        return ST_type_slice_expr(se, e);
     ST_ty_t *bt = ST_type_expr(se, e->index.base);
     ST_ty_t *it = ST_type_expr(se, e->index.index);
     if (it && !ST_ty_is_int(it))
@@ -5212,6 +5431,13 @@ static ST_expr_t *ST_lvalue_root_ident(ST_expr_t *e) {
 }
 
 static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
+    if (s->assign.lhs && s->assign.lhs->kind == ST_EX_INDEX &&
+        ST_expr_is_slice_range(s->assign.lhs->index.index)) {
+        ST_diag_error(&se->diag, s->line, s->col,
+                      "cannot assign to a slice expression, it is a temporary view; assign to "
+                      "its elements instead");
+        return;
+    }
     if (s->assign.lhs && s->assign.lhs->kind == ST_EX_IDENT) {
         // reassigning a slice invalidates its remembered literal length
         ST_sym_t *asym = ST_sym_find(se, s->assign.lhs->name);

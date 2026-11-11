@@ -71,6 +71,42 @@ f.name = "Urmom"; // This is an invalid code because you are trying to access an
                   // while age is the acctive one meaning only f.age is accessible.
 `
 
+### Slices
+
+A slice `[]T` is a pointer and a length, `{ptr, len}`. A fixed array converts to a slice of the same element type.
+`base[lo..hi]` takes the elements from `lo` up to but not including `hi`. A missing `lo` is `0` and a missing `hi` is the
+length of `base`, so `a[..]`, `a[2..]` and `a[..n]` are all valid.
+
+`src_code
+a : [8]i32;
+head := a[0..3];
+tail := a[3..];
+word := "hello world"[6..];
+`
+The base can be an array, a slice, a dynamic array, a string or a pointer. A string slice is a string, anything else is `[]T`.
+A pointer has no length so it needs both bounds. Nothing is copied, the slice views the original elements. Bounds are checked,
+at compile time when they are constants and at run time otherwise. A slice expression is a temporary and cannot be assigned to,
+`&a[lo..hi]` is a pointer to that temporary.
+
+### Traits and witnesses
+
+A trait lists method signatures over a type parameter, and a witness implements it for one type.
+
+`src_code
+trait Net($T) {
+    fn read(s: *$T, n: i32) -> i32;
+}
+
+struct Tcp { fd: i32; }
+
+tcp_net := Net(Tcp) {
+    fn read(s: *Tcp, n: i32) -> i32 { return n + s.fd; }
+};
+`
+A witness is called by name, `tcp_net.read(&t, 5)`, or by trait and type, `Net(Tcp).read(&t, 5)`. The second form finds the
+witness of exactly that type in scope. The innermost scope with a match wins, two matches at the same level is an error, and a
+witness from another module only counts when it is `pub`. See how-to chapter 22.
+
 ### Enums and Enum_Flags
 Enums work the exact same way enums from C work. They are completely identical.
 The `: u32` is optional, it is the integer type that backs the enum and by default it is u32. Any integer type (u8..u64, i8..i64) can be given and the enum takes that size.

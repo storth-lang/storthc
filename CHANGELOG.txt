@@ -370,3 +370,14 @@ above and it's easy to lose track of:
 
 - Trait system. The trait system will be in how-to for now documenting it for people to easily test it
   Sucks for temporary I will be writing a whole paper for it and how it work. With diagrams.
+
+13:11:2026
+
+- Slice expressions: `base[lo..hi]` with either bound optional (`a[..n]`, `a[n..]`, `a[..]`). Works on arrays, slices,
+  dynamic arrays, strings (result is a string) and pointers (needs both bounds). The result is a `[]T` header over the
+  original elements, bounds are checked at compile time for constants and at run time otherwise, and `&a[lo..hi]` takes the
+  address of the temporary header. Assigning to a slice expression is an error.
+
+- `Trait(Type).method(args)`: calls a trait method through the witness of exactly `Trait(Type)` without naming it. The witness
+  is searched by type, innermost scope first, two at one level is an ambiguity error, and a witness from another module is
+  only used when it is `pub`. Documented in how-to chapter 22.

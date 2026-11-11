@@ -977,10 +977,39 @@ static ST_expr_t *ST_parse_postfix(ST_parser_t *p) {
             ix->index.base = e;
             u32 save = p->no_struct_lit;
             p->no_struct_lit = 0;
-            ix->index.index = ST_parse_expr(p);
-            p->no_struct_lit = save;
-            if (!ix->index.index)
+            ST_expr_t *lo = NULL;
+            if (!ST_at_symbol(p, ".."))
+                lo = ST_parse_expr(p);
+            if (!lo && !ST_at_symbol(p, "..")) {
+                p->no_struct_lit = save;
                 return NULL;
+            }
+            if (ST_at_symbol(p, "..")) {
+                ST_token_t *dots = ST_peek(p);
+                p->pos++;
+                if (!lo) {
+                    lo = ST_expr_new(p->arena, ST_EX_INT, dots->line, dots->col);
+                    lo->ival = 0;
+                }
+                ST_expr_t *hi = NULL;
+                if (ST_at_symbol(p, "]")) {
+                    hi = ST_expr_new(p->arena, ST_EX_IDENT, dots->line, dots->col);
+                    hi->name = ST_cstr_to_str("..");
+                } else {
+                    hi = ST_parse_expr(p);
+                    if (!hi) {
+                        p->no_struct_lit = save;
+                        return NULL;
+                    }
+                }
+                ST_expr_t *range = ST_expr_new(p->arena, ST_EX_BINARY, dots->line, dots->col);
+                range->bin.op = ST_cstr_to_str("..");
+                range->bin.l = lo;
+                range->bin.r = hi;
+                lo = range;
+            }
+            ix->index.index = lo;
+            p->no_struct_lit = save;
             if (!ST_expect_sym(p, "]"))
                 return NULL;
             e = ix;

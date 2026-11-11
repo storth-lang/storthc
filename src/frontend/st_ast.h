@@ -488,6 +488,14 @@ typedef struct {
     ST_string_t file;
 } ST_program_t;
 
+static inline b8 ST_expr_is_slice_range(ST_expr_t *ix) {
+    return ix && ix->kind == ST_EX_BINARY && ST_string_eq_cstr(ix->bin.op, "..");
+}
+
+static inline b8 ST_expr_is_open_end(ST_expr_t *hi) {
+    return hi && hi->kind == ST_EX_IDENT && ST_string_eq_cstr(hi->name, "..");
+}
+
 ST_expr_t *ST_expr_new(ST_arena_t *a, ST_expr_kind_t kind, u32 line, u32 col);
 ST_stmt_t *ST_stmt_new(ST_arena_t *a, ST_stmt_kind_t kind, u32 line, u32 col);
 ST_decl_t *ST_decl_new(ST_arena_t *a, ST_decl_kind_t kind, u32 line, u32 col);
