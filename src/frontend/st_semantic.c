@@ -2843,6 +2843,12 @@ static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *call
         return 1;
     }
     if (!best) {
+        for (u32 k = 0; k < ovl->count; k++) {
+            ST_sym_t *cand = ovl->items[k];
+            if (cand->kind == ST_SYM_FN && cand->decl && cand->decl->kind == ST_DE_FN &&
+                cand->decl->fn.sig.generics.count)
+                return 0;
+        }
         ST_diag_error(&se->diag, callee->line, callee->col,
                       "no overload of '" ST_sv_fmt "' matches these argument types",
                       ST_sv_args(callee->name));
