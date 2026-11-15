@@ -37,7 +37,7 @@ Used to turn "this doesn't make sense" into a clear error at the actual call sit
 Iterates a struct's fields at compile time:
 
 ```rs
-for field, idx: #fields(v) {
+for idx, field: #fields(v) {
     print_value(fd, field);
 }
 ```

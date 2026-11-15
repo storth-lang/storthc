@@ -295,6 +295,7 @@ static b8 ST_ty_is_int_like(ST_ty_t *t) {
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
 static ST_expr_t *ST_dot_field(ST_expr_t *e);
 static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
+static void ST_enum_expect_walk(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors);
 static ST_ct_vm_t *ST_ct_vm_acquire(ST_sema_t *se);
 static void ST_ct_vm_release(ST_sema_t *se, ST_ct_vm_t *vm);
@@ -3660,6 +3661,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         }
         ST_ty_t *pt = (fnty && i < fnty->params.count) ? fnty->params.items[i] : NULL;
         ST_ty_t *at;
+        ST_enum_expect_walk(se, av, pt);
         if (pt && ST_dot_field(av) && ST_lit_takes_expected(se, av, pt)) {
             at = ST_type_struct_lit(se, av, pt);
             av->ty = at;
@@ -4515,7 +4517,25 @@ static b8 ST_ctor_normalize(ST_sema_t *se, ST_expr_t *e, b8 allow_bare, ST_ty_t 
     return 1;
 }
 
+static void ST_enum_expect_walk(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
+    if (!e || !expect || expect->kind != ST_TY_ENUM)
+        return;
+    if (ST_dot_field(e)) {
+        ST_ctor_normalize(se, e, 0, expect);
+        return;
+    }
+    if (e->kind == ST_EX_BINARY &&
+        (ST_op_is(e->bin.op, "|", "&") || ST_op_is(e->bin.op, "^", NULL))) {
+        ST_enum_expect_walk(se, e->bin.l, expect);
+        ST_enum_expect_walk(se, e->bin.r, expect);
+        return;
+    }
+    if (e->kind == ST_EX_UNARY && ST_string_eq_cstr(e->unary.op, "~"))
+        ST_enum_expect_walk(se, e->unary.operand, expect);
+}
+
 static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
+    ST_enum_expect_walk(se, e, expect);
     b8 expects_union = expect && expect->kind == ST_TY_TAG_UNION;
     ST_ctor_normalize(se, e, expects_union, expect);
     if (e->kind != ST_EX_STRUCT_LIT)
@@ -6476,6 +6496,7 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
             ST_forrange(0, s->switch_.cases.count) {
                 ST_case_t *c = &s->switch_.cases.items[i];
                 for (u32 k = 0; k < c->values.count; k++) {
+                    ST_enum_expect_walk(se, c->values.items[k], ct);
                     ST_ty_t *vt = ST_type_expr(se, c->values.items[k]);
                     if (!ct || !vt)
                         continue;
@@ -6561,6 +6582,12 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                               ST_sv_args(s->for_array.target->name));
                 break;
             }
+            if ((targets_pack || targets_fields || s->for_array.is_comptime) &&
+                s->for_array.ref_iter) {
+                ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
+                              "'for &name : ...' is not supported for compile-time iteration");
+                break;
+            }
             if (s->for_array.is_comptime || targets_fields) {
                 if (targets_fields)
                     ST_check_comptime_for_fields(se, s);
@@ -6579,6 +6606,17 @@ static void ST_check_stmt(ST_sema_t *se, ST_stmt_t *s) {
                 else
                     ST_diag_error(&se->diag, s->for_array.target->line, s->for_array.target->col,
                                   "cannot iterate a value of type '%s'", ST_tstr(se, tt));
+                if (iter && s->for_array.ref_iter) {
+                    if (tt->kind == ST_TY_STRING) {
+                        ST_diag_error(&se->diag, s->for_array.target->line,
+                                      s->for_array.target->col,
+                                      "'for &name : ...' cannot iterate a string by reference");
+                        iter = NULL;
+                    } else {
+                        ST_complete_ty(se, iter);
+                        iter = ST_ty_ptr(&se->tys, iter);
+                    }
+                }
                 if (iter && s->for_array.deref_iter) {
                     if (iter->kind != ST_TY_PTR) {
                         ST_diag_error(&se->diag, s->for_array.target->line,

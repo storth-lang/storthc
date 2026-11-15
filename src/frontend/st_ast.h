@@ -292,6 +292,7 @@ struct ST_stmt_t {
             ST_expr_t *target;
             b8 is_comptime; // '#for ch[, spec]: string_expr'
             b8 deref_iter;
+            b8 ref_iter;
             ST_stmts_t body;
         } for_array;
         struct {

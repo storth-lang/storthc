@@ -2786,6 +2786,12 @@ static void ST_ct_compile_stmt(ST_ct_compiler_t *cc, ST_stmt_t *s) {
                             "yet");
                 return;
             }
+            if (s->for_array.ref_iter) {
+                ST_ct_cfail(cc, s->line, s->col,
+                            "comptime: 'for &name : ...' isn't supported in a #comptime scope "
+                            "yet");
+                return;
+            }
             // Desugars to:
             //   __arr := target; __idx := 0;
             //   while __idx < __arr.len {

@@ -1379,8 +1379,12 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
     b8 is_comptime = ST_tok_is_symbol(t, "#for");
     p->pos++;
     b8 deref_iter = 0;
+    b8 ref_iter = 0;
     if (ST_at_symbol(p, "*")) {
         deref_iter = 1;
+        p->pos++;
+    } else if (ST_at_symbol(p, "&")) {
+        ref_iter = 1;
         p->pos++;
     }
     ST_string_t iter = ST_expect_ident(p, "an iterator name after 'for'");
@@ -1390,9 +1394,16 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
     ST_string_t spec_iter = {0};
     if (ST_at_symbol(p, ",")) {
         p->pos++;
+        if (ST_at_symbol(p, "&")) {
+            ref_iter = 1;
+            p->pos++;
+        }
         spec_iter = ST_expect_ident(p, "a second iterator name after ','");
         if (!spec_iter.len)
             return NULL;
+        ST_string_t tmp = iter;
+        iter = spec_iter;
+        spec_iter = tmp;
     }
 
     if (!ST_expect_sym(p, ":"))
@@ -1415,6 +1426,11 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
         if (deref_iter) {
             ST_perr_here(p, "'*' before the iterator name only makes sense when iterating a "
                             "slice/array of pointers, not a range");
+            return NULL;
+        }
+        if (ref_iter) {
+            ST_perr_here(p, "'&' before the iterator name only makes sense when iterating a "
+                            "slice/array, not a range");
             return NULL;
         }
         b8 inclusive = ST_at_symbol(p, "..=");
@@ -1444,6 +1460,7 @@ static ST_stmt_t *ST_parse_for(ST_parser_t *p) {
     s->for_array.target = first;
     s->for_array.is_comptime = is_comptime;
     s->for_array.deref_iter = deref_iter;
+    s->for_array.ref_iter = ref_iter;
     if (!ST_expect_sym(p, "{"))
         return NULL;
     if (!ST_parse_body(p, &s->for_array.body))

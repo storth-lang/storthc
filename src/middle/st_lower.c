@@ -3507,7 +3507,12 @@ static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_ir_inst_t *elem_ptr =
                 ST_ir_addr(c->cur, eptr_ty, data_ptr, idx, scale, 0, s->line, s->col);
 
-            if (s->for_array.deref_iter) {
+            if (s->for_array.ref_iter) {
+                ST_ir_inst_t *rslot = ST_ir_alloca(c->fn, &c->sema->tys, eptr_ty,
+                                                   s->for_array.iter, s->line, s->col);
+                ST_ir_store(c->cur, eptr_ty, rslot, elem_ptr, s->line, s->col);
+                ST_lower_bind_addr(c, s->for_array.iter, rslot, eptr_ty);
+            } else if (s->for_array.deref_iter) {
                 if (elem_ty->kind != ST_TY_PTR) {
                     ST_diag_error(&c->diag, s->line, s->col,
                                   "internal: 'for *name : ...' needs a slice/array of "

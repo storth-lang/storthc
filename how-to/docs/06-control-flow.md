@@ -54,6 +54,23 @@ for i: 0..path.len {
 }
 ```
 
+Over a dynamic array or slice with a second name for the index (an `i64`, the index comes first):
+
+```rs
+for i, x: xs {
+    printf("%zu => %d\n", i, x);
+}
+```
+
+By reference with `&`, so the loop name is a pointer to the element and writes go back into the array:
+
+```rs
+for &x: xs { *x = *x + 1; }
+for i, &x: xs { *x = *x * 2 + cast(i32)i; }
+```
+
+For arrays of structs the pointer lets you write `p.a = 1;` directly. `&` works on arrays, slices and dynamic arrays, not on strings, ranges or compile-time iteration.
+
 Over a `$T...` variadic pack:
 
 ```rs

@@ -177,7 +177,7 @@ ST_ty_t *ST_ty_for_decls(ST_ty_ctx_t *ctx, ST_decl_t *d) {
         // Backing integer type: `enum Foo : u8 { ... }`, default u32.
         ST_ty_t *backing = ctx->prim[ST_tu32];
         if (d->enum_.ty && d->enum_.ty->kind == ST_TE_NAME) {
-            ST_forrange(0, ST_ti64 + 1) {
+            ST_forrange(0, ST_tu64 + 1) {
                 ST_ty_t *cand = ctx->prim[i];
                 if (cand && cand->kind == ST_TY_INT &&
                     ST_string_eq_cstr(d->enum_.ty->name, ST_type_names[i])) {

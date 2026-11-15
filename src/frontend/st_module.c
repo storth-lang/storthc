@@ -44,8 +44,25 @@ static ST_string_t ST_mod_join(ST_arena_t *a, const char *dir, ST_string_t rel) 
     return (ST_string_t){.data = buf, .len = total};
 }
 
+static ST_string_t ST_mod_module_file(ST_arena_t *a, const char *dir, ST_string_t name) {
+    u32 dlen = (u32)strlen(dir);
+    u32 total = dlen + 1 + name.len + 10;
+    u8 *buf = ST_arena_push(a, total + 1);
+    u32 n = 0;
+    memcpy(buf, dir, dlen);
+    n += dlen;
+    buf[n++] = '/';
+    memcpy(buf + n, name.data, name.len);
+    n += name.len;
+    memcpy(buf + n, "/module.st", 10);
+    n += 10;
+    buf[n] = 0;
+    return (ST_string_t){.data = buf, .len = n};
+}
+
 static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_t name,
-                         ST_strings_t *import_dirs, ST_string_t *out_path) {
+                         ST_strings_t *import_dirs, ST_string_t sibling_root,
+                         ST_string_t *out_path) {
     ST_string_t rel = {0};
     {
         u32 total = 8 + name.len + 10; // "modules/" + name + "/module.st"
@@ -72,39 +89,31 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
         }
     }
 
+    if (sibling_root.len) {
+        ST_string_t sib = ST_mod_module_file(arena, ST_mod_cstr(arena, sibling_root), name);
+        if (ST_access_file(ST_mod_cstr(arena, sib)) == 0) {
+            *out_path = ST_abs_path(arena, ST_mod_cstr(arena, sib));
+            return 1;
+        }
+    }
+
     ST_string_t candidate = ST_mod_join(arena, ST_mod_cstr(arena, importer_dir), rel);
     if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
         *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
         return 1;
     }
 
-    #ifndef _WIN32 // Enviroment varable are stinky unix problem.
+    #ifndef _WIN32
     const char *env = getenv("STORTHC_MODULE_PATH");
     if (env && *env) {
-        candidate = ST_mod_join(arena, env, rel);
+        candidate = ST_mod_module_file(arena, env, name);
         if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
             *out_path = ST_abs_path(arena, ST_mod_cstr(arena, candidate));
             return 1;
         }
     }
 
-    candidate = ST_mod_join(arena, "/usr/local/storthc/modules", (ST_string_t){0});
-    {
-        const char *base = "/usr/local/storthc/modules";
-        u32 blen = (u32)strlen(base);
-        u32 total = blen + 1 + name.len + 10;
-        u8 *buf = ST_arena_push(arena, total + 1);
-        u32 n = 0;
-        memcpy(buf + n, base, blen);
-        n += blen;
-        buf[n++] = '/';
-        memcpy(buf + n, name.data, name.len);
-        n += name.len;
-        memcpy(buf + n, "/module.st", 10);
-        n += 10;
-        buf[n] = 0;
-        candidate = (ST_string_t){.data = buf, .len = n};
-    }
+    candidate = ST_mod_module_file(arena, "/usr/local/storthc/modules", name);
     #endif
 
     if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
@@ -648,6 +657,8 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
     ST_ht_t auto_exposed;
     ST_ht_init(ctx->arena, &auto_exposed, 16);
 
+    ST_string_t sibling_root = ST_mod_dirname(ST_mod_dirname(path));
+
     b8 ok = 1;
     ST_forrange(0, prog.decls.count) {
         ST_decl_t *d = prog.decls.items[i];
@@ -656,7 +667,7 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
         if (d->kind == ST_DE_IMPORT) {
             ST_string_t dep_path;
             if (!ST_mod_resolve(ctx->arena, ctx->project_root, d->import_.module_name,
-                                ctx->import_dirs, &dep_path)) {
+                                ctx->import_dirs, sibling_root, &dep_path)) {
                 ST_diag_error(ctx->diag, d->line, d->col,
                               "cannot find module '" ST_sv_fmt "' (looked in "
                               "-import_dir dirs, "
@@ -747,7 +758,7 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
             continue;
         ST_string_t dep_path;
         if (!ST_mod_resolve(arena, ctx.project_root, d->import_.module_name, ctx.import_dirs,
-                            &dep_path)) {
+                            (ST_string_t){0}, &dep_path)) {
             ST_diag_error(diag, d->line, d->col,
                           "cannot find module '" ST_sv_fmt "' (looked in "
                           "-import_dir dirs, "
