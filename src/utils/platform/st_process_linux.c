@@ -16,6 +16,8 @@ b8 ST_run_process(ST_proc_t *proc) {
     if (id == 0) {
         if (proc->opt.out)
             dup2(fileno(proc->opt.out), STDOUT_FILENO);
+        if (proc->opt.merge_err)
+            dup2(STDOUT_FILENO, STDERR_FILENO);
         
         char *const *original_args = (char *const *)proc->opt.args;
         int arg_count = 0;

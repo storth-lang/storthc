@@ -12,6 +12,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
 #include "backend/st_address_sanitizer.h"
@@ -153,6 +157,17 @@ static char *st_temp_path(ST_arena_t *arena, const char *name) {
     memcpy(out, dir, n);
     memcpy(out + n, name, name_len + 1);
     return out;
+}
+
+static char *st_temp_unique(ST_arena_t *arena, const char *stem, const char *ext) {
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    char name[128];
+    snprintf(name, sizeof(name), "%s_%lu%s", stem, pid, ext);
+    return st_temp_path(arena, name);
 }
 
 static char *st_default_exe_name(ST_arena_t *arena, const char *path) {
@@ -345,6 +360,8 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     ST_procs_t procs;
     ST_procs_init(arena, &procs);
     b8 ok = 0;
+    const char *tmp_asm = NULL;
+    const char *tmp_obj = NULL;
     ST_TIME_START();
     double t_frontend = 0, t_middle = 0, t_backend_write = 0, t_assemble = 0, t_link = 0;
     b8 summary_printed = 0;
@@ -488,7 +505,9 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     }
 
     const char *asm_path = stage == ST_STAGE_ASM ? (output ? output : "test.asm")
-                                                  : st_temp_path(arena, "storthc_build.asm");
+                                                  : st_temp_unique(arena, "storthc_build", ".asm");
+    if (stage != ST_STAGE_ASM)
+        tmp_asm = asm_path;
     ST_dbg_info_t dbg = {0};
     FILE *f = fopen(asm_path, "wb");
     if (!f) {
@@ -517,7 +536,9 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
     }
 
     const char *obj_path = stage == ST_STAGE_OBJ ? (output ? output : "test.o")
-                                                  : st_temp_path(arena, "storthc_build.o");
+                                                  : st_temp_unique(arena, "storthc_build", ".o");
+    if (stage != ST_STAGE_OBJ)
+        tmp_obj = obj_path;
 
     st_append_assemble(&procs, asm_path, obj_path, use_fasm);
     if (!st_run_step(&procs, "assembling"))
@@ -558,14 +579,26 @@ static b8 st_compile(ST_arena_t *arena, const char *path, st_stage_t stage, cons
 done:
     if (!quiet && !summary_printed && ok)
         st_print_summary(t_frontend, t_middle, t_backend_write, t_assemble, t_link);
+    if (ok) {
+        if (tmp_asm)
+            remove(tmp_asm);
+        if (tmp_obj)
+            remove(tmp_obj);
+    }
     return ok;
 }
 
 static void st_clean_comptime_cache(ST_arena_t *arena) {
     ST_glob_t g = {0};
     if (ST_glob(st_temp_path(arena, ST_CT_CACHE_GLOB), &g)) {
-        for (u32 i = 0; i < g.gl_pathc; i++)
+        for (u32 i = 0; i < g.gl_pathc; i++) {
+#ifndef _WIN32
+            struct stat st;
+            if (stat(g.gl_pathv[i], &st) == 0 && difftime(time(NULL), st.st_mtime) < 120.0)
+                continue;
+#endif
             remove(g.gl_pathv[i]);
+        }
         ST_glob_free(&g);
     }
 }

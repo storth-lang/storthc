@@ -1,7 +1,7 @@
 # TODO
 
 - [x] Use absolute path instead of relative path.
-- [ ] Make tasks parallel so I should be able to run them in parallel with -j$(nproc).
+- [x] Make tasks parallel so I should be able to run them in parallel with -j$(nproc).
 - [ ] Save all the errors to a file if needed.
 - [ ] When set is null that a file does not exist. It means just run the command.
 - [x] Add support to change directory with -dir flag.

@@ -10,6 +10,7 @@ typedef struct {
     const char *args[MAX_ARGS + 1];
     FILE *out;
     b8 async;
+    b8 merge_err;
 } ST_proc_opt_t;
 
 typedef struct {

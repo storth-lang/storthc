@@ -5,8 +5,7 @@ cd "$(dirname "$0")" || exit 1
 TESTER=../build/st_tester
 CMD='../build/storthc run $file --quiet --import_dir .. -o build/$file'
 
-mkdir -p build
-touch build/.gitignore
+mkdir -p build/
 echo "*" > build/.gitignore
 
 if [ ! -x "$TESTER" ] || [ ! -x ../build/storthc ]; then
@@ -22,10 +21,6 @@ else
     files="$*"
 fi
 
-for f in $files; do
-    [ -f "$f" ] || continue
-    "$TESTER" -set -f "$f" -cmd "$CMD" || exit 1
-done
-
+"$TESTER" -set -cmd "$CMD" -f $files || exit 1
 "$TESTER" -record || exit 1
 "$TESTER"

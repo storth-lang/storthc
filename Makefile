@@ -21,8 +21,9 @@ DEP := $(OBJ:.o=.d)
 TESTROOT := tests
 TESTSRC := $(TESTROOT)/st_tester.c
 TESTOBJ := $(patsubst $(TESTROOT)/%.c,$(OBJROOT)/%.o,$(TESTSRC))
+TESTUTIL := $(addprefix $(OBJROOT)/utils/,st_arena.o st_ht.o st_process.o st_string.o platform/st_process_linux.o)
 TESTTARGET := $(BINDIR)/st_tester
-TESTCFLAGS := -std=c99 -Wall -Wextra
+TESTCFLAGS := -std=c11 -Wall -Wextra -Wno-missing-field-initializers -I$(SRCROOT) -pthread
 
 V ?= 0
 ifeq ($(V),0)
@@ -48,9 +49,9 @@ all: $(TARGET)
 test: $(TESTTARGET)
 	$< -dir ./tests
 
-$(TESTTARGET): $(TESTOBJ) | $(BINDIR)
+$(TESTTARGET): $(TESTOBJ) $(TESTUTIL) | $(BINDIR)
 	$(QUIET)printf "$(GREEN)LD$(RESET)  %s\n" "$@"
-	$(QUIET)$(CC) $(TESTCFLAGS) -o $@ $(TESTOBJ) $(LDLIBS) \
+	$(QUIET)$(CC) $(TESTCFLAGS) -o $@ $(TESTOBJ) $(TESTUTIL) $(LDLIBS) \
 		&& printf "$(GREEN)build ok$(RESET)  %s\n" "$@" \
 		|| { printf "$(RED)build failed$(RESET)  %s\n" "$@"; exit 1; }
 
