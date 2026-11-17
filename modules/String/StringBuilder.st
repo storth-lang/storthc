@@ -11,8 +11,7 @@ pub impl StringBuilder {
                 case 0 { self.capacity = size; }
                 default { self.capacity *= 2; }
             }
-            self.data = mem.realloc(self.data, self.capacity 
-                                    * sizeof(StringBuilder)).unwrap();
+            self.data = mem.reallocate(self.data, self.capacity).unwrap();
         }
     }
 
@@ -20,14 +19,16 @@ pub impl StringBuilder {
 
     fn add_to_builder(self: *Self, str: $T(string, []char)) {
         self.reserve();
-        mem.copy(self.data + self.count, str.ptr, str.len);
-        self.count += str.len;
+        n := cast(u32) str.len;
+        mem.copy(self.data + self.count, str.ptr, n);
+        self.count += n;
     }
 
     fn add_to_builder(self: *Self, str: *char) {
         self.reserve();
-        mem.copy(self.data + self.count, str, strlen(str));
-        self.count += strlen(str);
+        n := cast(u32) strlen(str);
+        mem.copy(self.data + self.count, str, n);
+        self.count += n;
     }
 
     fn add_to_builder(self: *Self, str: $U(*char, []char, string),

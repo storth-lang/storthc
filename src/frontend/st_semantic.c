@@ -759,8 +759,20 @@ static ST_ty_t *ST_instantiate_trait_witness(ST_sema_t *se, ST_decl_t *trait, ST
         fnte->fn_is_variadic = m->sig.is_variadic;
         fnte->fn_is_noreturn = m->sig.is_noreturn;
         if (!m->sig.generics.count) {
-            for (u32 p = 0; p < m->sig.params.count; p++)
-                ST_da_append_arena(se->arena, &fnte->fn_params, m->sig.params.items[p].te);
+            for (u32 p = 0; p < m->sig.params.count; p++) {
+                ST_param_t *mp = &m->sig.params.items[p];
+                ST_tyexpr_t *pte = mp->te;
+                if (!pte && mp->def) {
+                    ST_ty_t *dt = ST_ty_defaulted(se, ST_type_expr(se, mp->def));
+                    if (dt) {
+                        pte = ST_tyexpr_new(se->arena, ST_TE_NAME, mp->line, mp->col);
+                        pte->name = mp->name;
+                        pte->resolved = dt;
+                        pte->pinned = 1;
+                    }
+                }
+                ST_da_append_arena(se->arena, &fnte->fn_params, pte);
+            }
             for (u32 r = 0; r < m->sig.rets.count; r++)
                 ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[r]);
         }

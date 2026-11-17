@@ -106,109 +106,97 @@ fn open_file(path: string, mode: openKind) -> (*void, bool) {
         return null, false;
 }
 
+fn read_all(handle: *void) -> (StringBuilder, bool) {
+    buffer : StringBuilder;
+    fseek(handle, 0, SEEK_END);
+    size := ftell(handle);
+    fseek(handle, 0, SEEK_SET);
+    if size < 0 {
+        log_error("ftell: could not get the size of the file\n\r");
+        return buffer, false;
+    }
+    n := cast(u64) size;
+    cap := cast(u32) size;
+    buffer.reserve(cap);
+    got := fread(buffer.data, 1, n, handle);
+    if got != n {
+        log_error("fread: Could not read file into String Builder\n\r");
+        return buffer, false;
+    }
+    buffer.count = cap;
+    return buffer, true;
+}
+
+fn read_path(path: string) -> (StringBuilder, bool) {
+    empty : StringBuilder;
+    if path.ptr == null || path.len == 0 {
+        log_error("path can not be empty or null\n\r");
+        return empty, false;
+    }
+    handle, ok := open_file(path, .Read);
+    if !ok {
+        log_error("Could not open %s for reading\n\r", path.ptr);
+        return empty, false;
+    }
+    defer fclose(handle);
+    content, good := read_all(handle);
+    return content, good;
+}
+
 libc_instance := Libc{};
 
-// Public file_system interface
 pub fs := File(Libc) {
     self = &libc_instance;
 
-    // Creates a file if it does not exist. However if it does it just repoens.
     fn open(self: *Self, path: string, op_kind: openKind) -> (*void, bool) {
         handle, ok := open_file(path, op_kind);
         return handle, ok;
     }
 
-    // Close the handle that we got from the 'open.'
-    fn close(_libc: *Self, handle : *void) {
+    fn close(_libc: *Self, handle : *void) -> void {
         if handle != null {
             fclose(handle);
         }
     }
 
-    // Read will the entire file into an array of chars.
     fn read(self: *Self, path: string) -> (StringBuilder, bool) {
-        if path == null || path.count <= 0 {
-            log_error("path can not be empty or null\n\r");
-            goto error;
-        }
-
-        handle, ok := self.open(path, .Read);
-        if  !ok {
-            log_error("Could not open %s for reading\n\r", path);
-            goto error;
-        }
-        defer self.close(handle);
-
-        fseek(handle, 0, SEEK_END);
-        size := ftell(handle);
-        fseek(handle, 0, SEEK_SET);
-
-        if size < 0 {
-            log_error("ftell: File %s has no content(it is just empty)\n\r", path);
-            goto error;
-        }
-
-
-        buffer.reserve(cast(u32)size);
-
-        if fread(buffer.data, 1, cast(u64) buffer.count, handle) < 0 {
-            log_error("fread: Could not read file into String Builder");
-            goto error;
-        }
-
-        return buffer, true;
-
-        label error;
-             return buffer, false;
+        content, ok := read_path(path);
+        return content, ok;
     }
 
     fn read(self: *Self, path: *char) -> (StringBuilder, bool) {
-        buffer : StringBuilder;
-        handle, ok := self.open(path, .Read);
-        if !ok {
-            log_error("Could not open %s for reading\n\r", path);
-            goto error;
-        }
-
-        fseek(handle, 0, SEEK_END);
-        size := ftell(handle);
-        fseek(handle, 0, SEEK_SET);
-        if size < 0 {
-            log_error("ftell: %p is an empty file\n\r", handle);
-            goto error;
-        }
-
-        buffer.reserve(cast(u32) size);
-
-        if fread(buffer.items, 1, cast(u64) buffer.count, handle) < 0 {
-            log_error("fread: Could not read file into String Builder");
-            goto error;
-        }
-
-        return buffer, true;
-
-        label error;
-             return buffer, false;
-
+        as_string := string { ptr = path, len = strlen(path) };
+        content, ok := read_path(as_string);
+        return content, ok;
     }
 
-    fn write(self: *Self, handle : *void, content: string, append := false) -> bool {
-        handle, ok := self.open(path, .Write);
+    fn read(self: *Self, handle: *void) -> (StringBuilder, bool) {
+        content, ok := read_all(handle);
+        return content, ok;
+    }
+
+    fn write(self: *Self, path: string, content: string, append := false) -> bool {
+        mode := openKind.Write;
+        if append then mode = openKind.Append;
+        handle, ok := open_file(path, mode);
         if !ok {
-            log_error("Could not open %s for reading\n\r", path);
+            log_error("Could not open %s for writing\n\r", path.ptr);
             return false;
         }
         defer fclose(handle);
-
-        if fwrite(content, 1, cast(u64) content.len, handle) < 0 then return false;
-        return true;
+        n := cast(u64) content.len;
+        return fwrite(content.ptr, 1, n, handle) == n;
     }
 
-    fn write(f: *Self, handle: *void, content: string,
-             append : bool = false, log_error : bool = false) -> bool {
+    fn write(self: *Self, handle: *void, content: string, append := false) -> bool {
         if handle == null then return false;
-        if fwrite(&content[0], 1, cast(u64)content.len, handle) < 0 then return false;
-        return true;
+        n := cast(u64) content.len;
+        return fwrite(content.ptr, 1, n, handle) == n;
     }
 
+    fn write(self: *Self, handle: *void, content: []char, append := false) -> bool {
+        if handle == null then return false;
+        n := cast(u64) content.len;
+        return fwrite(content.ptr, 1, n, handle) == n;
+    }
 };
