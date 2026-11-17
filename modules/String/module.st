@@ -1,3 +1,6 @@
+#load "StringBuilder.st";
+#import "Libc";
+
 pub fn toString(arr: [..]char) -> string {
     return string {
         ptr = &arr.items[0],
@@ -7,7 +10,7 @@ pub fn toString(arr: [..]char) -> string {
 
 pub fn toString(arr: []char) -> string {
     return string {
-        ptr = &arr[0],
+        ptr = arr.ptr,
         len = arr.len,
     };
 }
@@ -91,4 +94,3 @@ pub fn get_basename(str: string) -> string {
 }
 
 
-#import "libc";
