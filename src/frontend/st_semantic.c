@@ -220,13 +220,18 @@ static ST_ty_t *ST_ty_defaulted(ST_sema_t *se, ST_ty_t *t) {
     return t;
 }
 
+static b8 ST_ty_is_any(ST_sema_t *se, ST_ty_t *t) {
+    return t && t == se->tys.prim[ST_tany];
+}
+
+static void ST_box_any(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to);
+
 static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
-    ST_unused(se);
     if (!from || !to)
         return 1;
     if (from == to)
         return 1;
-    if (to->kind == ST_TY_ANY)
+    if (ST_ty_is_any(se, to))
         return 1;
     if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_INT)
         return 1;
@@ -3987,6 +3992,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                               ST_tstr(se, at));
             else if (pt && at && (pt->kind == ST_TY_INT || pt->kind == ST_TY_FLOAT))
                 ST_retype_untyped(arg->value, pt);
+            else
+                ST_box_any(se, &arg->value, pt);
             if (idx < sig->params.count)
                 ST_check_const_param(se, &sig->params.items[idx], arg);
         }
@@ -4033,6 +4040,8 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         ST_ty_t *pt = fnty->params.items[i];
         ST_arg_extern_decay(se, sym, pt, arg);
         ST_ty_t *at = arg->value->ty;
+        if (pt && at && ST_ty_coerces(se, at, pt))
+            ST_box_any(se, &arg->value, pt);
         if (pt && at && !ST_ty_coerces(se, at, pt)) {
             ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                           "'" ST_sv_fmt "' argument %u expects '%s', got '%s'",
@@ -4287,6 +4296,23 @@ static ST_ty_t *ST_type_index(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+static void ST_box_any(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
+    if (!slot || !*slot || !ST_ty_is_any(se, to))
+        return;
+    ST_expr_t *v = *slot;
+    if (!v->ty || ST_ty_is_any(se, v->ty) || v->ty->kind == ST_TY_VOID)
+        return;
+    ST_expr_t *c = ST_expr_new(se->arena, ST_EX_CAST, v->line, v->col);
+    ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, v->line, v->col);
+    te->name = ST_cstr_to_str("any");
+    te->resolved = to;
+    te->pinned = 1;
+    c->cast.operand = v;
+    c->cast.to = te;
+    c->ty = to;
+    *slot = c;
+}
+
 static ST_ty_t *ST_type_cast(ST_sema_t *se, ST_expr_t *e) {
     ST_ty_t *from = ST_type_expr(se, e->cast.operand);
     ST_ty_t *to = ST_resolve_tyexpr(se, e->cast.to);
@@ -4309,7 +4335,7 @@ static ST_ty_t *ST_type_cast(ST_sema_t *se, ST_expr_t *e) {
     if ((from->kind == ST_TY_FN || from->kind == ST_TY_PTR) &&
         (to->kind == ST_TY_FN || to->kind == ST_TY_PTR))
         return to;
-    if (from->kind == ST_TY_ANY)
+    if (ST_ty_is_any(se, from))
         return to;
 
     ST_diag_error(&se->diag, e->line, e->col, "cannot cast '%s' to '%s'", ST_tstr(se, from),
@@ -4608,6 +4634,8 @@ static ST_ty_t *ST_type_union_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *ut) {
             vt = ST_type_struct_lit(se, pfi->value, pt);
         else
             vt = ST_type_expr(se, pfi->value);
+        if (pt && vt && ST_ty_coerces(se, vt, pt))
+            ST_box_any(se, &pfi->value, pt);
         if (pt && vt && !ST_ty_coerces(se, vt, pt))
             ST_diag_error(&se->diag, pfi->value->line, pfi->value->col,
                           "'" ST_sv_fmt "' expects a payload of '%s', got '%s'",
@@ -4693,6 +4721,8 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
                 ety = vt ? ST_ty_defaulted(se, vt) : NULL;
                 continue;
             }
+            if (vt && ST_ty_coerces(se, vt, ety))
+                ST_box_any(se, &fi->value, ety);
             if (vt && !ST_ty_coerces(se, vt, ety)) {
                 ST_diag_error(&se->diag, fi->value->line, fi->value->col,
                               "'[...]' element expects '%s', got '%s'", ST_tstr(se, ety),
@@ -4834,6 +4864,8 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
             }
             if (i >= t->count || !vt)
                 continue;
+            if (ST_ty_coerces(se, vt, ety))
+                ST_box_any(se, &fi->value, ety);
             if (!ST_ty_coerces(se, vt, ety)) {
                 ST_diag_error(&se->diag, fi->value->line, fi->value->col,
                               "array element expects '%s', got '%s'.", ST_tstr(se, ety),
@@ -4912,6 +4944,8 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         if (!t)
             continue;
 
+        if (ft && vt && ST_ty_coerces(se, vt, ft))
+            ST_box_any(se, &fi->value, ft);
         if (ft && vt && !ST_ty_coerces(se, vt, ft)) {
             ST_diag_error(&se->diag, fi->value->line, fi->value->col,
                           "field '" ST_sv_fmt "' expects '%s', got '%s'", ST_sv_args(fname),
@@ -5361,6 +5395,8 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
             it = ST_type_expr(se, s->decl.init);
     }
 
+    if (dt && it && s->decl.init && ST_ty_coerces(se, it, dt))
+        ST_box_any(se, &s->decl.init, dt);
     if (dt && it && !ST_ty_coerces(se, it, dt)) {
         ST_diag_error(&se->diag, s->line, s->col,
                       "cannot initialize '" ST_sv_fmt "' of type '%s' "
@@ -5515,6 +5551,8 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
         if (!ST_ty_coerces(se, rt, lt))
             ST_diag_error(&se->diag, s->line, s->col, "cannot assign '%s' to '%s'", ST_tstr(se, rt),
                           ST_tstr(se, lt));
+        else
+            ST_box_any(se, &s->assign.rhs, lt);
         return;
     }
 
@@ -5624,6 +5662,8 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
             t = ST_type_expr(se, rv);
         if (i >= want || !se->cur_rets)
             continue;
+        if (t && rt && ST_ty_coerces(se, t, rt))
+            ST_box_any(se, &s->ret.values.items[i], rt);
         if (t && rt && !ST_ty_coerces(se, t, rt))
             ST_diag_error(&se->diag, s->ret.values.items[i]->line, s->ret.values.items[i]->col,
                           "return value %u expects '%s', got '%s'", i + 1, ST_tstr(se, rt),
@@ -7001,7 +7041,12 @@ static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig) {
             pt = ST_ty_defaulted(se, ST_type_expr(se, p->def));
         else if (p->def) {
             ST_ty_t *dt = ST_type_expr(se, p->def);
-            if (pt && dt && !ST_ty_coerces(se, dt, pt))
+            if (ST_ty_is_any(se, pt))
+                ST_diag_error(&se->diag, p->line, p->col,
+                              "a default value for the 'any' parameter '" ST_sv_fmt
+                              "' isn't supported yet",
+                              ST_sv_args(p->name));
+            else if (pt && dt && !ST_ty_coerces(se, dt, pt))
                 ST_diag_error(&se->diag, p->line, p->col,
                               "default for '" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(p->name), ST_tstr(se, pt), ST_tstr(se, dt));
@@ -7161,7 +7206,11 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                     ST_diag_error(&se->diag, d->line, d->col,
                                   "cannot declare '" ST_sv_fmt "' of type 'void'",
                                   ST_sv_args(d->name));
-                if (sym->t && d->global_.init) {
+                if (sym->t && d->global_.init && ST_ty_is_any(se, sym->t)) {
+                    ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
+                                  "a global of type 'any' can't have an initializer yet, "
+                                  "declare it and assign inside a function");
+                } else if (sym->t && d->global_.init) {
                     if (dt && it && !ST_ty_coerces(se, it, dt))
                         ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
                                       "global '" ST_sv_fmt "' expects '%s', got '%s'",
@@ -7753,6 +7802,34 @@ static void ST_sema_synth_type_info(ST_sema_t *se) {
     ST_complete_ty(se, se->type_info_ty);
 }
 
+static void ST_sema_synth_any(ST_sema_t *se) {
+    ST_decl_t *d = ST_decl_new(se->arena, ST_DE_STRUCT, 0, 0);
+    d->name = ST_cstr_to_str("any");
+    d->is_pub = 1;
+
+    ST_field_spec_t info = {0};
+    info.name = ST_cstr_to_str("info");
+    ST_tyexpr_t *ptr = ST_tyexpr_new(se->arena, ST_TE_PTR, 0, 0);
+    ST_tyexpr_t *inner = ST_tyexpr_new(se->arena, ST_TE_NAME, 0, 0);
+    inner->name = ST_cstr_to_str("Type_Info");
+    ptr->inner = inner;
+    info.te = ptr;
+    ST_da_append_arena(se->arena, &d->struct_.fields, info);
+
+    ST_field_spec_t data = {0};
+    data.name = ST_cstr_to_str("data");
+    ST_tyexpr_t *vptr = ST_tyexpr_new(se->arena, ST_TE_PTR, 0, 0);
+    ST_tyexpr_t *vinner = ST_tyexpr_new(se->arena, ST_TE_NAME, 0, 0);
+    vinner->name = ST_cstr_to_str("void");
+    vptr->inner = vinner;
+    data.te = vptr;
+    ST_da_append_arena(se->arena, &d->struct_.fields, data);
+
+    ST_ty_t *t = ST_ty_for_decls(&se->tys, d);
+    ST_complete_ty(se, t);
+    se->tys.prim[ST_tany] = t;
+}
+
 static void ST_sema_check_main(ST_sema_t *se, ST_program_t *prog) {
     ST_decl_t *main_decl = NULL;
     ST_forrange(0, prog->decls.count) {
@@ -7830,6 +7907,7 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
         ST_sym_insert(se, &se->globals, ST_sym_new(se, ST_SYM_FN, name, NULL, NULL, 0, 0));
     }
     ST_sema_synth_type_info(se);
+    ST_sema_synth_any(se);
     ST_sema_collect(se, prog);
     ST_sema_types(se, prog);
     ST_sema_check(se, prog);

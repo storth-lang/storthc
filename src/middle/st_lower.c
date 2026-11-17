@@ -66,6 +66,8 @@ typedef struct {
 } ST_lower_bind_t;
 
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_box_any(ST_lower_ctx_t *c, ST_expr_t *e);
+static ST_ir_inst_t *ST_lower_unbox_any(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e);
 static void ST_lower_stmt(ST_lower_ctx_t *c, ST_stmt_t *s);
 static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s);
@@ -1272,6 +1274,17 @@ static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e) {
 
 static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
     switch (e->kind) {
+        case ST_EX_CAST: {
+            ST_ty_t *anyty = c->sema->tys.prim[ST_tany];
+            ST_ty_t *ot = e->cast.operand->ty;
+            if (e->ty == anyty && ot != anyty)
+                return ST_lower_box_any(c, e);
+            if (ot == anyty && e->ty != anyty && !ST_lower_ty_is_scalar(e->ty))
+                return ST_lower_unbox_any(c, e);
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: cannot take the address of this expression form yet");
+            return NULL;
+        }
         case ST_EX_CODE_LOC: {
             ST_ir_inst_t *slot =
                 ST_ir_alloca(c->fn, &c->sema->tys, e->ty, (ST_string_t){0}, e->line, e->col);
@@ -1925,6 +1938,65 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     return result;
 }
 
+static ST_ir_inst_t *ST_lower_box_any(ST_lower_ctx_t *c, ST_expr_t *e) {
+    ST_expr_t *v = e->cast.operand;
+    ST_ty_t *vt = v->ty;
+    if (vt && vt->kind == ST_TY_UNTYPED_INT)
+        vt = c->sema->tys.prim[ST_ti32];
+    if (vt && vt->kind == ST_TY_UNTYPED_FLOAT)
+        vt = c->sema->tys.prim[ST_tf32];
+    if (!vt || vt->kind == ST_TY_VOID) {
+        ST_diag_error(&c->diag, e->line, e->col, "cannot convert this value to 'any'");
+        return ST_ir_const_int(c->cur, e->ty, 0);
+    }
+
+    ST_ty_t *anyty = c->sema->tys.prim[ST_tany];
+    ST_ty_t *tity = c->sema->type_info_ty;
+    ST_ty_t *tinfo_ptr = ST_ty_ptr(&c->sema->tys, tity);
+    ST_ty_t *void_ptr = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tvoid]);
+
+    ST_forrange(0, tity->fields.count) {
+        ST_ty_field_t *f = &tity->fields.items[i];
+        u32 want = ST_string_eq_cstr(f->name, "kind")    ? 0
+                   : ST_string_eq_cstr(f->name, "name")  ? 8
+                   : ST_string_eq_cstr(f->name, "size")  ? 24
+                                                        : 28;
+        if (f->offset != want) {
+            ST_diag_error(&c->diag, e->line, e->col,
+                          "internal: Type_Info layout changed, update the static type records");
+            return ST_ir_const_int(c->cur, e->ty, 0);
+        }
+    }
+
+    ST_ir_inst_t *vslot = ST_ir_alloca(c->fn, &c->sema->tys, vt, (ST_string_t){0}, e->line, e->col);
+    ST_lower_value_into(c, vslot, 0, vt, v);
+
+    ST_ir_inst_t *aslot = ST_ir_alloca(c->fn, &c->sema->tys, anyty, (ST_string_t){0}, e->line, e->col);
+    ST_string_t name_sv = ST_cstr_to_str((char *)ST_ty_cstr(c->arena, vt));
+    u32 nidx = ST_ir_module_intern_str(c->module, name_sv);
+    u32 tidx = ST_ir_module_intern_tinfo(c->module, (u8)vt->kind, vt->size, vt->align, nidx);
+    ST_ir_inst_t *ti = ST_ir_const_tinfo(c->cur, tinfo_ptr, tidx);
+
+    ST_ir_inst_t *fp0 = ST_lower_field_ptr(c, aslot, 0, tinfo_ptr, e->line, e->col);
+    ST_ir_store(c->cur, tinfo_ptr, fp0, ti, e->line, e->col);
+    ST_ir_inst_t *fp1 = ST_lower_field_ptr(c, aslot, 8, void_ptr, e->line, e->col);
+    ST_ir_store(c->cur, void_ptr, fp1, vslot, e->line, e->col);
+    return aslot;
+}
+
+static ST_ir_inst_t *ST_lower_unbox_any(ST_lower_ctx_t *c, ST_expr_t *e) {
+    ST_ty_t *anyty = c->sema->tys.prim[ST_tany];
+    ST_ty_t *void_ptr = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tvoid]);
+    ST_ir_inst_t *a = ST_lower_struct_addr(c, e->cast.operand, anyty);
+    if (!a)
+        return ST_ir_const_int(c->cur, e->ty, 0);
+    ST_ir_inst_t *dpp = ST_lower_field_ptr(c, a, 8, void_ptr, e->line, e->col);
+    ST_ir_inst_t *dp = ST_ir_load(c->cur, void_ptr, dpp, e->line, e->col);
+    if (ST_lower_ty_is_scalar(e->ty))
+        return ST_ir_load(c->cur, e->ty, dp, e->line, e->col);
+    return dp;
+}
+
 static ST_ir_inst_t *ST_lower_expr(ST_lower_ctx_t *c, ST_expr_t *e) {
     if (c->lower_depth >= ST_MAX_LOWER_DEPTH) {
         ST_diag_error(&c->diag, e->line, e->col, "expression nested too deeply");
@@ -2155,8 +2227,15 @@ static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
                 return ST_lower_union_construct_addr(c, e);
             return ST_lower_call(c, e);
 
-        case ST_EX_CAST:
+        case ST_EX_CAST: {
+            ST_ty_t *anyty = c->sema->tys.prim[ST_tany];
+            ST_ty_t *ot = e->cast.operand->ty;
+            if (e->ty == anyty && ot != anyty)
+                return ST_lower_box_any(c, e);
+            if (ot == anyty && e->ty != anyty)
+                return ST_lower_unbox_any(c, e);
             return ST_ir_cast(c->cur, e->ty, ST_lower_expr(c, e->cast.operand), e->line, e->col);
+        }
 
         case ST_EX_CSTR: {
             ST_ir_inst_t *a = ST_lower_string_addr(c, e->tyop.operand);

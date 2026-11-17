@@ -234,6 +234,16 @@ static void ST_generate_strs(FILE *out, ST_ir_module_t *m) {
         fprintf(out, "    dq str_%u_data\n", (u32)i);
         fprintf(out, "    dq %u\n", (u32)s.len);
     }
+    ST_forrange(0, m->tinfos.count) {
+        ST_ir_tinfo_t *t = &m->tinfos.items[i];
+        fprintf(out, "align 8\n");
+        fprintf(out, "tinfo_%u:\n", (u32)i);
+        fprintf(out, "    db %u, 0, 0, 0, 0, 0, 0, 0\n", (u32)t->kind);
+        fprintf(out, "    dq str_%u_data\n", t->name_idx);
+        fprintf(out, "    dq %u\n", (u32)m->strs.items[t->name_idx].len);
+        fprintf(out, "    dd %u\n", t->size);
+        fprintf(out, "    dd %u\n", t->align);
+    }
 }
 
 static u32 ST_emit_call_args(FILE *out, ST_ir_insts_t *args, u32 reserved_regs) {
@@ -327,7 +337,7 @@ static void ST_fcmp(FILE *out, ST_ir_inst_t *in, ST_ir_op_t kind) {
 }
 
 static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
-    _Static_assert(ST_IR_COUNT == 52, "IR count exceeded");
+    _Static_assert(ST_IR_COUNT == 53, "IR count exceeded");
     if (in->removed)
         return;
     switch (in->kind) {
@@ -342,6 +352,9 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
         } break;
         case ST_IR_CONST_STRING:
             fprintf(out, "    lea rax, [rel str_%u]\n", in->str_index);
+            break;
+        case ST_IR_CONST_TINFO:
+            fprintf(out, "    lea rax, [rel tinfo_%u]\n", in->str_index);
             break;
         case ST_IR_ADD:
             ST_load(out, "rax", in->bin.l);

@@ -1,5 +1,15 @@
 # Storth Programming Language
 
+2026:11:17
+- `any` is now a real type: a 16 byte struct of `info: *Type_Info` and `data: *void`. Any value converts
+  to it implicitly (declarations, assignments, arguments, returns, struct fields and array elements):
+  `x : any = 2; x = "string";`. The value is copied into a stack slot and `data` points at it, the
+  type record is static data in `.rodata`. `x.info.name` tells the type, `cast(T) x` reads the value
+  back without checking, so compare `x.info.name` first. An `any` must not outlive the function that
+  created it. Globals of type `any` and default values for `any` parameters are rejected.
+- `ST_IR_CONST_TINFO` and per module type records in all backends.
+- Calling a method with two or more plain overloads no longer skips a generic variadic overload.
+
 2026:11:12
 - Enums and enum_flags are now backed by `u32` by default instead of 8 bytes, and `enum Foo : u8 {..}`
   actually picks the integer type and size.

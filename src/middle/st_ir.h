@@ -31,6 +31,7 @@ typedef enum {
     ST_IR_CONST_INT,
     ST_IR_CONST_FLOAT,
     ST_IR_CONST_STRING,
+    ST_IR_CONST_TINFO,
 
     ST_IR_ADD,
     ST_IR_SUB,
@@ -233,6 +234,18 @@ typedef struct {
     u32 count, capacity;
 } ST_ir_strs_t;
 
+typedef struct {
+    u8 kind;
+    u32 size;
+    u32 align;
+    u32 name_idx;
+} ST_ir_tinfo_t;
+
+typedef struct {
+    ST_ir_tinfo_t *items;
+    u32 count, capacity;
+} ST_ir_tinfos_t;
+
 // @note: a single top-level 'global'/'global const' variable: reserves
 // storage in .bss (zero/no initializer) or .data (constant scalar
 // initializer) under 'name', addressed the same way as a function (see
@@ -276,6 +289,7 @@ struct ST_ir_module_t {
     ST_string_t name;
     ST_ir_fns_t fns;
     ST_ir_strs_t strs;
+    ST_ir_tinfos_t tinfos;
     ST_ir_global_vars_t globals;
     ST_ht_t fn_index;
     ST_ht_t global_index;
@@ -344,6 +358,10 @@ ST_ir_inst_t *ST_ir_const_float(ST_ir_block_t *b, ST_ty_t *ty, f64 v);
 // @note: ST_ir_module_intern_str this will just intern a string byte so we can
 // pass it to the module. This will return the bytes of the strings that got interened.
 u32 ST_ir_module_intern_str(ST_ir_module_t *m, ST_string_t bytes);
+
+u32 ST_ir_module_intern_tinfo(ST_ir_module_t *m, u8 kind, u32 size, u32 align, u32 name_idx);
+
+ST_ir_inst_t *ST_ir_const_tinfo(ST_ir_block_t *b, ST_ty_t *ty, u32 index);
 
 // @note: ST_ir_const_str is going to create a constant string in that module
 // with its own index as our implementation of strings are sized.
