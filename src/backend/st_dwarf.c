@@ -246,6 +246,8 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
             } break;
             default: {
                 u32 sz = ty->size ? ty->size : 8;
+                if (sz > 255)
+                    sz = 255;
                 fprintf(out, "Ldbgty_%u:\n", i);
                 fputs("    db 0x03\n", out);
                 fputs("    db \"?\", 0\n", out);

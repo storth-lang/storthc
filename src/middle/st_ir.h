@@ -85,6 +85,7 @@ typedef enum {
     ST_IR_ADDR,
     ST_IR_GLOBAL_ADDR,
     ST_IR_INLINE_ASM,
+    ST_IR_MEMSET_ZERO,
 
     ST_IR_COUNT,
 } ST_ir_op_t;
@@ -168,6 +169,10 @@ struct ST_ir_inst_t {
             ST_ir_inst_t *addr;
             ST_ir_inst_t *v;
         } store;
+        struct {
+            ST_ir_inst_t *addr;
+            u32 size;
+        } memset_;
         struct {
             ST_ir_inst_t *base;
             ST_ir_inst_t *index;
@@ -448,6 +453,8 @@ ST_ir_inst_t *ST_ir_global_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_string_t n
 // asm block's result usable as a value.
 ST_ir_inst_t *ST_ir_inline_asm(ST_ir_block_t *b, ST_string_t tmpl, ST_ir_inst_t **refs, u32 n_refs,
                                ST_ty_t *ty, u32 line, u32 col);
+
+ST_ir_inst_t *ST_ir_memset_zero(ST_ir_block_t *b, ST_ir_inst_t *addr, u32 size, u32 line, u32 col);
 
 // @note: ST_ir_term_ret will make a block return values as the values and their
 // count is passed in the function parameter.

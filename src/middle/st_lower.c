@@ -675,10 +675,24 @@ static void ST_lower_array_elem_zero(ST_lower_ctx_t *c, ST_ir_inst_t *elem_base,
     }
 }
 
+static b8 ST_lower_zero_is_all_bytes(ST_ty_t *t) {
+    if (t->kind == ST_TY_ARRAY)
+        return ST_lower_zero_is_all_bytes(t->inner);
+    return t->kind == ST_TY_STRING || t->kind == ST_TY_TAG_UNION || t->kind == ST_TY_SLICE ||
+           t->kind == ST_TY_DYN_ARRAY || ST_lower_ty_is_scalar(t);
+}
+
 static void ST_lower_array_zero(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 off, ST_ty_t *aty,
                                 u32 line, u32 col) {
     ST_ty_t *ety = aty->inner;
     u32 esz = ety->size;
+
+    if (aty->count > ST_LOWER_ARRAY_UNROLL_THRESHOLD && ST_lower_zero_is_all_bytes(aty)) {
+        ST_ir_inst_t *start =
+            ST_lower_field_ptr(c, base, off, c->sema->tys.prim[ST_ti8], line, col);
+        ST_ir_memset_zero(c->cur, start, aty->size, line, col);
+        return;
+    }
 
     if (aty->count <= ST_LOWER_ARRAY_UNROLL_THRESHOLD) {
         ST_forrange(0, aty->count) {

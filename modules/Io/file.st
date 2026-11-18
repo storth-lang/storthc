@@ -55,35 +55,6 @@ pub trait File($T) {
 // for these sepcific functions just override the default one with
 pub struct Libc {}
 
-enum_flag logKind {
-    Todo,
-    Error,
-}
-
-// @note: In the future we should be able to print where in our location we faild so
-// equivalent to C __LINE__, __FILE__.
-//
-// 'msg' is treated as a printf-style format string; 'args' is spread straight into
-// printf's own C-ABI variadic tail.
-fn die(type: logKind, msg: string, loc: Source_Code_Location, args: $T...) -> noreturn {
-
-    if type {
-        case logKind.Todo then printf("%s:%d:%d: TODO: ", loc.filename.ptr, loc.line, loc.column);
-        case logKind.Error then printf("%s:%d:%d: ERROR: ", loc.filename.ptr, loc.line, loc.column);
-    }
-
-    if msg != "" then printf(msg, ...args);
-    exit(1);
-}
-
-pub fn todo(msg : string, loc := #caller_location) -> void {
-    die(logKind.Todo, msg, loc);
-}
-
-pub fn log_error(msg : string, loc := #caller_location, args: $T...) -> void {
-    die(logKind.Error, msg, loc, ...args);
-}
-
 // TODO: log errors if provided
 // open_file returns handle if the file is valid otherwise returns null and false.
 fn open_file(path: string, mode: openKind) -> (*void, bool) {
@@ -150,7 +121,7 @@ pub fs := File(Libc) {
         }
         handle, ok := open(self, path, openKind.Read);
         if !ok {
-            log_error("Could not open %s for reading\n\r", path.ptr);
+            log_error("Could not open {} for reading\n\r", path);
             return empty, false;
         }
         defer close(self, handle);
@@ -174,7 +145,7 @@ pub fs := File(Libc) {
         if append then mode = openKind.Append;
         handle, ok := open(self, path, mode);
         if !ok {
-            log_error("Could not open %s for writing\n\r", path.ptr);
+            log_error("Could not open {} for writing\n\r", path);
             return false;
         }
         defer close(self, handle);

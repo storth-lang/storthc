@@ -1,5 +1,22 @@
 # Storth Programming Language
 
+2026:11:18
+- `#caller_location` as a default parameter value (`loc := #caller_location`) is stamped with the call site's
+  file, line and column. It replaces `#code`. The value has the builtin type `Source_Code_Location` with the
+  fields `filename: string`, `line: i32` and `column: i32`.
+- Fixed call lowering for a defaulted location argument: the synthesized value was untyped and failed with
+  "this expression form isn't lowered yet".
+- `Io` now has `modules/Io/log.st`: `print`, `println`, `eprint`, `eprintln`, `todo` and `log_error`. They use
+  Rust style `{}` placeholders (`{{` and `}}` escape braces) over `any` type records and write with the raw
+  `write` syscall, no libc. `todo` and `log_error` print `file:line:column: ERROR: message` to stderr and exit 1.
+- `fs.read` and `fs.write` go through the witness's own `open` and `close`.
+- DWARF: base type sizes above 255 are clamped, which silences the nasm "byte data exceeds bounds" warning.
+- Output is buffered like Rust's BufWriter: literal runs and strings are copied with one `rep movsb`, writes of a
+  full buffer or more bypass the buffer, and `write_all` retries partial writes and EINTR.
+- New IR op `ST_IR_MEMSET_ZERO` (`rep stosb`). Zero-initializing a local array of more than 8 scalar, string,
+  slice or nested array elements no longer runs a byte-by-byte loop, so `o : Out` with a 1024 byte buffer stops
+  costing about 36k instructions per call. Two million `println` calls went from 7.8s to 2.4s.
+
 2026:11:17
 - `any` is now a real type: a 16 byte struct of `info: *Type_Info` and `data: *void`. Any value converts
   to it implicitly (declarations, assignments, arguments, returns, struct fields and array elements):

@@ -477,7 +477,7 @@ static void ST_fcmp(FILE *out, ST_ir_inst_t *in, ST_ir_op_t kind) {
 }
 
 static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
-    _Static_assert(ST_IR_COUNT == 53, "IR count exceeded");
+    _Static_assert(ST_IR_COUNT == 54, "IR count exceeded");
     if (in->removed)
         return;
     switch (in->kind) {
@@ -914,6 +914,15 @@ static void ST_generate_inst(FILE *out, ST_gen_ctx_t *ctx, ST_ir_inst_t *in) {
             fprintf(out, "    lea rax, [rel "); ST_emit_sym(out, in->global_name); fprintf(out, "]\n");
             break;
 
+        case ST_IR_MEMSET_ZERO: {
+            ST_load(out, "rdx", in->memset_.addr);
+            fprintf(out, "    push rdi\n");
+            fprintf(out, "    mov rdi, rdx\n");
+            fprintf(out, "    mov rcx, %u\n", in->memset_.size);
+            fprintf(out, "    xor eax, eax\n");
+            fprintf(out, "    rep stosb\n");
+            fprintf(out, "    pop rdi\n");
+        } break;
         case ST_IR_INLINE_ASM: {
             ST_string_t tmpl = in->inline_asm.tmpl;
             for (u32 k = 0; k < tmpl.len; k++) {

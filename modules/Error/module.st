@@ -32,23 +32,21 @@ pub impl Result {
     fn is_ok(self: Self) -> bool {
         if self {
             case Ok(v) { return true; }
-            default { return false }
+            default { return false; }
         }
     }
 
     fn is_err(self: Self) -> bool {
         if self {
             case Error(v) { return true; }
-            default { return false }
+            default { return false; }
         }
     }
 
     fn unwrap(self: Self) -> $O {
         if self {
             case Ok(v) { return v; }
-            default { 
-                panic("Unwrapping error is invalid");
-            }
+            default { return cast($O)null; } 
         }
     }
 
@@ -58,16 +56,6 @@ pub impl Result {
             default    { return val; }
         }
     }
-
-    fn map(self: Self, func: fn(x: $Q, args: $A...)) -> $O {
-        if self {
-            case Ok(v) { 
-                return v; 
-            }
-            default    { return val; }
-        }
-    }
-
 
 }
 

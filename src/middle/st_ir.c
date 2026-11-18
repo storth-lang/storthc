@@ -468,6 +468,13 @@ ST_ir_inst_t *ST_ir_store(ST_ir_block_t *b, ST_ty_t *ty, ST_ir_inst_t *addr, ST_
     return inst;
 }
 
+ST_ir_inst_t *ST_ir_memset_zero(ST_ir_block_t *b, ST_ir_inst_t *addr, u32 size, u32 line, u32 col) {
+    ST_ir_inst_t *inst = ST_ir_emit(b, ST_IR_MEMSET_ZERO, NULL, line, col);
+    inst->memset_.addr = addr;
+    inst->memset_.size = size;
+    return inst;
+}
+
 ST_ir_inst_t *ST_ir_addr(ST_ir_block_t *b, ST_ty_t *ptr_ty, ST_ir_inst_t *base, ST_ir_inst_t *index,
                          u32 scale, i32 offset, u32 line, u32 col) {
     ST_assert(!index || scale != 0);
@@ -538,7 +545,7 @@ void ST_ir_term_unreachable(ST_ir_block_t *b, u32 line, u32 col) {
 }
 
 static const char *ST_ir_op_name(ST_ir_op_t op) {
-    _Static_assert(ST_IR_COUNT == 53, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
+    _Static_assert(ST_IR_COUNT == 54, "new IR op: update ST_ir_op_name and ST_ir_dump_func");
     switch (op) {
         case ST_IR_CONST_INT:
             return "const_int";
@@ -646,6 +653,8 @@ static const char *ST_ir_op_name(ST_ir_op_t op) {
             return "global_addr";
         case ST_IR_INLINE_ASM:
             return "inline_asm";
+        case ST_IR_MEMSET_ZERO:
+            return "memset_zero";
         case ST_IR_COUNT:
             break;
     }
@@ -698,7 +707,7 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn) {
             ST_ir_dump_val(out, inst);
             fprintf(out, " = %s", ST_ir_op_name(inst->kind));
 
-            _Static_assert(ST_IR_COUNT == 53, "IR is exceeded");
+            _Static_assert(ST_IR_COUNT == 54, "IR is exceeded");
             switch (inst->kind) {
                 case ST_IR_CONST_INT:
                     fprintf(out, " %lld", (long long)inst->const_int);
@@ -798,6 +807,11 @@ void ST_ir_dump_func(FILE *out, ST_ir_fn_t *fn) {
                     break;
                 case ST_IR_INLINE_ASM:
                     fprintf(out, " (%u refs)", inst->inline_asm.refs.count);
+                    break;
+                case ST_IR_MEMSET_ZERO:
+                    fprintf(out, " ");
+                    ST_ir_dump_val(out, inst->memset_.addr);
+                    fprintf(out, ", %u", inst->memset_.size);
                     break;
                 default:
                     fprintf(out, " ");
