@@ -45,6 +45,7 @@ void ST_ty_ctx_init(ST_ty_ctx_t *ctx, ST_arena_t *arena) {
     ctx->prim[ST_tany] = ST_ty_alloc(ctx, ST_TY_ANY, 16, 8);
     ctx->prim[ST_tbool] = ST_ty_alloc(ctx, ST_TY_BOOL, 1, 1);
     ctx->prim[ST_tstring] = ST_ty_alloc(ctx, ST_TY_STRING, 16, 8);
+    ctx->prim[ST_tsrc_loc] = NULL;
 
     ctx->untyped_int = ST_ty_alloc(ctx, ST_TY_UNTYPED_INT, 8, 8);
     ctx->untyped_int->width = 64;
@@ -54,6 +55,7 @@ void ST_ty_ctx_init(ST_ty_ctx_t *ctx, ST_arena_t *arena) {
     ctx->null_ptr = ST_ty_alloc(ctx, ST_TY_PTR, 8, 8);
     ctx->null_ptr->inner = ctx->prim[ST_tvoid];
     ctx->typeid_ty = ST_ty_alloc(ctx, ST_TY_TYPEID, 8, 8);
+    ctx->prim[ST_tsrc_loc] = ST_ty_code_loc(ctx);
 }
 
 ST_ty_t *ST_ty_prim(ST_ty_ctx_t *ctx, ST_type_t t) {
@@ -147,8 +149,8 @@ ST_ty_t *ST_ty_code_loc(ST_ty_ctx_t *ctx) {
         return ctx->code_loc_ty;
     ST_ty_t *t = ST_ty_alloc(ctx, ST_TY_STRUCT, 24, 8);
     ST_ty_field_t filename = {ST_cstr_to_str("filename"), ctx->prim[ST_tstring], 0};
-    ST_ty_field_t line = {ST_cstr_to_str("line"), ctx->prim[ST_tu32], 16};
-    ST_ty_field_t col = {ST_cstr_to_str("col"), ctx->prim[ST_tu32], 20};
+    ST_ty_field_t line = {ST_cstr_to_str("line"), ctx->prim[ST_ti32], 16};
+    ST_ty_field_t col = {ST_cstr_to_str("column"), ctx->prim[ST_ti32], 20};
     ST_da_append_arena(ctx->arena, &t->fields, filename);
     ST_da_append_arena(ctx->arena, &t->fields, line);
     ST_da_append_arena(ctx->arena, &t->fields, col);

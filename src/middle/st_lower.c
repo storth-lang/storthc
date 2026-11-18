@@ -969,7 +969,7 @@ static void ST_lower_code_loc_into(ST_lower_ctx_t *c, ST_ir_inst_t *base, i32 of
         ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, off + (i32)foff, fty, e->line, e->col);
         ST_ir_store(c->cur, fty, fp, ST_ir_const_int(c->cur, fty, (i64)e->line), e->line, e->col);
     }
-    if (ST_lower_field_find(st, ST_cstr_to_str("col"), &fty, &foff)) {
+    if (ST_lower_field_find(st, ST_cstr_to_str("column"), &fty, &foff)) {
         ST_ir_inst_t *fp = ST_lower_field_ptr(c, base, off + (i32)foff, fty, e->line, e->col);
         ST_ir_store(c->cur, fty, fp, ST_ir_const_int(c->cur, fty, (i64)e->col), e->line, e->col);
     }
@@ -1833,6 +1833,7 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
             if (p->def && p->def->kind == ST_EX_CODE_LOC) {
                 ST_expr_t *loc = ST_expr_new(c->arena, ST_EX_CODE_LOC, e->line, e->col);
                 loc->sval = c->diag.file;
+                loc->ty = ST_ty_code_loc(&c->sema->tys);
                 resolved[i] = loc;
             } else if (p->def)
                 resolved[i] = p->def;

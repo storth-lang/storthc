@@ -58,7 +58,8 @@ typedef enum {
     ST_TYPE(ST_tvoid, "void")                                                                      \
     ST_TYPE(ST_tany, "any")                                                                        \
     ST_TYPE(ST_tbool, "bool")                                                                      \
-    ST_TYPE(ST_tstring, "string")
+    ST_TYPE(ST_tstring, "string")                                                                  \
+    ST_TYPE(ST_tsrc_loc, "Source_Code_Location")
 
 typedef enum {
 #define ST_TYPE(e, s) e,

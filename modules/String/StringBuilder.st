@@ -37,6 +37,15 @@ pub impl StringBuilder {
         self.add_to_builder(...args);
     }
     
+    fn to_string(self: Self) -> string {
+        return string {
+            ptr = self.data,
+            len = self.count
+        };
+    }
+    fn to_cstring(self: Self) -> *char {
+        return cstr(self.to_string());
+    }
 }
 
 #import "Allocator";

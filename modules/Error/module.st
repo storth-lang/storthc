@@ -3,13 +3,6 @@ pub union Option {
     Some($T);
 }
 
-// pub fn error_out(msg := "", loc : Souce_Code_Location) -> noreturn {
-//     if msg.len > 0 {
-//         printf("%s:%d:$d: %s\n", cstr(loc.filename), loc.line, loc.col, cstr(msg));
-//     }
-//     abort();
-// }
-
 pub impl Option {
     pub fn unwrap_or(self: Self, val: $T) -> $T {
         if self {
@@ -27,9 +20,55 @@ pub impl Option {
     }
 }
 
+
+/*The Result type in Rust provides various methods for error handling, including is_ok, is_err, map, and_then, and or_else. These methods allow you to check the result's status, transform values, and handle errors more effectively*/
+
 pub union Result {
     Error($E);
     Ok($O);
+}
+
+pub impl Result {
+    fn is_ok(self: Self) -> bool {
+        if self {
+            case Ok(v) { return true; }
+            default { return false }
+        }
+    }
+
+    fn is_err(self: Self) -> bool {
+        if self {
+            case Error(v) { return true; }
+            default { return false }
+        }
+    }
+
+    fn unwrap(self: Self) -> $O {
+        if self {
+            case Ok(v) { return v; }
+            default { 
+                panic("Unwrapping error is invalid");
+            }
+        }
+    }
+
+    fn unwrap_or(self: Self, val: $O) -> $O {
+        if self {
+            case Ok(v) { return v; }
+            default    { return val; }
+        }
+    }
+
+    fn map(self: Self, func: fn(x: $Q, args: $A...)) -> $O {
+        if self {
+            case Ok(v) { 
+                return v; 
+            }
+            default    { return val; }
+        }
+    }
+
+
 }
 
 #import "Libc";

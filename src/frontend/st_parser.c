@@ -722,7 +722,7 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
-    if (ST_tok_is_symbol(t, "#code")) {
+    if (ST_tok_is_symbol(t, "#caller_location")) {
         p->pos++;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_CODE_LOC, t->line, t->col);
         e->sval = p->file;
