@@ -18,6 +18,40 @@ char *stbind_generate_string(const char *header_path,
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
+#include <stdint.h>
+
+/*
+ * Compile-time switches (define before including with STBIND_IMPLEMENTATION).
+ */
+#ifndef STBIND_STRIP_ENUM_PREFIX
+#define STBIND_STRIP_ENUM_PREFIX 1   /* SDL_KEY_A, SDL_KEY_B -> enum { A, B } */
+#endif
+#ifndef STBIND_EMIT_MACROS
+#define STBIND_EMIT_MACROS 1         /* #define N 5  ->  N :: 5; */
+#endif
+#ifndef STBIND_EMIT_DOCS
+#define STBIND_EMIT_DOCS 1           /* copy header doc comments as // lines */
+#endif
+#ifndef STBIND_EMIT_EXTERN_VARS
+#define STBIND_EMIT_EXTERN_VARS 1    /* extern int x;  ->  extern x: i32; */
+#endif
+#ifndef STBIND_DETECT_ENUM_FLAGS
+#define STBIND_DETECT_ENUM_FLAGS 1   /* 1,2,4,8 enums become enum_flag */
+#endif
+#ifndef STBIND_PUB
+#define STBIND_PUB 1                 /* prefix every top-level decl with pub */
+#endif
+#ifndef STBIND_DEEP_DEFAULT
+#define STBIND_DEEP_DEFAULT 1        /* also bind headers pulled in by the input header */
+#endif
+#ifndef STBIND_UNION_DIRECTIVE
+#define STBIND_UNION_DIRECTIVE " #union"
+#endif
+#ifndef STBIND_PACK_DIRECTIVE
+#define STBIND_PACK_DIRECTIVE " #pack"
+#endif
+
 typedef struct stbind_arena_chunk_t stbind_arena_chunk_t;
 struct stbind_arena_chunk_t {
     stbind_arena_chunk_t *next;
@@ -116,12 +150,19 @@ static void sb_append(sb_t *sb, const char *s) {
 }
 
 static void sb_appendf(sb_t *sb, const char *fmt, ...) {
-    char buf[4096];
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    sb_append(sb, buf);
+    if (n < 0) {
+        va_end(ap2);
+        return;
+    }
+    sb_ensure(sb, (size_t)n);
+    vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    sb->len += (size_t)n;
 }
 
 static void sb_indent(sb_t *sb, int depth) {
@@ -135,6 +176,36 @@ static char *cxstr(CXString s) {
     clang_disposeString(s);
     return out;
 }
+
+static const char *const g_reserved[] = {
+    "fn", "struct", "enum", "extern", "pub", "null", "if", "else", "while", "for",
+    "cast", "type_of", "type_info", "sizeof", "and", "or", "not", "default",
+    "enum_flag", "union", "case", "return", "using", "break", "continue", "defer",
+    "true", "false", "const", "static", "label", "goto", "impl",
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "f128",
+    "char", "void", "any", "bool", "string", NULL
+};
+
+static int is_reserved(const char *s) {
+    for (int i = 0; g_reserved[i]; i++)
+        if (!strcmp(s, g_reserved[i]))
+            return 1;
+    return 0;
+}
+
+/* Escape C identifiers that collide with storth keywords / primitive names. */
+static const char *safe_ident(const char *s) {
+    if (!is_reserved(s))
+        return s;
+    size_t n = strlen(s);
+    char *p = stbind_arena_push(n + 2);
+    memcpy(p, s, n);
+    p[n] = '_';
+    p[n + 1] = 0;
+    return p;
+}
+
+static int decl_is_anonymous(CXCursor d);
 
 static sb_t g_fail;
 static int g_fail_set;
@@ -232,6 +303,7 @@ static void mark_complex_used(const char *prefix) {
 typedef struct {
     const char *key;
     CXCursor cursor;
+    long long ival;
     int used;
 } hset_entry_t;
 
@@ -297,6 +369,29 @@ static hset_t g_needed_types;
 static hset_t g_opaque_types;
 static hset_t g_emitted_types;
 static hset_t g_record_index;
+static hset_t g_consts;       /* name -> integer value (enum constants, macros) */
+static hset_t g_macro_names;
+static hset_t g_typedef_index; /* typedef-of-anonymous-record/enum name -> typedef cursor */
+static hset_t g_scope_cache;   /* file path -> in scope? */
+static int g_deep;
+static const char *g_incl[32];
+static const char *g_excl[32];
+static int g_n_incl, g_n_excl;
+
+static void const_add(const char *name, long long v) {
+    hset_add(&g_consts, name, clang_getNullCursor());
+    hset_find_slot(g_consts.slots, g_consts.cap, name)->ival = v;
+}
+
+static int const_get(const char *name, long long *v) {
+    if (!g_consts.cap)
+        return 0;
+    hset_entry_t *e = hset_find_slot(g_consts.slots, g_consts.cap, name);
+    if (!e->used)
+        return 0;
+    *v = e->ival;
+    return 1;
+}
 
 static int map_pointee_or_fn(CXType pointee, sb_t *out) {
     if (pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto) {
@@ -439,6 +534,10 @@ static int map_type(CXType t, sb_t *out) {
         case CXType_Enum: {
             char *name = cxstr(clang_getTypeSpelling(t));
             if (!name[0] || strstr(name, "unnamed") || strstr(name, "anonymous")) {
+                /* anonymous enum used as a field/param type: it is just its integer type */
+                CXType it = clang_getEnumDeclIntegerType(clang_getTypeDeclaration(t));
+                if (it.kind != CXType_Invalid && it.kind != CXType_Enum)
+                    return map_type(it, out);
                 if (!g_fail_set) {
                     g_fail_set = 1;
                     sb_appendf(&g_fail, "reference to an anonymous %s type ('%s')",
@@ -472,13 +571,7 @@ static int map_type(CXType t, sb_t *out) {
             }
             const char *n = name;
             if (!strncmp(n, "struct ", 7)) n += 7;
-            else if (!strncmp(n, "union ", 6)) {
-                if (!g_fail_set) {
-                    g_fail_set = 1;
-                    sb_appendf(&g_fail, "reference to union type '%s' (unions unsupported)", name);
-                }
-                return 0;
-            }
+            else if (!strncmp(n, "union ", 6)) n += 6;
 
             sb_append(out, n);
             if (!clang_isCursorDefinition(clang_getTypeDeclaration(t)))
@@ -500,8 +593,28 @@ static int map_type(CXType t, sb_t *out) {
 
 static char *type_str(CXType t);
 
+/* glibc's __SOCKADDR_ARG & friends: a union of pointers is a transparent_union. */
+static int union_is_all_pointers(CXCursor decl) {
+    cursors_t ch = get_children(decl);
+    int fields = 0, ok = 1;
+    for (unsigned i = 0; i < ch.count; i++) {
+        if (clang_getCursorKind(ch.items[i]) != CXCursor_FieldDecl)
+            continue;
+        fields++;
+        if (clang_getCanonicalType(clang_getCursorType(ch.items[i])).kind != CXType_Pointer)
+            ok = 0;
+    }
+    free_children(&ch);
+    return ok && fields >= 2;
+}
+
 static char *param_type_str(CXType t) {
     CXType canon = clang_getCanonicalType(t);
+    if (canon.kind == CXType_Record) {
+        CXCursor rd = clang_getTypeDeclaration(canon);
+        if (clang_getCursorKind(rd) == CXCursor_UnionDecl && union_is_all_pointers(rd))
+            return "*void";
+    }
     if (canon.kind == CXType_ConstantArray || canon.kind == CXType_IncompleteArray) {
         sb_t sb;
         sb_init(&sb);
@@ -543,6 +656,68 @@ static CXCursor skip_transparent(CXCursor cur) {
         free_children(&ch);
         cur = next;
     }
+}
+
+/*
+ * Length of the prefix shared by every enumerator of an enum, cut at an
+ * underscore boundary (SDL_KEY_A, SDL_KEY_B -> "SDL_KEY_").  0 = do not strip.
+ */
+static int enum_strip_len(CXCursor d) {
+#if STBIND_STRIP_ENUM_PREFIX
+    cursors_t ch = get_children(d);
+    const char *first = NULL;
+    size_t plen = 0;
+    unsigned n = 0;
+    for (unsigned i = 0; i < ch.count; i++) {
+        if (clang_getCursorKind(ch.items[i]) != CXCursor_EnumConstantDecl)
+            continue;
+        char *nm = cxstr(clang_getCursorSpelling(ch.items[i]));
+        if (!n) {
+            first = nm;
+            plen = strlen(nm);
+        } else {
+            size_t j = 0;
+            while (j < plen && nm[j] == first[j])
+                j++;
+            plen = j;
+        }
+        n++;
+    }
+    int result = 0;
+    if (n >= 2) {
+        while (plen > 0 && first[plen - 1] != '_')
+            plen--;
+        result = (int)plen;
+        for (unsigned i = 0; result && i < ch.count; i++) {
+            if (clang_getCursorKind(ch.items[i]) != CXCursor_EnumConstantDecl)
+                continue;
+            char *nm = cxstr(clang_getCursorSpelling(ch.items[i]));
+            const char *rest = nm + plen;
+            if (!rest[0] || isdigit((unsigned char)rest[0]))
+                result = 0;
+        }
+    }
+    free_children(&ch);
+    return result;
+#else
+    (void)d;
+    return 0;
+#endif
+}
+
+/* `RED` referenced in a transpiled body becomes `Color.RED` (storth enum access). */
+static int emit_enum_const_ref(CXCursor ref, sb_t *out) {
+    CXCursor decl = clang_getCursorReferenced(ref);
+    if (clang_getCursorKind(decl) != CXCursor_EnumConstantDecl)
+        return 0;
+    CXCursor en = clang_getCursorSemanticParent(decl);
+    char *ename = cxstr(clang_getCursorSpelling(en));
+    if (!ename[0] || decl_is_anonymous(en))
+        return 0;
+    char *vname = cxstr(clang_getCursorSpelling(decl));
+    int strip = enum_strip_len(en);
+    sb_appendf(out, "%s.%s", ename, safe_ident(vname + strip));
+    return 1;
 }
 
 static int emit_expr(CXCursor e, sb_t *out);
@@ -848,9 +1023,9 @@ static int emit_cast(CXCursor e, sb_t *out) {
         free_children(&ch);
         return 0;
     }
-    sb_append(out, "(");
+    sb_appendf(out, "cast(%s) (", ty);
     int ok = emit_expr(operand, out);
-    sb_appendf(out, " #as %s)", ty);
+    sb_append(out, ")");
     free_children(&ch);
     return ok;
 }
@@ -1067,7 +1242,7 @@ static int emit_expr(CXCursor e, sb_t *out) {
             if (v >= 32 && v < 127)
                 sb_appendf(out, "'%c'", (char)v);
             else
-                sb_appendf(out, "%lld #as char", v);
+                sb_appendf(out, "cast(char) %lld", v);
             return 1;
         }
         case CXCursor_StringLiteral: {
@@ -1076,6 +1251,8 @@ static int emit_expr(CXCursor e, sb_t *out) {
             return 1;
         }
         case CXCursor_DeclRefExpr: {
+            if (emit_enum_const_ref(e, out))
+                return 1;
             char *s = cxstr(clang_getCursorSpelling(e));
             sb_append(out, s);
             return 1;
@@ -1424,25 +1601,116 @@ static int emit_stmt(CXCursor s, sb_t *out, int depth) {
     }
 }
 
+/* Header doc comments -> `//` lines. */
+static void emit_doc(CXCursor d, sb_t *out, int depth) {
+#if STBIND_EMIT_DOCS
+    CXString raw = clang_Cursor_getRawCommentText(d);
+    const char *c = clang_getCString(raw);
+    if (c && *c) {
+        const char *p = c;
+        for (;;) {
+            const char *e = strchr(p, '\n');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            char *line = stbind_arena_push(len + 1);
+            memcpy(line, p, len);
+            line[len] = 0;
+
+            char *t = line;
+            while (*t == ' ' || *t == '\t' || *t == '\r')
+                t++;
+            if (!strncmp(t, "/**", 3) || !strncmp(t, "/*!", 3) || !strncmp(t, "///", 3) ||
+                !strncmp(t, "//!", 3))
+                t += 3;
+            else if (!strncmp(t, "/*", 2) || !strncmp(t, "//", 2))
+                t += 2;
+            else if (*t == '*' && t[1] != '/')
+                t += 1;
+            size_t l = strlen(t);
+            if (l >= 2 && t[l - 2] == '*' && t[l - 1] == '/')
+                t[l - 2] = 0;
+            l = strlen(t);
+            while (l && (t[l - 1] == ' ' || t[l - 1] == '\t' || t[l - 1] == '\r'))
+                t[--l] = 0;
+            while (*t == ' ' || *t == '\t')
+                t++;
+            if (*t) {
+                sb_indent(out, depth);
+                sb_appendf(out, "// %s\n", t);
+            }
+            if (!e)
+                break;
+            p = e + 1;
+        }
+    }
+    clang_disposeString(raw);
+#else
+    (void)d; (void)out; (void)depth;
+#endif
+}
+
 static void emit_extern_fn(CXCursor f, sb_t *out) {
     char *name = cxstr(clang_getCursorSpelling(f));
+    fail_reset();
     char *ret = type_str(clang_getResultType(clang_getCursorType(f)));
-    sb_appendf(out, "extern fn %s(", name);
+    if (!ret) {
+        fprintf(stderr, "stbind: skipping function '%s' (%s)\n", name,
+                g_fail_set ? g_fail.data : "unsupported return type");
+        return;
+    }
+    sb_t decl;
+    sb_init(&decl);
+    sb_appendf(&decl, "extern fn %s(", name);
     int n = clang_Cursor_getNumArguments(f);
     for (int i = 0; i < n; i++) {
         if (i)
-            sb_append(out, ", ");
+            sb_append(&decl, ", ");
         CXCursor arg = clang_Cursor_getArgument(f, i);
         char *aname = cxstr(clang_getCursorSpelling(arg));
+        fail_reset();
         char *aty = param_type_str(clang_getCursorType(arg));
+        if (!aty) {
+            fprintf(stderr, "stbind: skipping function '%s' (%s)\n", name,
+                    g_fail_set ? g_fail.data : "unsupported parameter type");
+            free(decl.data);
+            return;
+        }
         if (!aname[0])
-            sb_appendf(out, "a%d: %s", i, aty ? aty : "void");
+            sb_appendf(&decl, "a%d: %s", i, aty);
         else
-            sb_appendf(out, "%s: %s", aname, aty ? aty : "void");
+            sb_appendf(&decl, "%s: %s", safe_ident(aname), aty);
     }
     if (clang_isFunctionTypeVariadic(clang_getCursorType(f)))
-        sb_append(out, n ? ", ..." : "...");
-    sb_appendf(out, ") -> %s;\n", ret ? ret : "void");
+        sb_append(&decl, n ? ", ..." : "...");
+    sb_appendf(&decl, ") -> %s;\n", ret);
+    emit_doc(f, out, 0);
+    sb_append(out, decl.data);
+    free(decl.data);
+}
+
+static void emit_extern_var(CXCursor v, sb_t *out) {
+#if STBIND_EMIT_EXTERN_VARS
+    if (clang_Cursor_getStorageClass(v) != CX_SC_Extern || clang_isCursorDefinition(v))
+        return;
+    char *name = cxstr(clang_getCursorSpelling(v));
+    if (!name[0] || is_reserved(name))
+        return;
+    CXType t = clang_getCursorType(v);
+    if (clang_getCanonicalType(t).kind == CXType_IncompleteArray) {
+        fprintf(stderr, "stbind: skipping extern variable '%s' (array of unknown size)\n", name);
+        return;
+    }
+    fail_reset();
+    char *ty = type_str(t);
+    if (!ty) {
+        fprintf(stderr, "stbind: skipping extern variable '%s' (%s)\n", name,
+                g_fail_set ? g_fail.data : "unsupported type");
+        return;
+    }
+    emit_doc(v, out, 0);
+    sb_appendf(out, "extern %s: %s;\n\n", name, ty);
+#else
+    (void)v; (void)out;
+#endif
 }
 
 static int try_emit_full_fn(CXCursor f, sb_t *out) {
@@ -1471,7 +1739,7 @@ static int try_emit_full_fn(CXCursor f, sb_t *out) {
         if (!aname[0])
             sb_appendf(&body, "a%d: %s", i, aty);
         else
-            sb_appendf(&body, "%s: %s", aname, aty);
+            sb_appendf(&body, "%s: %s", safe_ident(aname), aty);
     }
     sb_appendf(&body, ") -> %s ", ret);
 
@@ -1498,79 +1766,455 @@ static int try_emit_full_fn(CXCursor f, sb_t *out) {
     return 1;
 }
 
-static void emit_record(CXCursor d, sb_t *out) {
-    if (clang_Cursor_isAnonymous(d))
+static const char *record_directive(CXCursor d) {
+    if (clang_getCursorKind(d) == CXCursor_UnionDecl)
+        return STBIND_UNION_DIRECTIVE;
+    cursors_t ch = get_children(d);
+    int packed = 0;
+    for (unsigned i = 0; i < ch.count; i++)
+        if (clang_getCursorKind(ch.items[i]) == CXCursor_PackedAttr)
+            packed = 1;
+    free_children(&ch);
+    return packed ? STBIND_PACK_DIRECTIVE : "";
+}
+
+/* Tracks where our emitted layout ends so we can match C offsets with explicit padding. */
+typedef struct {
+    sb_t *body;
+    int depth, is_union;
+    long long cur;
+    int pad_n, bits_n, anon_n;
+    int in_bits;
+    long long bit_first, bit_last;
+    sb_t bit_names;
+    int have_pending;
+    CXCursor pending;
+} fields_ctx_t;
+
+static int emit_fields(CXCursor d, sb_t *body, int depth);
+
+static long long type_size_or_0(CXType t) {
+    long long sz = clang_Type_getSizeOf(t);
+    return sz > 0 ? sz : 0;
+}
+
+static void fields_pad(fields_ctx_t *f, long long n) {
+    if (n <= 0)
         return;
-    char *name = cxstr(clang_getCursorSpelling(d));
+    sb_indent(f->body, f->depth);
+    sb_appendf(f->body, "_pad%d: [%lld]u8;\n", f->pad_n++, n);
+    f->cur += n;
+}
+
+/* Called right before emitting a field of type `fty` that C puts at `off_bits`. */
+static void fields_place(fields_ctx_t *f, CXType fty, long long off_bits) {
+    if (f->is_union)
+        return;
+    long long al = clang_Type_getAlignOf(fty);
+    if (al < 1)
+        al = 1;
+    long long ours = (f->cur + al - 1) / al * al;
+    if (off_bits >= 0) {
+        long long off = off_bits / 8;
+        if (ours < off)
+            fields_pad(f, off - f->cur);
+        f->cur = off + type_size_or_0(fty);
+    } else {
+        f->cur = ours + type_size_or_0(fty);
+    }
+}
+
+/* A run of bitfields cannot be expressed; keep its exact bytes as one opaque field. */
+static void fields_flush_bits(fields_ctx_t *f) {
+    if (!f->in_bits)
+        return;
+    long long end = (f->bit_last + 7) / 8;
+    long long start = f->bit_first / 8;
+    if (f->is_union) {
+        start = 0;
+    } else if (start > f->cur) {
+        fields_pad(f, start - f->cur);
+    } else {
+        start = f->cur;
+    }
+    long long len = end - start;
+    if (len > 0) {
+        sb_indent(f->body, f->depth);
+        sb_appendf(f->body, "_bits%d: [%lld]u8;", f->bits_n++, len);
+        if (f->bit_names.len)
+            sb_appendf(f->body, " // bitfields: %s", f->bit_names.data);
+        sb_append(f->body, "\n");
+        if (!f->is_union)
+            f->cur = end;
+    }
+    f->in_bits = 0;
+    f->bit_names.len = 0;
+    if (f->bit_names.data)
+        f->bit_names.data[0] = 0;
+}
+
+static int fields_emit_anon(fields_ctx_t *f, CXCursor rec, const char *fname) {
+    sb_t inner;
+    sb_init(&inner);
+    if (!emit_fields(rec, &inner, f->depth + 1)) {
+        free(inner.data);
+        return 0;
+    }
+    sb_indent(f->body, f->depth);
+    sb_appendf(f->body, "%s: struct%s {\n", fname, record_directive(rec));
+    sb_append(f->body, inner.data);
+    sb_indent(f->body, f->depth);
+    sb_append(f->body, "}\n");
+    free(inner.data);
+    return 1;
+}
+
+/* An anonymous struct/union member with no field cursor of its own (C11). */
+static void fields_flush_pending(fields_ctx_t *f) {
+    if (!f->have_pending)
+        return;
+    f->have_pending = 0;
+    char nm[32];
+    snprintf(nm, sizeof(nm), "_anon%d", f->anon_n++);
+    CXType t = clang_getCursorType(f->pending);
+    fields_flush_bits(f);
+    fields_place(f, t, -1);
+    if (!fields_emit_anon(f, f->pending, nm)) {
+        long long sz = type_size_or_0(t);
+        if (sz > 0) {
+            sb_indent(f->body, f->depth);
+            sb_appendf(f->body, "%s: [%lld]u8;\n", nm, sz);
+        }
+    }
+}
+
+static int emit_fields(CXCursor d, sb_t *body, int depth) {
+    fields_ctx_t f;
+    memset(&f, 0, sizeof(f));
+    f.body = body;
+    f.depth = depth;
+    f.is_union = clang_getCursorKind(d) == CXCursor_UnionDecl;
+    sb_init(&f.bit_names);
+
+    int ok = 1;
+    cursors_t ch = get_children(d);
+    for (unsigned i = 0; ok && i < ch.count; i++) {
+        CXCursor c = ch.items[i];
+        enum CXCursorKind k = clang_getCursorKind(c);
+
+        if (k == CXCursor_StructDecl || k == CXCursor_UnionDecl) {
+            if (!clang_isCursorDefinition(c))
+                continue;
+            if (decl_is_anonymous(c)) {
+                fields_flush_pending(&f);
+                f.pending = c;
+                f.have_pending = 1;
+            } else {
+                char *nm = cxstr(clang_getCursorSpelling(c));
+                if (nm[0])
+                    hset_add(&g_record_index, nm, c);
+            }
+            continue;
+        }
+        if (k == CXCursor_EnumDecl) {
+            if (!decl_is_anonymous(c)) {
+                char *nm = cxstr(clang_getCursorSpelling(c));
+                if (nm[0])
+                    hset_add(&g_record_index, nm, c);
+            }
+            continue;
+        }
+        if (k != CXCursor_FieldDecl)
+            continue;
+
+        char *fname = cxstr(clang_getCursorSpelling(c));
+        CXType fty = clang_getCursorType(c);
+        CXType fcanon = clang_getCanonicalType(fty);
+        long long off_bits = clang_Cursor_getOffsetOfField(c);
+
+        if (clang_Cursor_isBitField(c)) {
+            long long w = clang_getFieldDeclBitWidth(c);
+            if (w > 0) {
+                fields_flush_pending(&f);
+                long long start = off_bits >= 0 ? off_bits : (f.in_bits ? f.bit_last : f.cur * 8);
+                if (!f.in_bits) {
+                    f.in_bits = 1;
+                    f.bit_first = start;
+                    f.bit_last = start;
+                }
+                if (start + w > f.bit_last)
+                    f.bit_last = start + w;
+                if (fname[0]) {
+                    if (f.bit_names.len)
+                        sb_append(&f.bit_names, ", ");
+                    sb_appendf(&f.bit_names, "%s:%lld", fname, w);
+                }
+            }
+            continue;
+        }
+        fields_flush_bits(&f);
+
+        CXCursor tdecl = clang_getNullCursor();
+        int anon_rec = 0;
+        {
+            /* only a literally anonymous `struct { } x;` is inlined; a typedef name is kept */
+            CXType declared = fty;
+            if (declared.kind == CXType_Elaborated)
+                declared = clang_Type_getNamedType(declared);
+            if (declared.kind == CXType_Record && fcanon.kind == CXType_Record) {
+                tdecl = clang_getTypeDeclaration(fcanon);
+                anon_rec = decl_is_anonymous(tdecl);
+            }
+        }
+        if (f.have_pending) {
+            if (anon_rec && clang_equalCursors(f.pending, tdecl))
+                f.have_pending = 0;
+            else
+                fields_flush_pending(&f);
+        }
+
+        char nm[32];
+        const char *emit_name = fname;
+        if (!fname[0]) {
+            snprintf(nm, sizeof(nm), "_anon%d", f.anon_n++);
+            emit_name = nm;
+        }
+        emit_name = safe_ident(emit_name);
+
+        if (fcanon.kind == CXType_IncompleteArray) {
+            sb_indent(body, depth);
+            sb_appendf(body, "// flexible array member '%s' omitted\n", fname);
+            continue;
+        }
+
+        if (anon_rec) {
+            fields_place(&f, fty, off_bits);
+            if (fields_emit_anon(&f, tdecl, emit_name))
+                continue;
+            long long sz = type_size_or_0(fcanon);
+            if (sz > 0) {
+                sb_indent(body, depth);
+                sb_appendf(body, "%s: [%lld]u8;\n", emit_name, sz);
+                continue;
+            }
+            ok = 0;
+            break;
+        }
+
+        fail_reset();
+        char *fty_str = type_str(fty);
+        fields_place(&f, fty, off_bits);
+        if (!fty_str) {
+            /* unsupported type: keep the field's bytes so the layout stays right */
+            long long sz = type_size_or_0(fcanon);
+            if (sz > 0) {
+                sb_indent(body, depth);
+                sb_appendf(body, "%s: [%lld]u8; // opaque: %s\n", emit_name, sz,
+                           g_fail_set ? g_fail.data : "unsupported type");
+                continue;
+            }
+            ok = 0;
+            break;
+        }
+        sb_indent(body, depth);
+        sb_appendf(body, "%s: %s;\n", emit_name, fty_str);
+    }
+    if (ok) {
+        fields_flush_bits(&f);
+        fields_flush_pending(&f);
+        if (!f.is_union) {
+            CXType rt = clang_getCursorType(d);
+            long long csz = clang_Type_getSizeOf(rt);
+            long long cal = clang_Type_getAlignOf(rt);
+            int packed = !strcmp(record_directive(d), STBIND_PACK_DIRECTIVE);
+            if (cal < 1 || packed)
+                cal = 1;
+            long long ours = (f.cur + cal - 1) / cal * cal;
+            if (csz > ours)
+                fields_pad(&f, csz - f.cur);
+        }
+    }
+    free(f.bit_names.data);
+    free_children(&ch);
+    return ok;
+}
+
+static void emit_enum(CXCursor d, const char *name, sb_t *out) {
+    CXType it = clang_getEnumDeclIntegerType(d);
+    CXType icanon = clang_getCanonicalType(it);
+    int is_unsigned = icanon.kind == CXType_UChar || icanon.kind == CXType_UShort ||
+                      icanon.kind == CXType_UInt || icanon.kind == CXType_ULong ||
+                      icanon.kind == CXType_ULongLong;
+
+    const char *backing = NULL;
+    {
+        sb_t ty;
+        sb_init(&ty);
+        fail_reset();
+        if (map_type(it, &ty) && strcmp(ty.data, "u32") != 0)
+            backing = stbind_arena_strdup(ty.data);
+        free(ty.data);
+    }
+
+    cursors_t ch = get_children(d);
+    unsigned n = 0;
+    long long *vals = NULL;
+    char **names = NULL;
+    vals = stbind_arena_push(sizeof(*vals) * (ch.count + 1));
+    names = stbind_arena_push(sizeof(*names) * (ch.count + 1));
+    for (unsigned i = 0; i < ch.count; i++) {
+        if (clang_getCursorKind(ch.items[i]) != CXCursor_EnumConstantDecl)
+            continue;
+        names[n] = cxstr(clang_getCursorSpelling(ch.items[i]));
+        vals[n] = is_unsigned ? (long long)clang_getEnumConstantDeclUnsignedValue(ch.items[i])
+                              : clang_getEnumConstantDeclValue(ch.items[i]);
+        n++;
+    }
+
+    /* enum_flag: variant i is (first << i), only the first may carry an explicit value */
+    int as_flag = 0;
+#if STBIND_DETECT_ENUM_FLAGS
+    if (n >= 3 && n <= 30 && vals[0] > 0 && vals[0] < (1LL << 30)) {
+        as_flag = 1;
+        for (unsigned i = 0; i < n; i++)
+            if (vals[i] != (vals[0] << i)) {
+                as_flag = 0;
+                break;
+            }
+    }
+#endif
+
+    int strip = enum_strip_len(d);
+    emit_doc(d, out, 0);
+    sb_appendf(out, "%s %s", as_flag ? "enum_flag" : "enum", name);
+    if (backing)
+        sb_appendf(out, " : %s", backing);
+    sb_append(out, " {\n");
+
+    for (unsigned i = 0; i < n; i++) {
+        const_add(names[i], vals[i]);
+        const char *vn = safe_ident(names[i] + strip);
+
+        /* storth rejects two variants with the same value; keep aliases as comments */
+        unsigned dup = n;
+        for (unsigned j = 0; j < i; j++)
+            if (vals[j] == vals[i]) {
+                dup = j;
+                break;
+            }
+        if (dup != n) {
+            sb_appendf(out, "    // %s == %s\n", vn, safe_ident(names[dup] + strip));
+            continue;
+        }
+        if (as_flag) {
+            if (i == 0)
+                sb_appendf(out, "    %s := %lld,\n", vn, vals[i]);
+            else
+                sb_appendf(out, "    %s,\n", vn);
+        } else if (is_unsigned) {
+            sb_appendf(out, "    %s := %llu,\n", vn, (unsigned long long)vals[i]);
+        } else {
+            sb_appendf(out, "    %s := %lld,\n", vn, vals[i]);
+        }
+    }
+    sb_append(out, "}\n\n");
+    free_children(&ch);
+}
+
+static void emit_record_as(CXCursor d, const char *forced_name, sb_t *out) {
+    if (!forced_name && decl_is_anonymous(d))
+        return;
+    char *name = forced_name ? stbind_arena_strdup(forced_name)
+                             : cxstr(clang_getCursorSpelling(d));
     if (!name[0]) {
         return;
     }
 
     if (hset_has(&g_emitted_types, name)) {
-	return;
+        return;
     }
 
     enum CXCursorKind k = clang_getCursorKind(d);
     if (k == CXCursor_EnumDecl) {
-        sb_appendf(out, "enum %s {\n", name);
-        cursors_t ch = get_children(d);
-        for (unsigned i = 0; i < ch.count; i++) {
-            if (clang_getCursorKind(ch.items[i]) != CXCursor_EnumConstantDecl)
-                continue;
-            char *ename = cxstr(clang_getCursorSpelling(ch.items[i]));
-            long long v = clang_getEnumConstantDeclValue(ch.items[i]);
-            sb_appendf(out, "    %s := %lld,\n", ename, v);
-        }
-        sb_append(out, "}\n\n");
-        free_children(&ch);
         hset_add(&g_emitted_types, name, clang_getNullCursor());
+        emit_enum(d, name, out);
         return;
     }
-    if (k != CXCursor_StructDecl) {
+    if (k != CXCursor_StructDecl && k != CXCursor_UnionDecl) {
         return;
     }
     if (!clang_isCursorDefinition(d)) {
         return;
     }
     hset_add(&g_emitted_types, name, clang_getNullCursor());
-    cursors_t ch = get_children(d);
     sb_t body;
     sb_init(&body);
-    int ok = 1;
-    for (unsigned i = 0; i < ch.count; i++) {
-        if (clang_getCursorKind(ch.items[i]) != CXCursor_FieldDecl)
-            continue;
-        char *fname = cxstr(clang_getCursorSpelling(ch.items[i]));
-        CXType fty = clang_getCursorType(ch.items[i]);
-        CXType fcanon = clang_getCanonicalType(fty);
-        char *fty_str = NULL;
-
-        if (fcanon.kind == CXType_Record &&
-            clang_Cursor_isAnonymous(clang_getTypeDeclaration(fcanon))) {
-            long long sz = clang_Type_getSizeOf(fcanon);
-            if (sz > 0) {
-                sb_t tmp;
-                sb_init(&tmp);
-                sb_appendf(&tmp, "[%lld]u8", sz);
-                fty_str = stbind_arena_strdup(tmp.data);
-                free(tmp.data);
-            }
-        }
-        if (!fty_str)
-            fty_str = type_str(fty);
-        if (!fty_str) {
-            ok = 0;
-            break;
-        }
-        sb_appendf(&body, "    %s: %s;\n", fname, fty_str);
-    }
-    free_children(&ch);
+    fail_reset();
+    int ok = emit_fields(d, &body, 1);
     if (ok) {
-        sb_appendf(out, "struct %s {\n%s}\n\n", name, body.data);
+        emit_doc(d, out, 0);
+        sb_appendf(out, "struct %s%s {\n%s}\n\n", name, record_directive(d), body.data);
     } else {
-        fprintf(stderr, "stbind: skipping struct '%s' (unsupported field type)\n", name);
+        fprintf(stderr, "stbind: skipping %s '%s' (unsupported field type)\n",
+                k == CXCursor_UnionDecl ? "union" : "struct", name);
     }
     free(body.data);
+}
+
+static void emit_record(CXCursor d, sb_t *out) {
+    emit_record_as(d, NULL, out);
+}
+
+/* libclang spells anonymous tags differently across versions, so check both. */
+static int decl_is_anonymous(CXCursor d) {
+    if (clang_Cursor_isAnonymous(d))
+        return 1;
+    char *n = cxstr(clang_getCursorSpelling(d));
+    return !n[0] || strstr(n, "unnamed") || strstr(n, "anonymous");
+}
+
+/* True for scalar C types that map_type already writes inline (i32, f64, bool...). */
+static int is_scalar_kind(enum CXTypeKind k) {
+    switch (k) {
+        case CXType_Bool:
+        case CXType_Char_S: case CXType_Char_U:
+        case CXType_SChar:  case CXType_UChar:
+        case CXType_Short:  case CXType_UShort:
+        case CXType_Int:    case CXType_UInt:
+        case CXType_Long:   case CXType_ULong:
+        case CXType_LongLong: case CXType_ULongLong:
+        case CXType_Float:  case CXType_Double: case CXType_LongDouble:
+        case CXType_Complex:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * A typedef is "primitive" when it only renames a scalar, or a pointer/array of
+ * scalars (typedef unsigned int uint; typedef const char *cstr;).  map_type
+ * already collapses these to their canonical spelling at every use site, so an
+ * alias would be dead weight.  void* handles, function pointers, structs,
+ * enums and opaque types are NOT primitive: those keep their alias.
+ */
+static int typedef_is_primitive(CXType underlying) {
+    CXType t = clang_getCanonicalType(underlying);
+    for (;;) {
+        if (t.kind == CXType_Pointer) {
+            CXType pointee = clang_getCanonicalType(clang_getPointeeType(t));
+            if (pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto)
+                return 0;
+            if (pointee.kind == CXType_Void)
+                return 0;
+            t = pointee;
+        } else if (t.kind == CXType_ConstantArray || t.kind == CXType_IncompleteArray) {
+            t = clang_getCanonicalType(clang_getArrayElementType(t));
+        } else {
+            break;
+        }
+    }
+    return is_scalar_kind(t.kind);
 }
 
 static void emit_typedef(CXCursor d, sb_t *out) {
@@ -1589,6 +2233,19 @@ static void emit_typedef(CXCursor d, sb_t *out) {
     CXType underlying = clang_getTypedefDeclUnderlyingType(d);
     CXType canon = clang_getCanonicalType(underlying);
 
+    /* Primitive typedefs never get an alias; uses are already inlined. */
+    if (typedef_is_primitive(underlying))
+        return;
+
+    /* typedef enum { A, B } Name;  ->  enum Name { ... } */
+    if (canon.kind == CXType_Enum) {
+        CXCursor enum_decl = clang_getTypeDeclaration(canon);
+        if (decl_is_anonymous(enum_decl)) {
+            emit_record_as(enum_decl, name, out);
+            return;
+        }
+    }
+
     if (canon.kind == CXType_Record) {
         CXCursor record_decl = clang_getTypeDeclaration(canon);
         char *record_name = cxstr(clang_getCursorSpelling(record_decl));
@@ -1603,7 +2260,14 @@ static void emit_typedef(CXCursor d, sb_t *out) {
 
         int same_name = !strcmp(record_name, name);
 
-        if (same_name || clang_Cursor_isAnonymous(record_decl))
+        /* typedef struct { ... } Name;  ->  struct Name { ... } */
+        if (decl_is_anonymous(record_decl)) {
+            if (clang_isCursorDefinition(record_decl))
+                emit_record_as(record_decl, name, out);
+            return;
+        }
+
+        if (same_name)
             return;
 
         if (!clang_isCursorDefinition(record_decl)) {
@@ -1640,8 +2304,482 @@ static void emit_typedef(CXCursor d, sb_t *out) {
 }
 
 
+/* #define NAME <constant>  ->  NAME :: <value>; */
+
+typedef struct {
+    const char **t;
+    unsigned n, pos;
+    int err;
+} mx_t;
+
+static int mx_is(mx_t *m, const char *s) {
+    return m->pos < m->n && !strcmp(m->t[m->pos], s);
+}
+
+static long long mx_int_literal(const char *s, int *ok) {
+    char buf[80];
+    size_t len = strlen(s);
+    *ok = 0;
+    if (!len || len >= sizeof(buf))
+        return 0;
+    memcpy(buf, s, len + 1);
+    while (len && strchr("uUlL", buf[len - 1]))
+        buf[--len] = 0;
+    if (!len)
+        return 0;
+    char *end;
+    unsigned long long v;
+    if (len > 2 && buf[0] == '0' && (buf[1] == 'b' || buf[1] == 'B'))
+        v = strtoull(buf + 2, &end, 2);
+    else
+        v = strtoull(buf, &end, 0);
+    *ok = *end == 0;
+    return (long long)v;
+}
+
+static long long mx_char_literal(const char *s, int *ok) {
+    size_t len = strlen(s);
+    *ok = 0;
+    if (len < 3 || s[0] != '\'' || s[len - 1] != '\'')
+        return 0;
+    if (s[1] != '\\') {
+        *ok = len == 3;
+        return (unsigned char)s[1];
+    }
+    *ok = 1;
+    switch (s[2]) {
+        case 'n': return 10;
+        case 't': return 9;
+        case 'r': return 13;
+        case 'a': return 7;
+        case 'b': return 8;
+        case 'f': return 12;
+        case 'v': return 11;
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        case 'x': return strtol(s + 3, NULL, 16);
+        default:
+            if (s[2] >= '0' && s[2] <= '7')
+                return strtol(s + 2, NULL, 8);
+    }
+    *ok = 0;
+    return 0;
+}
+
+static int mx_prec(const char *op) {
+    if (!strcmp(op, "|")) return 1;
+    if (!strcmp(op, "^")) return 2;
+    if (!strcmp(op, "&")) return 3;
+    if (!strcmp(op, "<<") || !strcmp(op, ">>")) return 4;
+    if (!strcmp(op, "+") || !strcmp(op, "-")) return 5;
+    if (!strcmp(op, "*") || !strcmp(op, "/") || !strcmp(op, "%")) return 6;
+    return 0;
+}
+
+static long long mx_binary(mx_t *m, int minprec);
+
+static long long mx_unary(mx_t *m) {
+    if (m->pos >= m->n) {
+        m->err = 1;
+        return 0;
+    }
+    const char *t = m->t[m->pos];
+    if (!strcmp(t, "-")) {
+        m->pos++;
+        return (long long)(0ULL - (unsigned long long)mx_unary(m));
+    }
+    if (!strcmp(t, "+")) {
+        m->pos++;
+        return mx_unary(m);
+    }
+    if (!strcmp(t, "~")) {
+        m->pos++;
+        return ~mx_unary(m);
+    }
+    if (!strcmp(t, "!")) {
+        m->pos++;
+        return !mx_unary(m);
+    }
+    if (!strcmp(t, "(")) {
+        /* "(in_addr_t) 0x7f000001", "(unsigned long) 5": a cast we can ignore for the value */
+        {
+            static const char *const kw[] = {"unsigned", "signed", "int", "long", "short",
+                                             "char", "float", "double", "void", "const", NULL};
+            unsigned q = m->pos + 1;
+            int words = 0, typeish = 0, bad = 0;
+            while (q < m->n && strcmp(m->t[q], ")")) {
+                const char *w = m->t[q];
+                long long tmp;
+                if (!strcmp(w, "*")) {
+                    typeish = 1;
+                } else if ((isalpha((unsigned char)w[0]) || w[0] == '_') && !const_get(w, &tmp)) {
+                    size_t wl = strlen(w);
+                    for (int i = 0; kw[i]; i++)
+                        if (!strcmp(w, kw[i]))
+                            typeish = 1;
+                    if (wl > 2 && !strcmp(w + wl - 2, "_t"))
+                        typeish = 1;
+                    words++;
+                } else {
+                    bad = 1;
+                    break;
+                }
+                q++;
+            }
+            if (!bad && words && typeish && q + 1 < m->n && !strcmp(m->t[q], ")")) {
+                m->pos = q + 1;
+                return mx_unary(m);
+            }
+        }
+        m->pos++;
+        long long v = mx_binary(m, 1);
+        if (!mx_is(m, ")")) {
+            m->err = 1;
+            return 0;
+        }
+        m->pos++;
+        return v;
+    }
+    m->pos++;
+    int ok = 0;
+    long long v = 0;
+    if (t[0] == '\'') {
+        v = mx_char_literal(t, &ok);
+    } else if (isdigit((unsigned char)t[0])) {
+        v = mx_int_literal(t, &ok);
+    } else if (isalpha((unsigned char)t[0]) || t[0] == '_') {
+        ok = const_get(t, &v);
+    }
+    if (!ok)
+        m->err = 1;
+    return v;
+}
+
+static long long mx_binary(mx_t *m, int minprec) {
+    long long l = mx_unary(m);
+    while (!m->err && m->pos < m->n) {
+        const char *op = m->t[m->pos];
+        int p = mx_prec(op);
+        if (!p || p < minprec)
+            break;
+        m->pos++;
+        long long r = mx_binary(m, p + 1);
+        unsigned long long a = (unsigned long long)l, b = (unsigned long long)r;
+        switch (op[0]) {
+            case '|': l = (long long)(a | b); break;
+            case '^': l = (long long)(a ^ b); break;
+            case '&': l = (long long)(a & b); break;
+            case '+': l = (long long)(a + b); break;
+            case '-': l = (long long)(a - b); break;
+            case '*': l = (long long)(a * b); break;
+            case '/': if (!r) m->err = 1; else l = l / r; break;
+            case '%': if (!r) m->err = 1; else l = l % r; break;
+            case '<':
+                if (r < 0 || r >= 64) m->err = 1; else l = (long long)(a << r);
+                break;
+            case '>':
+                if (r < 0 || r >= 64) m->err = 1; else l = l >> r;
+                break;
+        }
+    }
+    return l;
+}
+
+/* "( X )" -> "X" only when the first paren closes at the very end. */
+static void mx_strip_parens(const char ***t, unsigned *n) {
+    while (*n >= 3 && !strcmp((*t)[0], "(") && !strcmp((*t)[*n - 1], ")")) {
+        int depth = 0, whole = 1;
+        for (unsigned i = 0; i < *n; i++) {
+            if (!strcmp((*t)[i], "(")) depth++;
+            else if (!strcmp((*t)[i], ")")) depth--;
+            if (depth == 0 && i + 1 < *n) {
+                whole = 0;
+                break;
+            }
+        }
+        if (!whole)
+            break;
+        (*t)++;
+        (*n) -= 2;
+    }
+}
+
+static int mx_float_text(const char *tok, char *out, size_t cap) {
+    size_t len = strlen(tok);
+    if (len == 0 || len >= 64 || (!isdigit((unsigned char)tok[0]) && tok[0] != '.'))
+        return 0;
+    char buf[64];
+    memcpy(buf, tok, len + 1);
+    int hex = len > 1 && buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X');
+    if (hex)
+        return 0;
+    while (len && strchr("fFlL", buf[len - 1]))
+        buf[--len] = 0;
+    if (!strchr(buf, '.') && !strpbrk(buf, "eE"))
+        return 0;
+    char *end;
+    double v = strtod(buf, &end);
+    if (*end)
+        return 0;
+    for (int prec = 6; prec <= 17; prec++) {
+        snprintf(out, cap, "%.*g", prec, v);
+        if (strtod(out, NULL) == v)
+            break;
+    }
+    if (strpbrk(out, "eEn"))   /* exponent / inf / nan forms: leave to the user */
+        return 0;
+    if (!strchr(out, '.'))
+        strncat(out, ".0", cap - strlen(out) - 1);
+    return 1;
+}
+
+/* out == NULL: only evaluate, so later macros (AF_INET -> PF_INET) can refer to it. */
+static void emit_macro(CXTranslationUnit tu, CXCursor c, sb_t *out) {
+#if STBIND_EMIT_MACROS
+    if (clang_Cursor_isMacroFunctionLike(c) || clang_Cursor_isMacroBuiltin(c))
+        return;
+    char *name = cxstr(clang_getCursorSpelling(c));
+    if (!name[0] || is_reserved(name) || (name[0] == '_' && name[1] == '_'))
+        return;
+    if (hset_has(&g_macro_names, name))
+        return;
+
+    CXFile file;
+    clang_getExpansionLocation(clang_getCursorLocation(c), &file, NULL, NULL, NULL);
+    if (!file)
+        return;
+    char *fname = cxstr(clang_getFileName(file));
+    if (!fname[0] || fname[0] == '<')
+        return;
+
+    CXSourceRange range = clang_getCursorExtent(c);
+    unsigned end_off = 0;
+    clang_getSpellingLocation(clang_getRangeEnd(range), NULL, NULL, NULL, &end_off);
+
+    CXToken *toks = NULL;
+    unsigned ntoks = 0;
+    clang_tokenize(tu, range, &toks, &ntoks);
+    if (!toks)
+        return;
+
+    const char **val = stbind_arena_push(sizeof(*val) * (ntoks + 1));
+    int *is_str = stbind_arena_push(sizeof(*is_str) * (ntoks + 1));
+    unsigned nval = 0;
+    for (unsigned i = 1; i < ntoks; i++) {
+        unsigned start_off = 0;
+        clang_getSpellingLocation(clang_getRangeStart(clang_getTokenExtent(tu, toks[i])),
+                                  NULL, NULL, NULL, &start_off);
+        if (end_off && start_off >= end_off)   /* some libclang versions tokenize one extra */
+            break;
+        if (clang_getTokenKind(toks[i]) == CXToken_Comment)
+            continue;
+        val[nval] = cxstr(clang_getTokenSpelling(tu, toks[i]));
+        is_str[nval] = clang_getTokenKind(toks[i]) == CXToken_Literal && val[nval][0] == '"';
+        nval++;
+    }
+    clang_disposeTokens(tu, toks, ntoks);
+    if (!nval)
+        return;
+
+    unsigned n = nval;
+    const char **t = val;
+    mx_strip_parens(&t, &n);
+    if (!n)
+        return;
+
+    /* string literal (adjacent literals are concatenated) */
+    int all_str = 1;
+    for (unsigned i = 0; i < n; i++)
+        if (!is_str[i + (unsigned)(t - val)])
+            all_str = 0;
+    if (all_str) {
+        if (!out)
+            return;
+        sb_t sv;
+        sb_init(&sv);
+        sb_append(&sv, "\"");
+        for (unsigned i = 0; i < n; i++) {
+            size_t l = strlen(t[i]);
+            if (l < 2) {
+                free(sv.data);
+                return;
+            }
+            char *inner = stbind_arena_push(l);
+            memcpy(inner, t[i] + 1, l - 2);
+            inner[l - 2] = 0;
+            sb_append(&sv, inner);
+        }
+        sb_append(&sv, "\"");
+        hset_add(&g_macro_names, name, clang_getNullCursor());
+        sb_appendf(out, "%s :: %s;\n", name, sv.data);
+        free(sv.data);
+        return;
+    }
+
+    /* floating point literal, optionally negated */
+    {
+        int neg = n == 2 && !strcmp(t[0], "-");
+        if (out && (n == 1 || neg)) {
+            char fbuf[80];
+            if (mx_float_text(t[neg ? 1 : 0], fbuf, sizeof(fbuf))) {
+                hset_add(&g_macro_names, name, clang_getNullCursor());
+                sb_appendf(out, "%s :: %s%s;\n", name, neg ? "-" : "", fbuf);
+                return;
+            }
+        }
+    }
+
+    /* integer constant expression over literals and earlier constants */
+    mx_t m = {.t = t, .n = n, .pos = 0, .err = 0};
+    long long v = mx_binary(&m, 1);
+    if (m.err || m.pos != m.n)
+        return;
+
+    hset_add(&g_macro_names, name, clang_getNullCursor());
+    const_add(name, v);
+    if (!out)
+        return;
+    if (v >= INT32_MIN && v <= INT32_MAX)
+        sb_appendf(out, "%s :: %lld;\n", name, v);
+    else if (v >= 0 && v <= (long long)UINT32_MAX)
+        sb_appendf(out, "%s :: cast(u32) %lld;\n", name, v);
+    else
+        sb_appendf(out, "%s :: cast(i64) %lld;\n", name, v);
+#else
+    (void)tu; (void)c; (void)out;
+#endif
+}
+
+/* STBIND_PUB: prefix every top-level declaration line with `pub `. */
+static char *apply_pub(char *src) {
+    sb_t o;
+    sb_init(&o);
+    char *p = src;
+    while (*p) {
+        char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        int decl = 0;
+        if (len && p[0] != ' ' && p[0] != '/' && p[0] != '}' && p[0] != '\t') {
+            static const char *const kw[] = {"struct ", "enum ", "enum_flag ", "extern ",
+                                             "fn ", "using ", NULL};
+            for (int i = 0; kw[i]; i++)
+                if (!strncmp(p, kw[i], strlen(kw[i])))
+                    decl = 1;
+            if (!decl && (isalpha((unsigned char)p[0]) || p[0] == '_')) {
+                size_t j = 0;
+                while (j < len && (isalnum((unsigned char)p[j]) || p[j] == '_'))
+                    j++;
+                if (j + 4 <= len && !strncmp(p + j, " :: ", 4))
+                    decl = 1;
+            }
+        }
+        if (decl)
+            sb_append(&o, "pub ");
+        char *line = stbind_arena_push(len + 2);
+        memcpy(line, p, len);
+        line[len] = 0;
+        sb_append(&o, line);
+        if (e)
+            sb_append(&o, "\n");
+        if (!e)
+            break;
+        p = e + 1;
+    }
+    return o.data;
+}
+
+/*
+ * Which headers do we bind?  The input header and any non-system header always.
+ * With deep scope (default) also the system headers it pulls in (sys/socket.h ->
+ * bits/socket.h, asm/socket.h ...), except the base headers below.
+ * Per-run overrides: -stbind-include=SUBSTR  -stbind-exclude=SUBSTR
+ *                    -stbind-shallow         -stbind-deep
+ */
+static const char *const g_base_headers[] = {
+    "/lib/clang/", "/lib/gcc/", "/stddef.h", "/stdarg.h", "/stdint.h", "/stdbool.h",
+    "/float.h", "/limits.h", "/syslimits.h", "/features.h", "/features-time64.h",
+    "/sys/cdefs.h", "/sys/types.h", "/gnu/stubs", "/stdc-predef.h",
+    "/bits/types.h", "/bits/types/", "/bits/typesizes.h", "/bits/wordsize.h",
+    "/bits/libc-header-start.h", "/bits/long-double.h", "/bits/floatn",
+    "/bits/stdint-", "/bits/time64.h", "/bits/byteswap.h", "/bits/uintn-identity.h",
+    "/bits/endian.h", "/bits/endianness.h", "/endian.h", "/bits/local_lim.h",
+    "/bits/posix1_lim.h", "/bits/posix2_lim.h", "/bits/xopen_lim.h",
+    "/bits/pthreadtypes", "/bits/thread-shared-types.h", "/bits/struct_mutex.h",
+    "/bits/struct_rwlock.h", "/bits/setjmp.h", "/bits/stdlib-float.h", NULL
+};
+
+static int file_in_scope(const char *path, int is_system) {
+    for (int i = 0; i < g_n_excl; i++)
+        if (strstr(path, g_excl[i]))
+            return 0;
+    for (int i = 0; i < g_n_incl; i++)
+        if (strstr(path, g_incl[i]))
+            return 1;
+    if (!is_system)
+        return 1;
+    if (!g_deep)
+        return 0;
+    for (int i = 0; g_base_headers[i]; i++)
+        if (strstr(path, g_base_headers[i]))
+            return 0;
+    return 1;
+}
+
+static int cursor_in_scope(CXSourceLocation loc) {
+    CXFile file = NULL;
+    clang_getExpansionLocation(loc, &file, NULL, NULL, NULL);
+    if (!file)
+        return 0;   /* builtin / command-line declarations */
+    char *path = cxstr(clang_getFileName(file));
+    if (!path[0] || path[0] == '<')
+        return 0;
+    if (g_scope_cache.cap) {
+        hset_entry_t *e = hset_find_slot(g_scope_cache.slots, g_scope_cache.cap, path);
+        if (e->used)
+            return (int)e->ival;
+    }
+    int r = file_in_scope(path, clang_Location_isInSystemHeader(loc));
+    hset_add(&g_scope_cache, path, clang_getNullCursor());
+    hset_find_slot(g_scope_cache.slots, g_scope_cache.cap, path)->ival = r;
+    return r;
+}
+
+/* Values of enumerators we do not emit still feed `#define X Y` evaluation. */
+static void enum_register_consts(CXCursor d) {
+    cursors_t ch = get_children(d);
+    for (unsigned i = 0; i < ch.count; i++)
+        if (clang_getCursorKind(ch.items[i]) == CXCursor_EnumConstantDecl)
+            const_add(cxstr(clang_getCursorSpelling(ch.items[i])),
+                      clang_getEnumConstantDeclValue(ch.items[i]));
+    free_children(&ch);
+}
+
+static int enum_is_truly_anonymous(CXCursor d) {
+    char *t = cxstr(clang_getTypeSpelling(clang_getCursorType(d)));
+    return !t[0] || strstr(t, "unnamed") || strstr(t, "anonymous");
+}
+
+/* `enum { FOO = 1, BAR = 2 };` is the C idiom for constants: emit them as `FOO :: 1;`. */
+static void emit_anon_enum_consts(CXCursor d, sb_t *out) {
+    cursors_t ch = get_children(d);
+    for (unsigned i = 0; i < ch.count; i++) {
+        if (clang_getCursorKind(ch.items[i]) != CXCursor_EnumConstantDecl)
+            continue;
+        char *nm = cxstr(clang_getCursorSpelling(ch.items[i]));
+        if (!nm[0] || is_reserved(nm) || (nm[0] == '_' && nm[1] == '_') ||
+            hset_has(&g_macro_names, nm))
+            continue;
+        hset_add(&g_macro_names, nm, clang_getNullCursor());
+        sb_appendf(out, "%s :: %lld;\n", nm, clang_getEnumConstantDeclValue(ch.items[i]));
+    }
+    free_children(&ch);
+}
+
 typedef struct {
     sb_t *out;
+    sb_t *macros;
+    CXTranslationUnit tu;
     CXFile main_file;
 } visit_ctx_t;
 
@@ -1650,16 +2788,31 @@ static enum CXChildVisitResult top_level_visit(CXCursor c, CXCursor parent, CXCl
     visit_ctx_t *ctx = (visit_ctx_t *)data;
     enum CXCursorKind k = clang_getCursorKind(c);
 
-    if ((k == CXCursor_StructDecl || k == CXCursor_EnumDecl) &&
-        clang_isCursorDefinition(c) && !clang_Cursor_isAnonymous(c)) {
+    if ((k == CXCursor_StructDecl || k == CXCursor_UnionDecl || k == CXCursor_EnumDecl) &&
+        clang_isCursorDefinition(c) && !decl_is_anonymous(c)) {
         char *nm = cxstr(clang_getCursorSpelling(c));
         if (nm[0])
             hset_add(&g_record_index, nm, c);
     }
 
+    if (k == CXCursor_TypedefDecl) {
+        CXType u = clang_getCanonicalType(clang_getTypedefDeclUnderlyingType(c));
+        if ((u.kind == CXType_Record || u.kind == CXType_Enum) &&
+            decl_is_anonymous(clang_getTypeDeclaration(u))) {
+            char *tn = cxstr(clang_getCursorSpelling(c));
+            if (tn[0])
+                hset_add(&g_typedef_index, tn, c);
+        }
+    }
+
     CXSourceLocation loc = clang_getCursorLocation(c);
-    if (clang_Location_isInSystemHeader(loc))
+    if (!cursor_in_scope(loc)) {
+        if (k == CXCursor_EnumDecl && clang_isCursorDefinition(c))
+            enum_register_consts(c);
+        else if (k == CXCursor_MacroDefinition)
+            emit_macro(ctx->tu, c, NULL);
         return CXChildVisit_Continue;
+    }
 
     if (k == CXCursor_FunctionDecl) {
         if (clang_isCursorDefinition(c)) {
@@ -1667,6 +2820,7 @@ static enum CXChildVisitResult top_level_visit(CXCursor c, CXCursor parent, CXCl
             sb_init(&attempt);
             fail_reset();
             if (try_emit_full_fn(c, &attempt)) {
+                emit_doc(c, ctx->out, 0);
                 sb_append(ctx->out, attempt.data);
                 sb_append(ctx->out, "\n");
             } else {
@@ -1681,10 +2835,19 @@ static enum CXChildVisitResult top_level_visit(CXCursor c, CXCursor parent, CXCl
             emit_extern_fn(c, ctx->out);
             sb_append(ctx->out, "\n");
         }
-    } else if (k == CXCursor_StructDecl || k == CXCursor_EnumDecl) {
+    } else if (k == CXCursor_StructDecl || k == CXCursor_UnionDecl || k == CXCursor_EnumDecl) {
         emit_record(c, ctx->out);
+        if (k == CXCursor_EnumDecl && clang_isCursorDefinition(c)) {
+            enum_register_consts(c);
+            if (decl_is_anonymous(c) && enum_is_truly_anonymous(c))
+                emit_anon_enum_consts(c, ctx->macros);
+        }
     } else if (k == CXCursor_TypedefDecl) {
         emit_typedef(c, ctx->out);
+    } else if (k == CXCursor_VarDecl) {
+        emit_extern_var(c, ctx->out);
+    } else if (k == CXCursor_MacroDefinition) {
+        emit_macro(ctx->tu, c, ctx->macros);
     }
 
     return CXChildVisit_Continue;
@@ -1742,6 +2905,12 @@ static void stbind_reset_state(void) {
     memset(&g_opaque_types, 0, sizeof(g_opaque_types));
     memset(&g_emitted_types, 0, sizeof(g_emitted_types));
     memset(&g_record_index, 0, sizeof(g_record_index));
+    memset(&g_consts, 0, sizeof(g_consts));
+    memset(&g_macro_names, 0, sizeof(g_macro_names));
+    memset(&g_typedef_index, 0, sizeof(g_typedef_index));
+    memset(&g_scope_cache, 0, sizeof(g_scope_cache));
+    g_deep = STBIND_DEEP_DEFAULT;
+    g_n_incl = g_n_excl = 0;
 }
 
 char *stbind_generate_string(const char *header_path,
@@ -1761,8 +2930,23 @@ char *stbind_generate_string(const char *header_path,
     int n_clang_args = 0;
     if (resinc)
         clang_args[n_clang_args++] = resinc;
-    for (int i = 0; i < n_extra_args; i++)
-        clang_args[n_clang_args++] = extra_args[i];
+    for (int i = 0; i < n_extra_args; i++) {
+        const char *a = extra_args[i];
+        if (!strncmp(a, "-stbind-", 8)) {
+            if (!strcmp(a, "-stbind-deep"))
+                g_deep = 1;
+            else if (!strcmp(a, "-stbind-shallow"))
+                g_deep = 0;
+            else if (!strncmp(a, "-stbind-include=", 16) && g_n_incl < 32)
+                g_incl[g_n_incl++] = a + 16;
+            else if (!strncmp(a, "-stbind-exclude=", 16) && g_n_excl < 32)
+                g_excl[g_n_excl++] = a + 16;
+            else
+                fprintf(stderr, "stbind: unknown option '%s'\n", a);
+            continue;
+        }
+        clang_args[n_clang_args++] = a;
+    }
 
     CXIndex index = clang_createIndex(0, 0);
     CXTranslationUnit tu;
@@ -1800,7 +2984,9 @@ char *stbind_generate_string(const char *header_path,
     sb_t out;
     sb_init(&out);
 
-    visit_ctx_t ctx = { .out = &out };
+    sb_t macros_out;
+    sb_init(&macros_out);
+    visit_ctx_t ctx = { .out = &out, .macros = &macros_out, .tu = tu };
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, top_level_visit, &ctx);
 
@@ -1827,10 +3013,17 @@ char *stbind_generate_string(const char *header_path,
             if (hset_has(&g_emitted_types, nm))
                 continue;
             CXCursor *found = hset_find(&g_record_index, nm);
-            if (!found)
+            if (found) {
+                emit_record(*found, &deferred);
+                added = 1;
                 continue;
-            emit_record(*found, &deferred);
-            added = 1;
+            }
+            CXCursor *td = hset_find(&g_typedef_index, nm);
+            if (td) {
+                emit_typedef(*td, &deferred);
+                hset_add(&g_emitted_types, nm, clang_getNullCursor());
+                added = 1;
+            }
         }
         if (!added)
             break;
@@ -1842,17 +3035,31 @@ char *stbind_generate_string(const char *header_path,
         emit_complex_support(&final_out, "Complex32", "complex32", "f32");
     if (g_used_complex64)
         emit_complex_support(&final_out, "Complex64", "complex64", "f64");
+    if (macros_out.len)
+        sb_append(&final_out, "\n");
+    sb_append(&final_out, macros_out.data);
+    if (macros_out.len)
+        sb_append(&final_out, "\n");
     sb_append(&final_out, opaque_out.data);
     sb_append(&final_out, deferred.data);
     sb_append(&final_out, out.data);
 
+    free(macros_out.data);
     free(opaque_out.data);
     free(deferred.data);
     free(out.data);
     clang_disposeTranslationUnit(tu);
     clang_disposeIndex(index);
 
+#if STBIND_PUB
+    {
+        char *pubbed = apply_pub(final_out.data);
+        free(final_out.data);
+        return pubbed;
+    }
+#else
     return final_out.data;
+#endif
 }
 
 int stbind_generate(const char *header_path, const char *output_path,

@@ -24,8 +24,8 @@ pub impl Option {
 /*The Result type in Rust provides various methods for error handling, including is_ok, is_err, map, and_then, and or_else. These methods allow you to check the result's status, transform values, and handle errors more effectively*/
 
 pub union Result {
-    Error($E);
     Ok($O);
+    Error($E);
 }
 
 pub impl Result {
