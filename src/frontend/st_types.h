@@ -63,6 +63,7 @@ struct ST_ty_t {
     b8 is_noreturn;
     ST_ty_state_t state;
     b8 is_trait_witness;
+    b8 is_erased_witness;
     ST_decl_t *trait_decl;
     b8 is_standin;
     b8 standin_open;

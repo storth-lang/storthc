@@ -2342,13 +2342,8 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
                         ST_sv_args(m->type_name), decl_generics.count, generics.count);
             continue;
         }
-        if (!d->fn.sig.params.count ||
-            !ST_string_eq_cstr(d->fn.sig.params.items[0].name, "self")) {
-            ST_perr_tok_at(p, file, d->line, d->col,
-                           "method '" ST_sv_fmt "' must take 'self' as its first parameter",
-                           ST_sv_args(d->name));
-            continue;
-        }
+        b8 is_static = !d->fn.sig.params.count ||
+                       !ST_string_eq_cstr(d->fn.sig.params.items[0].name, "self");
         ST_forrange(0, d->fn.sig.params.count)
             ST_impl_rewrite_te(p, d->fn.sig.params.items[i].te, m->type_name, &generics);
         ST_forrange(0, d->fn.sig.rets.count)
@@ -2362,7 +2357,14 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
                 ST_da_append_arena(p->arena, &d->fn.sig.generics, generics.items[i]);
         }
         d->display_name = d->name;
-        d->fn.is_method = 1;
+        if (is_static) {
+            ST_tyexpr_t *self_te = ST_tyexpr_new(p->arena, ST_TE_NAME, d->line, d->col);
+            self_te->name = ST_cstr_to_str("Self");
+            ST_impl_rewrite_te(p, self_te, m->type_name, &generics);
+            d->fn.self_te = self_te;
+        } else {
+            d->fn.is_method = 1;
+        }
         d->name = ST_mangle_method_name(p->arena, m->type_name, d->name);
         d->file = file;
         ST_da_append_arena(p->arena, &out->decls, d);

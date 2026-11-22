@@ -233,6 +233,9 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
         return 1;
     if (ST_ty_is_any(se, to))
         return 1;
+    if (to->is_erased_witness && from->is_trait_witness && !from->is_erased_witness &&
+        from->trait_decl == to->trait_decl && from->fields.count == to->fields.count)
+        return 1;
     if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_INT)
         return 1;
     if (from->kind == ST_TY_UNTYPED_INT && to->kind == ST_TY_ENUM)
@@ -889,6 +892,17 @@ static ST_sym_t *ST_find_witness(ST_sema_t *se, ST_string_t name, ST_ty_t *want_
     return NULL;
 }
 
+static ST_ty_t *ST_erased_witness_ty(ST_sema_t *se, ST_decl_t *trait, u32 line, u32 col) {
+    if (trait->trait_.generics.count != 1)
+        return NULL;
+    ST_tys_t args = {0};
+    ST_da_append_arena(se->arena, &args, se->tys.prim[ST_tvoid]);
+    ST_ty_t *t = ST_instantiate_trait_witness(se, trait, args, line, col);
+    if (t)
+        t->is_erased_witness = 1;
+    return t;
+}
+
 static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
     ST_sym_t *tsym = ST_sym_find(se, e->trait_impl.trait_name);
     if (!tsym || tsym->kind != ST_SYM_TYPE || !tsym->decl || tsym->decl->kind != ST_DE_TRAIT) {
@@ -1113,6 +1127,13 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                 ST_ty_t *at = ST_resolve_tyexpr(se, sym->decl->type_alias.te);
                 ST_alias_resolve_depth--;
                 return at;
+            }
+            if (sym->decl->kind == ST_DE_TRAIT) {
+                ST_ty_t *erased = ST_erased_witness_ty(se, sym->decl, te->line, te->col);
+                if (erased) {
+                    te->resolved = erased;
+                    return erased;
+                }
             }
             ST_strings_t *sym_generics = ST_decl_generics(sym->decl);
             if (se->generic_bindings && sym_generics && sym_generics->count) {
@@ -3194,7 +3215,8 @@ static b8 ST_try_method_call(ST_sema_t *se, ST_expr_t *e) {
     ST_sym_t *fsym = ST_sym_find_in(&se->globals, mangled);
     ST_sym_t *tsym = ST_sym_find_in(&se->templates, mangled);
     ST_decl_t *md = fsym && fsym->decl ? fsym->decl : tsym ? tsym->decl : NULL;
-    if (!md || md->kind != ST_DE_FN || !md->fn.sig.params.count)
+    if (!md || md->kind != ST_DE_FN || !md->fn.sig.params.count ||
+        !ST_string_eq_cstr(md->fn.sig.params.items[0].name, "self"))
         return 0;
 
     ST_tyexpr_t *recv_te = md->fn.sig.params.items[0].te;
@@ -3455,9 +3477,49 @@ static i32 ST_try_witness_generic_call(ST_sema_t *se, ST_expr_t *e) {
     return 1;
 }
 
+static b8 ST_try_static_method_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    ST_expr_t *base = callee->field.base;
+    if (!base || base->kind != ST_EX_IDENT)
+        return 0;
+    ST_sym_t *tsym0 = ST_sym_find(se, base->name);
+    if (!tsym0 || tsym0->kind != ST_SYM_TYPE || !tsym0->decl)
+        return 0;
+    ST_decl_t *td = tsym0->decl;
+    if (td->kind != ST_DE_STRUCT && td->kind != ST_DE_TAG_UNION)
+        return 0;
+    ST_string_t mname = callee->field.name;
+    ST_string_t tname = td->name;
+    u32 total = tname.len + 2 + mname.len;
+    u8 *buf = ST_arena_push(se->arena, total);
+    memcpy(buf, tname.data, tname.len);
+    buf[tname.len] = '_';
+    buf[tname.len + 1] = '_';
+    memcpy(buf + tname.len + 2, mname.data, mname.len);
+    ST_string_t mangled = {.data = buf, .len = total};
+    ST_sym_t *fsym = ST_sym_find_in(&se->globals, mangled);
+    ST_sym_t *tsym = ST_sym_find_in(&se->templates, mangled);
+    ST_decl_t *md = fsym && fsym->decl ? fsym->decl : tsym ? tsym->decl : NULL;
+    if (!md || md->kind != ST_DE_FN)
+        return 0;
+    if (md->fn.sig.params.count &&
+        ST_string_eq_cstr(md->fn.sig.params.items[0].name, "self")) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'" ST_sv_fmt "' takes 'self'; call it on a value of '" ST_sv_fmt "'",
+                      ST_sv_args(mname), ST_sv_args(base->name));
+        return 0;
+    }
+    callee->kind = ST_EX_IDENT;
+    callee->name = mangled;
+    return 1;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
+    if (callee && callee->kind == ST_EX_FIELD && callee->field.base &&
+        ST_try_static_method_call(se, e))
+        callee = e->call.callee;
     if (callee && callee->kind == ST_EX_FIELD && callee->field.base) {
         if (ST_try_trait_instance_call(se, e) < 0)
             return NULL;
@@ -4308,7 +4370,52 @@ static ST_ty_t *ST_type_index(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+static void ST_erase_witness(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
+    if (!slot || !*slot || !to || !to->is_erased_witness)
+        return;
+    ST_expr_t *v = *slot;
+    ST_ty_t *from = v->ty;
+    if (!from || from == to || !from->is_trait_witness || from->is_erased_witness ||
+        from->trait_decl != to->trait_decl || from->fields.count != to->fields.count)
+        return;
+    ST_expr_t *lit = ST_expr_new(se->arena, ST_EX_STRUCT_LIT, v->line, v->col);
+    lit->struct_lit.type_name = to->decl->name;
+    ST_forrange(0, to->fields.count) {
+        ST_expr_t *src = ST_clone_place(se, v);
+        if (!src) {
+            ST_diag_error(&se->diag, v->line, v->col,
+                          "cannot convert '%s' to '%s' here; store the value in a variable first",
+                          ST_tstr(se, from), ST_tstr(se, to));
+            return;
+        }
+        ST_expr_t *fld = ST_expr_new(se->arena, ST_EX_FIELD, v->line, v->col);
+        fld->field.base = src;
+        fld->field.name = from->fields.items[i].name;
+        ST_type_expr(se, fld);
+        ST_expr_t *val = fld;
+        if (fld->ty != to->fields.items[i].ty) {
+            ST_expr_t *c = ST_expr_new(se->arena, ST_EX_CAST, v->line, v->col);
+            ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, v->line, v->col);
+            te->name = ST_cstr_to_str("void");
+            te->resolved = to->fields.items[i].ty;
+            te->pinned = 1;
+            c->cast.operand = fld;
+            c->cast.to = te;
+            c->ty = to->fields.items[i].ty;
+            val = c;
+        }
+        ST_field_init_t fi = {.name = to->fields.items[i].name,
+                              .value = val,
+                              .line = v->line,
+                              .col = v->col};
+        ST_da_append_arena(se->arena, &lit->struct_lit.inits, fi);
+    }
+    lit->ty = to;
+    *slot = lit;
+}
+
 static void ST_box_any(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
+    ST_erase_witness(se, slot, to);
     if (!slot || !*slot || !ST_ty_is_any(se, to))
         return;
     ST_expr_t *v = *slot;
@@ -4408,7 +4515,7 @@ static ST_decl_t *ST_union_type_decl(ST_sema_t *se, ST_expr_t *e, ST_string_t *t
     if (!e || e->kind != ST_EX_IDENT)
         return NULL;
     if (ST_string_eq_cstr(e->name, "Self") && se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN &&
-        se->cur_fn_decl->fn.is_method) {
+        (se->cur_fn_decl->fn.is_method || se->cur_fn_decl->fn.self_te)) {
         ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
         te->name = e->name;
         ST_ty_t *st = ST_resolve_tyexpr(se, te);

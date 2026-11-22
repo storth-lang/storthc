@@ -530,3 +530,44 @@ pub struct in6_addr {
     }
 }
 
+
+pub extern fn ntohl(__netlong: u32) -> u32;
+
+pub extern fn ntohs(__netshort: u16) -> u16;
+
+pub extern fn htonl(__hostlong: u32) -> u32;
+
+pub extern fn htons(__hostshort: u16) -> u16;
+
+pub extern fn bindresvport(__sockfd: i32, __sock_in: *sockaddr_in) -> i32;
+
+pub extern fn bindresvport6(__sockfd: i32, __sock_in: *sockaddr_in6) -> i32;
+
+pub extern fn inet_addr(__cp: *char) -> u32;
+
+pub extern fn inet_lnaof(__in: in_addr) -> u32;
+
+pub extern fn inet_makeaddr(__net: u32, __host: u32) -> in_addr;
+
+pub extern fn inet_netof(__in: in_addr) -> u32;
+
+pub extern fn inet_network(__cp: *char) -> u32;
+
+pub extern fn inet_ntoa(__in: in_addr) -> *char;
+
+pub extern fn inet_pton(__af: i32, __cp: *char, __buf: *void) -> i32;
+
+pub extern fn inet_ntop(__af: i32, __cp: *void, __buf: *char, __len: u32) -> *char;
+
+pub extern fn inet_aton(__cp: *char, __inp: *in_addr) -> i32;
+
+pub extern fn inet_neta(__net: u32, __buf: *char, __len: u64) -> *char;
+
+pub extern fn inet_net_ntop(__af: i32, __cp: *void, __bits: i32, __buf: *char, __len: u64) -> *char;
+
+pub extern fn inet_net_pton(__af: i32, __cp: *char, __buf: *void, __len: u64) -> i32;
+
+pub extern fn inet_nsap_addr(__cp: *char, __buf: *u8, __len: i32) -> u32;
+
+pub extern fn inet_nsap_ntoa(__len: i32, __cp: *u8, __buf: *char) -> *char;
+

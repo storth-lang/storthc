@@ -46,7 +46,7 @@ pub impl Result {
     fn unwrap(self: Self) -> $O {
         if self {
             case Ok(v) { return v; }
-            default { return cast($O)null; } 
+            default { abort(); } 
         }
     }
 

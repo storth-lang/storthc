@@ -33,3 +33,18 @@ pub fn contains(s: string, c: char) -> bool {
     }
     return false;
 }
+
+pub fn ends_with(buf: []char, str: string) -> bool {
+    str_len := str.len - 1;
+    buf_len := buf.len - 1;
+    while str_len > 0 and buf_len > 0{
+        if buf[buf_len] == str[str_len]  {
+            buf_len -= 1;
+            str_len -= 1;
+            continue;
+        } else { return false; }
+    }
+    
+    return true;
+}
+

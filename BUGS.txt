@@ -137,3 +137,12 @@ pub fn main() -> i32 {
 }
 
 ```
+storthc build exe --quiet non_quit.st -o build/non_quit                                         /mnt/extra/Programming/webserver/non_quit.st:39:19: error: 'Allocator__Allocator$Libc$1$clear' argument 2 expects '*[]char', got '*[1024]char'                                                    37 |         println("Wrote {} bytes => {}", bytes, msg);                                       38 |
+  39 |         mem.clear(&buffer, 0x00);
+     |                   ^                                                                      /home/segfault/.local/storthc/modules/Allocator/module.st:32:8: note: 'Allocator__Allocator$Libc$1$clear' is declared here                                                                        30 |     }
+  31 |                                                                                            32 |     fn clear(self: *Self, s: *[]$P, c: i32) -> void {
+     |        ^
+storthc: error: semantic analysis for 'non_quit.st' failed
+make: *** [Makefile:18: non_quit] Error 1
+segfault@penger $ vim
+In freaking traits a []slice and [N] are d/t type though we can pass [N] into a function that accepts []

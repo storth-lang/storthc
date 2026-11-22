@@ -1,6 +1,7 @@
 enum_flag logKind {
     Todo,
     Error,
+    Assert,
 }
 
 struct Out {
@@ -382,8 +383,10 @@ fn die(type: logKind, loc: Source_Code_Location, fmt: string, args: $T...) {
     if type {
         case logKind.Todo then out_str(&o, "TODO: ");
         case logKind.Error then out_str(&o, "ERROR: ");
+        case logKind.Assert then out_str(&o, "ASSERT: ");
     }
     format_args(&o, ...args);
+    out_char(&o, '\n');
     out_flush(&o);
     sys_exit(1);
 }
@@ -394,4 +397,9 @@ pub fn todo(msg: string, loc := #caller_location, args: $T...) -> void {
 
 pub fn log_error(msg: string, loc := #caller_location, args: $T...) -> void {
     die(logKind.Error, loc, msg, ...args);
+}
+
+pub fn assert(cond: bool, msg: string = "assertion failed", loc := #caller_location, args: $T...) -> void {
+    if cond then return;
+    die(logKind.Assert, loc, msg, ...args);
 }
