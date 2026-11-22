@@ -2142,12 +2142,19 @@ static ST_decl_t *ST_parse_struct_decl(ST_parser_t *p, ST_string_t name, u32 lin
     d->name = name;
     if (!ST_parse_generic_list(p, &d->struct_.generics))
         return NULL;
-    if (ST_at_symbol(p, "#pad")) {
-        d->struct_.packing = ST_PACK_C;
-        p->pos++;
-    } else if (ST_at_symbol(p, "#pack")) {
-        d->struct_.packing = ST_PACK_PACKED;
-        p->pos++;
+    for (;;) {
+        if (ST_at_symbol(p, "#pad")) {
+            d->struct_.packing = ST_PACK_C;
+            p->pos++;
+        } else if (ST_at_symbol(p, "#pack")) {
+            d->struct_.packing = ST_PACK_PACKED;
+            p->pos++;
+        } else if (ST_at_symbol(p, "#union")) {
+            d->struct_.is_union = 1;
+            p->pos++;
+        } else {
+            break;
+        }
     }
     if (!ST_expect_sym(p, "{"))
         return NULL;

@@ -328,6 +328,7 @@ static void ST_modrw_expr(ST_module_rw_t *rw, ST_expr_t *e) {
                     }
                     e->kind = ST_EX_IDENT;
                     e->name = *(ST_string_t *)exp.tag;
+                    e->from_module = 1;
                     break;
                 }
             }

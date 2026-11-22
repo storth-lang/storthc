@@ -84,6 +84,22 @@ static ST_sym_t *ST_sym_find(ST_sema_t *se, ST_string_t name) {
     return ST_sym_find_in(&se->types, name);
 }
 
+// @note: like ST_sym_find, but for an identifier the module pass produced from 'Mod.name'.
+// Such a name was written with an explicit module qualifier, so locals, nested functions
+// and trait-witness methods in scope must not capture it (e.g. 'Os.close(fd)' inside the
+// witness method 'close').
+static ST_sym_t *ST_sym_find_expr(ST_sema_t *se, ST_expr_t *e) {
+    if (e->from_module) {
+        ST_sym_t *sym = ST_sym_find_in(&se->globals, e->name);
+        if (sym)
+            return sym;
+        sym = ST_sym_find_in(&se->types, e->name);
+        if (sym)
+            return sym;
+    }
+    return ST_sym_find(se, e->name);
+}
+
 static ST_sym_t *ST_sym_new(ST_sema_t *se, ST_sym_kind_t kind, ST_string_t name, ST_decl_t *decl,
                             ST_ty_t *t, u32 line, u32 col) {
     ST_sym_t *sym = ST_arena_push_zeroed(se->arena, sizeof(*sym));
@@ -634,6 +650,7 @@ static ST_ty_t *ST_instantiate_struct(ST_sema_t *se, ST_decl_t *tmpl, ST_tys_t a
     id->file = tmpl->file;
     id->is_pub = tmpl->is_pub;
     id->struct_.packing = tmpl->struct_.packing;
+    id->struct_.is_union = tmpl->struct_.is_union;
     id->struct_.fields = tmpl->struct_.fields;
     id->display_name = ST_instance_display_name(se, ST_decl_display_name(tmpl), args);
 
@@ -2426,7 +2443,8 @@ static u32 ST_align_up(u32 x, u32 a) {
 static void ST_complete_struct(ST_sema_t *se, ST_ty_t *t) {
     ST_decl_t *d = t->decl;
     b8 packed = d->struct_.packing == ST_PACK_PACKED;
-    u32 off = 0, align = 1;
+    b8 is_union = d->struct_.is_union;
+    u32 off = 0, align = 1, max_size = 0;
 
     ST_forrange(0, d->struct_.fields.count) {
         ST_field_spec_t *f = &d->struct_.fields.items[i];
@@ -2440,6 +2458,19 @@ static void ST_complete_struct(ST_sema_t *se, ST_ty_t *t) {
 
         ST_complete_ty(se, ft);
         u32 a = packed ? 1 : (ft->align ? ft->align : 1);
+
+        if (is_union) {
+            // C union layout: every field starts at offset 0, the size is that of
+            // the largest field rounded up to the strictest alignment
+            ST_ty_field_t field = {.name = f->name, .ty = ft, .offset = 0};
+            ST_da_append_arena(se->arena, &t->fields, field);
+            if (ft->size > max_size)
+                max_size = ft->size;
+            if (a > align)
+                align = a;
+            continue;
+        }
+
         off = ST_align_up(off, a);
 
         ST_ty_field_t field = {.name = f->name, .ty = ft, .offset = off};
@@ -2450,7 +2481,7 @@ static void ST_complete_struct(ST_sema_t *se, ST_ty_t *t) {
             align = a;
     }
     t->align = align;
-    t->size = ST_align_up(off, align);
+    t->size = ST_align_up(is_union ? max_size : off, align);
 }
 
 static void ST_complete_tag_union(ST_sema_t *se, ST_ty_t *t) {
@@ -2531,7 +2562,7 @@ static ST_ty_t *ST_ty_of_const(ST_sema_t *se, ST_sym_t *sym) {
 }
 
 static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
-    ST_sym_t *sym = ST_sym_find(se, e->name);
+    ST_sym_t *sym = ST_sym_find_expr(se, e);
     if (!sym) {
         ST_diag_error(&se->diag, e->line, e->col, "use of undeclared identifier '" ST_sv_fmt "'",
                       ST_sv_args(e->name));
@@ -2599,7 +2630,7 @@ static const char *ST_expr_kind_desc(ST_expr_t *e) {
 static b8 ST_expr_is_addressable(ST_sema_t *se, ST_expr_t *e) {
     switch (e->kind) {
         case ST_EX_IDENT: {
-            ST_sym_t *sym = ST_sym_find(se, e->name);
+            ST_sym_t *sym = ST_sym_find_expr(se, e);
             if (!sym)
                 return 0;
             switch (sym->kind) {
@@ -3537,7 +3568,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     if (callee && callee->kind == ST_EX_IDENT &&
         ST_type_call_try_overload(se, e, callee, &sym, &fnty)) {
     } else if (callee && callee->kind == ST_EX_IDENT) {
-        sym = ST_sym_find(se, callee->name);
+        sym = ST_sym_find_expr(se, callee);
         if (sym && sym->kind == ST_SYM_FN && sym->decl &&
             !ST_string_eq(callee->name, sym->decl->name))
             callee->name = sym->decl->name;
@@ -4902,6 +4933,23 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         if (expect_info && expect_info->tmpl == lit_tmpl->decl)
             return ST_type_union_lit(se, e, expect);
         return ST_infer_union_lit(se, e, lit_tmpl->decl);
+    } else if (ST_string_eq_cstr(e->struct_lit.type_name, "Self") && se->cur_fn_decl &&
+               se->cur_fn_decl->kind == ST_DE_FN &&
+               (se->cur_fn_decl->fn.is_method || se->cur_fn_decl->fn.self_te)) {
+        // 'Self { .. }' inside a method or a trait-witness method: build the implementing type
+        ST_tyexpr_t *ste = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
+        ste->name = e->struct_lit.type_name;
+        ST_ty_t *st = ST_resolve_tyexpr(se, ste);
+        if (!st)
+            return NULL;
+        if (st->kind == ST_TY_TAG_UNION)
+            return ST_type_union_lit(se, e, st);
+        if (st->kind != ST_TY_STRUCT) {
+            ST_diag_error(&se->diag, e->line, e->col, "'Self' is '%s', which is not a struct type",
+                          ST_tstr(se, st));
+            return NULL;
+        }
+        t = st;
     } else if (ST_string_eq_cstr(e->struct_lit.type_name, "string")) {
         ST_expr_t *ptr_e = NULL, *len_e = NULL;
         ST_forrange(0, e->struct_lit.inits.count) {
@@ -5003,6 +5051,17 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
             }
         }
         return t;
+    }
+
+    if (t && t->kind == ST_TY_STRUCT && t->decl && t->decl->kind == ST_DE_STRUCT &&
+        t->decl->struct_.is_union && e->struct_lit.inits.count > 1) {
+        ST_field_init_t *extra = &e->struct_lit.inits.items[1];
+        ST_diag_error(&se->diag, extra->line, extra->col,
+                      "'" ST_sv_fmt "' is a #union, a literal can initialize only one field",
+                      ST_sv_args(ST_decl_display_name(t->decl)));
+        ST_diag_note_in_file(se, t->decl->file, t->decl->line, t->decl->col,
+                             "'" ST_sv_fmt "' is declared here",
+                             ST_sv_args(ST_decl_display_name(t->decl)));
     }
 
     ST_forrange(0, e->struct_lit.inits.count) {

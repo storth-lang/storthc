@@ -457,8 +457,8 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth) {
             const char *pack = d->struct_.packing == ST_PACK_C        ? " #pad"
                 : d->struct_.packing == ST_PACK_PACKED ? " #pack"
                 : "";
-            fprintf(out, "struct " ST_sv_fmt "%s%s\n", ST_sv_args(d->name), pack,
-                    d->is_pub ? " pub" : "");
+            fprintf(out, "struct " ST_sv_fmt "%s%s%s\n", ST_sv_args(d->name), pack,
+                    d->struct_.is_union ? " #union" : "", d->is_pub ? " pub" : "");
             ST_forrange(0, d->struct_.fields.count) {
                 ST_field_spec_t *f = &d->struct_.fields.items[i];
                 ST_indent(out, depth + 1);

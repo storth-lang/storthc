@@ -132,6 +132,10 @@ struct ST_expr_t {
     ST_expr_kind_t kind;
     ST_ty_t *ty;
     u32 line, col;
+    // set by the module pass when 'Mod.name' was rewritten to the bare/mangled 'name':
+    // it must resolve to the module-level symbol, never to a local or witness method
+    // that happens to share the name
+    b8 from_module;
     union {
         i64 ival;
         f64 fval;
@@ -418,6 +422,7 @@ struct ST_decl_t {
     union {
         struct {
             ST_packing_t packing;
+            b8 is_union; // 'struct Foo #union { .. }': C union layout, all fields at offset 0
             ST_field_specs_t fields;
             ST_strings_t generics;
         } struct_;
