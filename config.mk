@@ -10,5 +10,6 @@ VERSION_PATCH := 0
 
 STACK_SIZE          := 268435456 # 256 * 1024 * 1024
 DYNAMIC_LINKER_PATH := /usr/lib64/ld-linux-x86-64.so.2
+LIBC_LIBRARY_PATH   := /usr/lib
 
 BIND_GENERATOR := 1
