@@ -57,6 +57,10 @@
 #include "utils/st_clang_bindgen.h"
 #endif
 
+#ifndef ST_DYNAMIC_LINKER_PATH
+#define ST_DYNAMIC_LINKER_PATH "/usr/lib64/ld-linux-x86-64.so.2"
+#endif
+
 #define ST_STR2(x) #x
 #define ST_STR(x) ST_STR2(x)
 #define STORTHC_VERSION_STRING                                                                 \
@@ -259,7 +263,7 @@ static void st_append_link(ST_arena_t *arena, ST_procs_t *procs, const char *out
     opt.args[n++] = "-o";
     opt.args[n++] = out_path;
     opt.args[n++] = obj_path;
-    opt.args[n++] = "--dynamic-linker=/usr/lib64/ld-linux-x86-64.so.2";
+    opt.args[n++] = "--dynamic-linker=" ST_DYNAMIC_LINKER_PATH;
     opt.args[n++] = "-lc";
 #endif
     if (ldflags)
