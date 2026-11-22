@@ -625,3 +625,4 @@ pub extern fn crypt(__key: *char, __salt: *char) -> *char;
 
 pub extern fn getentropy(__buffer: *void, __length: u64) -> i32;
 
+pub extern fn waitpid(__pid: i32, __stat_loc: *i32, __options: i32) -> i32;

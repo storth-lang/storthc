@@ -1,3 +1,5 @@
+#load "log.st";
+
 pub union Option {
     None;
     Some($T);

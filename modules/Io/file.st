@@ -9,6 +9,7 @@
 // Functions -> camelCase.
 
 #import "Libc";
+#import "Error";
 #import "Allocator";
 #import "String";
 

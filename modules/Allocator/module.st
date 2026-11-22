@@ -26,7 +26,7 @@ pub mem := Allocator(Libc) {
         return .Some(p);
     }
     fn copy(self: *Self, ptr: *void, ptr2 : *void, size : u32) -> void {
-        memcpy(ptr, ptr2, cast(u64)size);
+        Libc.memcpy(ptr, ptr2, cast(u64)size);
     }
     fn deallocate(self: *Self, ptr: *void) -> void {
         if ptr != null {
@@ -35,3 +35,5 @@ pub mem := Allocator(Libc) {
         }
     }
 };
+
+#load "Flat_Pool.st";
