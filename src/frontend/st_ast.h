@@ -62,6 +62,8 @@ struct ST_tyexpr_t {
     ST_tyexprs_t fn_rets;
     b8 fn_is_variadic;
     b8 fn_is_noreturn;
+    b8 fn_is_closure;
+    b8 fn_closure_ref;
     b8 is_generic_param;
     b8 is_negeated_constraint;
     ST_tyexprs_t generic_constraints; // '$T(A | B)'
@@ -411,6 +413,23 @@ typedef struct {
     u32 count, capacity;
 } ST_trait_methods_t;
 
+// One entry of a capture list: 'fn(..) |x, &y| { .. }'. 'x' is copied into the closure when it is
+// written, '&y' is captured by reference so the body can modify the original.
+typedef struct {
+    ST_string_t name;
+    b8 by_ref;
+    u32 line, col;
+    ST_expr_t *src; // the identifier naming the captured variable, in the enclosing scope, or for an
+                    // 'name: type = value' capture (is_init) the value expression
+    b8 is_init;         // 'name: type = value': a value written in the list, not an existing variable
+    ST_tyexpr_t *te;    // its declared type, NULL to take the type of the value
+} ST_capture_t;
+
+typedef struct {
+    ST_capture_t *items;
+    u32 count, capacity;
+} ST_captures_t;
+
 struct ST_decl_t {
     ST_decl_kind_t kind;
     ST_string_t name;
@@ -425,6 +444,10 @@ struct ST_decl_t {
             b8 is_union; // 'struct Foo #union { .. }': C union layout, all fields at offset 0
             ST_field_specs_t fields;
             ST_strings_t generics;
+            ST_string_t closure_fn; // set on the environment struct synthesized for a capturing
+                                    // lambda: the name of the hoisted fn it is the first arg of
+            b8 closure_ref;
+            b8 closure_erased;
         } struct_;
         struct {
             b8 is_flag;
@@ -465,6 +488,10 @@ struct ST_decl_t {
             ST_string_t bound_str_value; // the literal value bound at this call site
             b8 has_call_site;
             b8 is_method;
+            b8 is_lambda; // anonymous 'fn(..) { .. }' expression, hoisted to a top-level fn by the parser
+            b8 closure_glue;
+            b8 lambda_done; // semantic analysis already turned this capturing lambda into a closure
+            ST_captures_t caps; // capture list of a lambda or nested fn: 'fn(..) |x, &y| { .. }'
             ST_tyexpr_t *self_te;
             ST_strings_t where_static_params;
             ST_strings_t where_static_syms;
@@ -512,5 +539,8 @@ void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth);
 void ST_dump_stmt(FILE *out, ST_stmt_t *s, u32 depth);
 void ST_dump_expr(FILE *out, ST_expr_t *e, u32 depth);
 void ST_dump_tyexpr(FILE *out, ST_tyexpr_t *te);
+
+#define ST_FN_UNFINISHED_LAMBDA(d) \
+    ((d)->kind == ST_DE_FN && (d)->fn.caps.count && !(d)->fn.lambda_done)
 
 #endif

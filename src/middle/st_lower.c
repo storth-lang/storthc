@@ -4098,7 +4098,8 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
 
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
-        if (d->kind == ST_DE_FN && (d->fn.sig.generics.count || d->fn.sig.is_comptime))
+        if (d->kind == ST_DE_FN && (d->fn.sig.generics.count || d->fn.sig.is_comptime ||
+                                    ST_FN_UNFINISHED_LAMBDA(d)))
             continue;
         if (d->kind == ST_DE_FN)
             ST_lower_register_fn(&c, d->name, &d->fn.sig, d->is_pub, d->fn.is_prototype);
@@ -4138,7 +4139,8 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
 
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
-        if (d->kind == ST_DE_FN && (d->fn.sig.generics.count || d->fn.sig.is_comptime))
+        if (d->kind == ST_DE_FN && (d->fn.sig.generics.count || d->fn.sig.is_comptime ||
+                                    ST_FN_UNFINISHED_LAMBDA(d)))
             continue;
         if (d->kind == ST_DE_FN)
             ST_lower_fn_body(&c, d);
