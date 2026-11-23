@@ -241,6 +241,8 @@ static b8 ST_ty_is_any(ST_sema_t *se, ST_ty_t *t) {
 }
 
 static void ST_box_any(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to);
+static b8 ST_closure_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to);
+static ST_ty_t *ST_closure_erased_ty(ST_sema_t *se, ST_ty_t *sig, b8 is_ref, u32 line, u32 col);
 
 static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
     if (!from || !to)
@@ -266,6 +268,8 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
     if (from->kind == ST_TY_ARRAY && to->kind == ST_TY_SLICE && from->inner == to->inner)
         return 1;
     if (from->kind == ST_TY_DYN_ARRAY && to->kind == ST_TY_SLICE && from->inner == to->inner)
+        return 1;
+    if (ST_closure_coerces(se, from, to))
         return 1;
     if (from->kind == ST_TY_FN && to->kind == ST_TY_FN)
         return ST_ty_equal(from, to);
@@ -1192,6 +1196,14 @@ static ST_ty_t *ST_resolve_tyexpr_raw(ST_sema_t *se, ST_tyexpr_t *te) {
                 ST_da_append_arena(se->arena, &t->rets, rt);
             }
 
+            if (te->fn_is_closure) {
+                ST_forrange(0, t->params.count) if (!t->params.items[i]) return NULL;
+                ST_forrange(0, t->rets.count) if (!t->rets.items[i]) return NULL;
+                ST_ty_t *ct = ST_closure_erased_ty(se, t, te->fn_closure_ref, te->line, te->col);
+                if (ct && !se->generic_bindings && !se->in_standin)
+                    te->resolved = ct;
+                return ct;
+            }
             return t;
         }
         case ST_TE_TYPEOF:
@@ -2561,15 +2573,1198 @@ static ST_ty_t *ST_ty_of_const(ST_sema_t *se, ST_sym_t *sym) {
     return sym->t;
 }
 
+// ---------------------------------------------------------------------------------------
+// Closures: lambdas (and nested fns) with a capture list, 'fn(..) |x, &y| { .. }'.
+//
+// The parser hoists every lambda to a top-level function and leaves an identifier naming
+// it. That is all a lambda without a capture list needs. With one, the identifier is
+// rewritten here, when the enclosing function is checked and the types of the captured
+// variables are known:
+//
+//   * a struct 'NAME$env' is synthesized, one field per captured variable: the value for
+//     'x', a pointer to the variable for '&y';
+//   * the hoisted function gets that struct as a new first parameter. For a capture 'x' its
+//     body starts with 'x := env.x;', a copy only it can see. For '&y' every use of 'y' in
+//     the body becomes '*env.y', so the original is read and written;
+//   * the lambda expression becomes the literal 'NAME$env { x = x, y = &y }';
+//   * calling a value of such a struct type, 'f(3)', becomes 'NAME(f, 3)'.
+//
+// A closure is an ordinary struct value: it can be copied, stored in locals and passed to
+// generic ('$T') parameters. It is *not* a function pointer, so it can't be passed where
+// a 'fn(..)' type is expected. A '&y' capture points into the frame that wrote the
+// lambda, so the closure must not outlive that function.
+// ---------------------------------------------------------------------------------------
+static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig);
+
+typedef struct {
+    ST_sema_t *se;
+    ST_strings_t declared; // locals the body declares, in textual order so far
+    ST_strings_t refs;     // '&y' captures: uses become '*env.y'
+    ST_strings_t vals;     // 'x' captures: read only
+    ST_tys_t val_tys;
+    ST_string_t env;       // name of the hidden parameter
+    u32 errors;
+    u32 tmp;
+} ST_lam_rw_t;
+
+static b8 ST_lam_has(ST_strings_t *l, ST_string_t n) {
+    ST_forrange(0, l->count) if (ST_string_eq(l->items[i], n)) return 1;
+    return 0;
+}
+
+static void ST_lam_declare(ST_lam_rw_t *c, ST_string_t n) {
+    if (n.len && !ST_lam_has(&c->declared, n))
+        ST_da_append_arena(c->se->arena, &c->declared, n);
+}
+
+static void ST_lam_rw_expr(ST_lam_rw_t *c, ST_expr_t *e);
+static void ST_lam_rw_stmt(ST_lam_rw_t *c, ST_stmt_t *s);
+
+static void ST_lam_rw_stmts(ST_lam_rw_t *c, ST_stmts_t *b) {
+    ST_forrange(0, b->count) ST_lam_rw_stmt(c, b->items[i]);
+}
+
+static void ST_lam_cap_error(ST_lam_rw_t *c, u32 line, u32 col, ST_string_t name) {
+    ST_diag_error(&c->se->diag, line, col,
+                  "'" ST_sv_fmt "' is captured by value here, so assigning to it changes only the "
+                  "lambda's own copy",
+                  ST_sv_args(name));
+    ST_diag_note(&c->se->diag, line, col,
+                 "capture it by reference to modify the original: '|&" ST_sv_fmt "|'",
+                 ST_sv_args(name));
+    c->errors++;
+}
+
+enum { ST_LAM_VALUE, ST_LAM_MEMORY, ST_LAM_UNKNOWN, ST_LAM_NONE };
+
+static b8 ST_lam_field_ty(ST_sema_t *se, ST_ty_t *t, ST_string_t name, ST_ty_t **out) {
+    if (!t || t->kind != ST_TY_STRUCT)
+        return 0;
+    ST_complete_ty(se, t);
+    ST_forrange(0, t->fields.count) {
+        if (ST_string_eq(t->fields.items[i].name, name)) {
+            *out = t->fields.items[i].ty;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static u32 ST_lam_chain(ST_lam_rw_t *c, ST_expr_t *e, ST_ty_t **t, ST_expr_t **root) {
+    switch (e->kind) {
+        case ST_EX_IDENT:
+        *root = e;
+        if (ST_lam_has(&c->declared, e->name))
+            return ST_LAM_NONE;
+        ST_forrange(0, c->vals.count) {
+            if (ST_string_eq(c->vals.items[i], e->name)) {
+                *t = c->val_tys.items[i];
+                return ST_LAM_VALUE;
+            }
+        }
+        return ST_LAM_NONE;
+        case ST_EX_FIELD: {
+            u32 r = ST_lam_chain(c, e->field.base, t, root);
+            if (r != ST_LAM_VALUE)
+                return r;
+            if (*t && (*t)->kind == ST_TY_PTR)
+                return ST_LAM_MEMORY;
+            return ST_lam_field_ty(c->se, *t, e->field.name, t) ? ST_LAM_VALUE : ST_LAM_UNKNOWN;
+        }
+        case ST_EX_INDEX: {
+            u32 r = ST_lam_chain(c, e->index.base, t, root);
+            if (r != ST_LAM_VALUE)
+                return r;
+            if (!*t)
+                return ST_LAM_UNKNOWN;
+            if ((*t)->kind == ST_TY_PTR || (*t)->kind == ST_TY_SLICE ||
+                (*t)->kind == ST_TY_DYN_ARRAY)
+                return ST_LAM_MEMORY;
+            if ((*t)->kind == ST_TY_ARRAY) {
+                *t = (*t)->inner;
+                return ST_LAM_VALUE;
+            }
+            return ST_LAM_UNKNOWN;
+        }
+        case ST_EX_UNARY:
+        return ST_LAM_MEMORY;
+        default:
+        return ST_LAM_NONE;
+    }
+}
+
+static void ST_lam_check_assign(ST_lam_rw_t *c, ST_expr_t *lhs) {
+    ST_ty_t *t = NULL;
+    ST_expr_t *root = NULL;
+    u32 r = ST_lam_chain(c, lhs, &t, &root);
+    if (r == ST_LAM_VALUE || r == ST_LAM_UNKNOWN)
+        ST_lam_cap_error(c, lhs->line, lhs->col, root->name);
+}
+
+static ST_stmt_t *ST_lam_assign_stmt(ST_lam_rw_t *c, ST_expr_t *lhs, ST_expr_t *rhs, u32 line,
+                                     u32 col) {
+    ST_stmt_t *a = ST_stmt_new(c->se->arena, ST_ST_ASSIGN, line, col);
+    a->assign.lhs = lhs;
+    a->assign.op = (ST_string_t){.data = (u8 *)"=", .len = 1};
+    a->assign.rhs = rhs;
+    return a;
+}
+
+static void ST_lam_split_multi(ST_lam_rw_t *c, ST_stmt_t *s) {
+    u32 n = s->multi.n_names;
+    b8 from_call = n > 1 && s->multi.values.count == 1 && s->multi.values.items[0]->kind == ST_EX_CALL;
+    if (!from_call && s->multi.values.count != n) {
+        ST_diag_error(&c->se->diag, s->line, s->col, "expected %u value%s, got %u", n,
+                      n == 1 ? "" : "s", s->multi.values.count);
+        c->errors++;
+        return;
+    }
+    u32 line = s->line, col = s->col;
+    ST_string_t *names = s->multi.names;
+    ST_exprs_t values = s->multi.values;
+    u32 id = ++c->tmp;
+
+    ST_string_t *tmps = ST_arena_push(c->se->arena, sizeof(*tmps) * n);
+    ST_forrange(0, n) {
+        char buf[48];
+        int len = snprintf(buf, sizeof buf, "lambda$m%u_%u", id, i);
+        u8 *nb = ST_arena_push(c->se->arena, (u32)len);
+        memcpy(nb, buf, (u32)len);
+        tmps[i] = (ST_string_t){.data = nb, .len = (u32)len};
+    }
+
+    ST_stmts_t blk = {0};
+    ST_stmt_t *bind = ST_stmt_new(c->se->arena, ST_ST_MULTI_BIND, line, col);
+    bind->multi.names = tmps;
+    bind->multi.n_names = n;
+    bind->multi.values = values;
+    bind->multi.declare = 1;
+    ST_da_append_arena(c->se->arena, &blk, bind);
+
+    ST_forrange(0, n) {
+        ST_expr_t *lhs = ST_expr_new(c->se->arena, ST_EX_IDENT, line, col);
+        lhs->name = names[i];
+        ST_lam_rw_expr(c, lhs);
+        ST_expr_t *rhs = ST_expr_new(c->se->arena, ST_EX_IDENT, line, col);
+        rhs->name = tmps[i];
+        ST_da_append_arena(c->se->arena, &blk, ST_lam_assign_stmt(c, lhs, rhs, line, col));
+    }
+    s->kind = ST_ST_BLOCK;
+    s->block = blk;
+}
+
+static void ST_lam_rw_expr(ST_lam_rw_t *c, ST_expr_t *e) {
+    if (!e)
+        return;
+    switch (e->kind) {
+        case ST_EX_IDENT: {
+            ST_sym_t *g = ST_sym_find_in(&c->se->globals, e->name);
+            if (g && g->kind == ST_SYM_FN && g->decl && g->decl->kind == ST_DE_FN &&
+                g->decl->fn.is_lambda) {
+                // a lambda written inside this one: what it captures is read here, so
+                // 'src' is in this body's terms and may need the same rewriting
+                ST_forrange(0, g->decl->fn.caps.count) ST_lam_rw_expr(c, g->decl->fn.caps.items[i].src);
+                return;
+            }
+            if (ST_lam_has(&c->refs, e->name) && !ST_lam_has(&c->declared, e->name)) {
+                ST_expr_t *base = ST_expr_new(c->se->arena, ST_EX_IDENT, e->line, e->col);
+                base->name = c->env;
+                ST_expr_t *fld = ST_expr_new(c->se->arena, ST_EX_FIELD, e->line, e->col);
+                fld->field.base = base;
+                fld->field.name = e->name;
+                u32 line = e->line, col = e->col;
+                memset(e, 0, sizeof *e);
+                e->kind = ST_EX_UNARY;
+                e->line = line;
+                e->col = col;
+                e->unary.op = (ST_string_t){.data = (u8 *)"*", .len = 1};
+                e->unary.operand = fld;
+            }
+            return;
+        }
+        case ST_EX_UNARY:
+        ST_lam_rw_expr(c, e->unary.operand);
+        return;
+        case ST_EX_BINARY:
+        ST_lam_rw_expr(c, e->bin.l);
+        ST_lam_rw_expr(c, e->bin.r);
+        return;
+        case ST_EX_CALL:
+        ST_lam_rw_expr(c, e->call.callee);
+        ST_forrange(0, e->call.args.count) ST_lam_rw_expr(c, e->call.args.items[i].value);
+        return;
+        case ST_EX_FIELD:
+        ST_lam_rw_expr(c, e->field.base);
+        return;
+        case ST_EX_INDEX:
+        ST_lam_rw_expr(c, e->index.base);
+        ST_lam_rw_expr(c, e->index.index);
+        return;
+        case ST_EX_CAST:
+        ST_lam_rw_expr(c, e->cast.operand);
+        return;
+        case ST_EX_STRUCT_LIT:
+        ST_forrange(0, e->struct_lit.inits.count) ST_lam_rw_expr(c, e->struct_lit.inits.items[i].value);
+        return;
+        case ST_EX_SIZEOF:
+        case ST_EX_TYPEOF:
+        case ST_EX_TYPEINFO:
+        case ST_EX_KIND:
+        case ST_EX_CSTR:
+        case ST_EX_FIELDS:
+        ST_lam_rw_expr(c, e->tyop.operand);
+        return;
+        case ST_EX_COMP_ERROR:
+        ST_forrange(0, e->comp_error.args.count) ST_lam_rw_expr(c, e->comp_error.args.items[i]);
+        return;
+        case ST_EX_STR_FROM_RAW:
+        ST_lam_rw_expr(c, e->str_from_raw.ptr);
+        ST_lam_rw_expr(c, e->str_from_raw.len);
+        return;
+        default:
+        return;
+    }
+}
+
+static void ST_lam_rw_stmt(ST_lam_rw_t *c, ST_stmt_t *s) {
+    if (!s)
+        return;
+    switch (s->kind) {
+        case ST_ST_EXPR:
+        case ST_ST_PACK_EXPAND:
+        ST_lam_rw_expr(c, s->expr);
+        return;
+        case ST_ST_DECL:
+        ST_lam_rw_expr(c, s->decl.init); // 'x := x + 1' reads the captured 'x'
+        ST_lam_declare(c, s->decl.name);
+        return;
+        case ST_ST_ASSIGN:
+        ST_lam_check_assign(c, s->assign.lhs);
+        ST_lam_rw_expr(c, s->assign.lhs);
+        ST_lam_rw_expr(c, s->assign.rhs);
+        return;
+        case ST_ST_MULTI_BIND:
+        ST_forrange(0, s->multi.values.count) ST_lam_rw_expr(c, s->multi.values.items[i]);
+        if (s->multi.declare) {
+            ST_forrange(0, s->multi.n_names) ST_lam_declare(c, s->multi.names[i]);
+        } else {
+            b8 any_ref = 0;
+            ST_forrange(0, s->multi.n_names) {
+                ST_string_t n = s->multi.names[i];
+                if (ST_lam_has(&c->declared, n))
+                    continue;
+                if (ST_lam_has(&c->vals, n))
+                    ST_lam_cap_error(c, s->line, s->col, n);
+                else if (ST_lam_has(&c->refs, n))
+                    any_ref = 1;
+            }
+            if (any_ref)
+                ST_lam_split_multi(c, s);
+        }
+        return;
+        case ST_ST_IF:
+        ST_lam_rw_expr(c, s->if_.cond);
+        ST_lam_rw_stmts(c, &s->if_.then_body);
+        ST_lam_rw_stmt(c, s->if_.else_stmt);
+        return;
+        case ST_ST_SWITCH:
+        ST_lam_rw_expr(c, s->switch_.cond);
+        ST_forrange(0, s->switch_.cases.count) {
+            ST_case_t *cs = &s->switch_.cases.items[i];
+            for (u32 k = 0; k < cs->values.count; k++)
+                ST_lam_rw_expr(c, cs->values.items[k]);
+            ST_lam_rw_stmts(c, &cs->body);
+        }
+        return;
+        case ST_ST_WHILE:
+        ST_lam_rw_expr(c, s->while_.cond);
+        ST_lam_rw_stmts(c, &s->while_.body);
+        return;
+        case ST_ST_FOR_RANGE:
+        ST_lam_rw_expr(c, s->for_range.lo);
+        ST_lam_rw_expr(c, s->for_range.hi);
+        ST_lam_declare(c, s->for_range.iter);
+        ST_lam_rw_stmts(c, &s->for_range.body);
+        return;
+        case ST_ST_FOR_ARRAY:
+        ST_lam_rw_expr(c, s->for_array.target);
+        ST_lam_declare(c, s->for_array.iter);
+        ST_lam_declare(c, s->for_array.spec_iter);
+        ST_lam_rw_stmts(c, &s->for_array.body);
+        return;
+        case ST_ST_RETURN:
+        ST_forrange(0, s->ret.values.count) ST_lam_rw_expr(c, s->ret.values.items[i]);
+        return;
+        case ST_ST_BLOCK:
+        case ST_ST_COMPTIME_BLOCK:
+        ST_lam_rw_stmts(c, &s->block);
+        return;
+        case ST_ST_DEFER:
+        ST_lam_rw_stmt(c, s->defer_stmt);
+        return;
+        default:
+        return;
+    }
+}
+
+static ST_string_t ST_lam_cstr(const char *c) {
+    return (ST_string_t){.data = (u8 *)c, .len = (u32)strlen(c)};
+}
+
+static ST_string_t ST_lam_cstr_n(ST_sema_t *se, const char *c, int n) {
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, c, (u32)n);
+    return (ST_string_t){.data = nb, .len = (u32)n};
+}
+
+static ST_tyexpr_t *ST_lam_te_from_ty(ST_sema_t *se, ST_ty_t *t, u32 line, u32 col) {
+    ST_tyexpr_t *te = NULL;
+    switch (t->kind) {
+        case ST_TY_PTR:
+        te = ST_tyexpr_new(se->arena, ST_TE_PTR, line, col);
+        te->inner = ST_lam_te_from_ty(se, t->inner, line, col);
+        break;
+        case ST_TY_ARRAY: {
+            te = ST_tyexpr_new(se->arena, ST_TE_ARRAY, line, col);
+            ST_expr_t *n = ST_expr_new(se->arena, ST_EX_INT, line, col);
+            n->ival = (i64)t->count;
+            n->ty = se->tys.untyped_int;
+            te->count_expr = n;
+            te->inner = ST_lam_te_from_ty(se, t->inner, line, col);
+            break;
+        }
+        case ST_TY_SLICE:
+        te = ST_tyexpr_new(se->arena, ST_TE_ARRAY, line, col);
+        te->inner = ST_lam_te_from_ty(se, t->inner, line, col);
+        break;
+        case ST_TY_DYN_ARRAY:
+        te = ST_tyexpr_new(se->arena, ST_TE_ARRAY, line, col);
+        te->is_dynamic = 1;
+        te->inner = ST_lam_te_from_ty(se, t->inner, line, col);
+        break;
+        case ST_TY_FN:
+        te = ST_tyexpr_new(se->arena, ST_TE_FN, line, col);
+        ST_forrange(0, t->params.count)
+            ST_da_append_arena(se->arena, &te->fn_params,
+                               ST_lam_te_from_ty(se, t->params.items[i], line, col));
+        ST_forrange(0, t->rets.count)
+            ST_da_append_arena(se->arena, &te->fn_rets,
+                               ST_lam_te_from_ty(se, t->rets.items[i], line, col));
+        te->fn_is_variadic = t->is_variadic;
+        te->fn_is_noreturn = t->is_noreturn;
+        break;
+        case ST_TY_STRUCT:
+        case ST_TY_ENUM:
+        case ST_TY_TAG_UNION:
+        te = ST_tyexpr_new(se->arena, ST_TE_NAME, line, col);
+        te->name = t->decl ? t->decl->name : ST_lam_cstr("capture");
+        break;
+        default:
+        te = ST_tyexpr_new(se->arena, ST_TE_NAME, line, col);
+        te->name = ST_lam_cstr(ST_ty_cstr(se->arena, t));
+        break;
+    }
+    te->resolved = t;
+    te->pinned = 1;
+    return te;
+}
+
+static ST_tyexpr_t *ST_lam_pin_te(ST_sema_t *se, ST_ty_t *t, ST_string_t name, u32 line, u32 col) {
+    ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, line, col);
+    te->name = name;
+    te->resolved = t;
+    te->pinned = 1;
+    return te;
+}
+
+// 'e' is an identifier naming the lambda 'lam', written in the enclosing function. If the
+// lambda has a capture list, rewrites 'e' into the closure literal and returns 1. Returns 0
+// for a plain lambda (a function pointer), and also, after reporting an error, when the
+// closure can't be built; 'lambda_done' stays 0 then so the body isn't checked against a
+// signature it was never given.
+static ST_decl_t *ST_lambda_instance(ST_sema_t *se, ST_decl_t *lam) {
+    ST_decl_t *d = ST_decl_new(se->arena, ST_DE_FN, lam->line, lam->col);
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, ST_sv_fmt "$i%u", ST_sv_args(lam->name),
+                     se->prog ? se->prog->decls.count : 0);
+    d->name = ST_lam_cstr_n(se, buf, n);
+    d->file = lam->file;
+    d->display_name = lam->display_name;
+    d->fn.is_lambda = 1;
+    d->fn.decl_block_id = lam->fn.decl_block_id;
+    d->fn.sig = ST_clone_fn_sig(se->arena, &lam->fn.sig);
+    d->fn.body = ST_clone_body(se->arena, &lam->fn.body);
+    ST_forrange(0, lam->fn.caps.count) {
+        ST_capture_t cp = lam->fn.caps.items[i];
+        cp.src = ST_clone_expr(se->arena, cp.src);
+        if (cp.te)
+            cp.te = ST_clone_tyexpr(se->arena, cp.te);
+        ST_da_append_arena(se->arena, &d->fn.caps, cp);
+    }
+    ST_sym_t *sym = ST_sym_new(se, ST_SYM_FN, d->name, d, NULL, lam->line, lam->col);
+    d->sema_sym = sym;
+    sym->generic_bindings = se->generic_bindings;
+    ST_sym_insert(se, &se->globals, sym);
+    b8 save_stamp = se->stamp_tyexprs;
+    se->stamp_tyexprs = 1;
+    ST_build_fn_ty(se, sym, &d->fn.sig);
+    se->stamp_tyexprs = save_stamp;
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, d);
+    return d;
+}
+
+static b8 ST_lambda_analyze(ST_sema_t *se, ST_expr_t *e, ST_decl_t **plam) {
+    ST_decl_t *lam = *plam;
+    ST_captures_t *caps = &lam->fn.caps;
+    if (!caps->count) {
+        lam->fn.lambda_done = 1;
+        return 0;
+    }
+    if (se->in_standin)
+        return 0;
+    if (lam->fn.sig.is_comptime) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "a lambda with a capture list can't be used in a #comptime scope yet");
+        ST_diag_note(&se->diag, e->line, e->col,
+                     "a closure is a struct passed to its function by value, and the #comptime VM "
+                     "can't pass struct arguments to functions yet; pass what it needs as parameters");
+        return 0;
+    }
+    if (se->generic_bindings && lam->fn.sig.generics.count) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "a generic function with a capture list can't be written inside a generic "
+                      "function yet");
+        return 0;
+    }
+    if (se->generic_bindings) {
+        lam = ST_lambda_instance(se, lam);
+        e->name = lam->name;
+        *plam = lam;
+        caps = &lam->fn.caps;
+    }
+
+    ST_lam_rw_t rw = {.se = se, .env = ST_lam_cstr("lambda$env")};
+    ST_tys_t cap_tys = {0};
+    ST_forrange(0, caps->count) {
+        ST_capture_t *cp = &caps->items[i];
+        ST_forrange(0, lam->fn.sig.params.count) {
+            if (ST_string_eq(lam->fn.sig.params.items[i].name, cp->name)) {
+                ST_diag_error(&se->diag, cp->line, cp->col,
+                              "'" ST_sv_fmt "' is both a parameter and a capture of this lambda",
+                              ST_sv_args(cp->name));
+                return 0;
+            }
+        }
+        if (cp->is_init) {
+            // 'name: type = value': nothing to look up, the closure gets its own copy of the value
+            ST_ty_t *vt = cp->te ? ST_resolve_tyexpr(se, cp->te) : ST_type_expr(se, cp->src);
+            if (!vt)
+                return 0; // its own error was already reported
+            vt = ST_ty_defaulted(se, vt);
+            ST_da_append_arena(se->arena, &cap_tys, vt);
+            ST_da_append_arena(se->arena, &rw.vals, cp->name);
+            ST_da_append_arena(se->arena, &rw.val_tys, vt);
+            continue;
+        }
+        ST_sym_t *v = ST_sym_find(se, cp->name);
+        if (!v || v->kind != ST_SYM_VAR) {
+            ST_diag_error(&se->diag, cp->line, cp->col,
+                          v ? "'" ST_sv_fmt "' can't be captured: it is not a variable of the enclosing function"
+                            : "'" ST_sv_fmt "' is in the capture list but no such variable is in scope",
+                          ST_sv_args(cp->name));
+            return 0;
+        }
+        if (!v->t)
+            return 0; // its own error was already reported
+        ST_ty_t *vt = ST_ty_defaulted(se, v->t);
+        ST_da_append_arena(se->arena, &cap_tys, cp->by_ref ? ST_ty_ptr(&se->tys, vt) : vt);
+        if (cp->by_ref) {
+            ST_da_append_arena(se->arena, &rw.refs, cp->name);
+        } else {
+            ST_da_append_arena(se->arena, &rw.vals, cp->name);
+            ST_da_append_arena(se->arena, &rw.val_tys, vt);
+        }
+    }
+
+    // the body: '&y' uses become '*env.y'; assignments to a by-value capture are errors
+    ST_forrange(0, lam->fn.sig.params.count) ST_lam_declare(&rw, lam->fn.sig.params.items[i].name);
+    ST_lam_rw_stmts(&rw, &lam->fn.body);
+    if (rw.errors)
+        return 0;
+    lam->fn.lambda_done = 1;
+
+    // the environment struct
+    ST_decl_t *sd = ST_decl_new(se->arena, ST_DE_STRUCT, lam->line, lam->col);
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, ST_sv_fmt "$env", ST_sv_args(lam->name));
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    sd->name = (ST_string_t){.data = nb, .len = (u32)n};
+    sd->display_name = ST_lam_cstr("closure");
+    sd->file = lam->file;
+    sd->struct_.closure_fn = lam->name;
+    ST_forrange(0, caps->count) if (caps->items[i].by_ref) sd->struct_.closure_ref = 1;
+    ST_forrange(0, caps->count) {
+        ST_field_spec_t f = {.name = caps->items[i].name, .line = caps->items[i].line,
+                             .col = caps->items[i].col};
+        f.te = ST_lam_te_from_ty(se, cap_tys.items[i], f.line, f.col);
+        ST_da_append_arena(se->arena, &sd->struct_.fields, f);
+    }
+    ST_ty_t *env_ty = ST_ty_for_decls(&se->tys, sd);
+    ST_sym_t *env_sym = ST_sym_new(se, ST_SYM_TYPE, sd->name, sd, env_ty, lam->line, lam->col);
+    sd->sema_sym = env_sym;
+    ST_sym_insert(se, &se->types, env_sym);
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, sd);
+    ST_complete_ty(se, env_ty);
+
+    // the hoisted function: 'env' first, then 'x := env.x;' for each by-value capture
+    ST_param_t ep = {.name = rw.env, .line = lam->line, .col = lam->col};
+    ep.te = ST_lam_pin_te(se, env_ty, sd->name, lam->line, lam->col);
+    ST_da_append_arena(se->arena, &lam->fn.sig.params, ep);
+    ST_params_t *ps = &lam->fn.sig.params;
+    for (u32 k = ps->count - 1; k > 0; k--) {
+        ST_param_t tmp = ps->items[k];
+        ps->items[k] = ps->items[k - 1];
+        ps->items[k - 1] = tmp;
+    }
+
+    ST_stmts_t *body = &lam->fn.body;
+    u32 n_vals = rw.vals.count;
+    u32 old_count = body->count;
+    ST_forrange(0, n_vals) ST_da_append_arena(se->arena, body, NULL); // grow; filled in below
+    for (u32 k = old_count; k > 0; k--)
+        body->items[k - 1 + n_vals] = body->items[k - 1];
+    ST_forrange(0, n_vals) {
+        ST_expr_t *base = ST_expr_new(se->arena, ST_EX_IDENT, lam->line, lam->col);
+        base->name = rw.env;
+        ST_expr_t *fld = ST_expr_new(se->arena, ST_EX_FIELD, lam->line, lam->col);
+        fld->field.base = base;
+        fld->field.name = rw.vals.items[i];
+        ST_stmt_t *d = ST_stmt_new(se->arena, ST_ST_DECL, lam->line, lam->col);
+        d->decl.name = rw.vals.items[i];
+        d->decl.init = fld;
+        body->items[i] = d;
+    }
+
+    if (!lam->fn.sig.generics.count) {
+        b8 save_stamp = se->stamp_tyexprs;
+        if (se->generic_bindings)
+            se->stamp_tyexprs = 1;
+        ST_sym_t *fsym = ST_sym_for_decl(se, lam);
+        if (fsym)
+            ST_build_fn_ty(se, fsym, &lam->fn.sig);
+        ST_sym_t *gsym = ST_sym_find_in(&se->globals, lam->name);
+        if (gsym && gsym != fsym)
+            ST_build_fn_ty(se, gsym, &lam->fn.sig);
+        se->stamp_tyexprs = save_stamp;
+    }
+
+    // the lambda expression itself: 'NAME$env { x = x, y = &y }'
+    ST_field_inits_t inits = {0};
+    ST_forrange(0, caps->count) {
+        ST_capture_t *cp = &caps->items[i];
+        ST_expr_t *v = cp->src;
+        if (cp->by_ref) {
+            ST_expr_t *addr = ST_expr_new(se->arena, ST_EX_UNARY, cp->line, cp->col);
+            addr->unary.op = (ST_string_t){.data = (u8 *)"&", .len = 1};
+            addr->unary.operand = cp->src;
+            v = addr;
+        }
+        ST_field_init_t fi = {.name = cp->name, .value = v, .line = cp->line, .col = cp->col};
+        ST_da_append_arena(se->arena, &inits, fi);
+    }
+    memset(&e->struct_lit, 0, sizeof e->struct_lit);
+    e->kind = ST_EX_STRUCT_LIT;
+    e->ty = NULL;
+    e->struct_lit.type_name = sd->name;
+    e->struct_lit.inits = inits;
+    return 1;
+}
+
+// 'f(3)' where 'f' is a closure (or the lambda is written right there: 'fn(x) {..}(3)')
+// becomes 'NAME(f, 3)'. Returns 1 if the call was rewritten.
+static b8 ST_try_closure_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    if (!callee || callee->kind != ST_EX_IDENT)
+        return 0;
+    ST_sym_t *sym = ST_sym_find_expr(se, callee);
+    if (!sym)
+        return 0;
+    ST_string_t fn_name = {0};
+    if (sym->kind == ST_SYM_VAR && sym->t && sym->t->kind == ST_TY_STRUCT && sym->t->decl &&
+        sym->t->decl->kind == ST_DE_STRUCT && sym->t->decl->struct_.closure_fn.len) {
+        fn_name = sym->t->decl->struct_.closure_fn;
+    } else if (sym->kind == ST_SYM_FN && sym->decl && sym->decl->kind == ST_DE_FN &&
+               sym->decl->fn.is_lambda && !sym->decl->fn.lambda_done) {
+        ST_decl_t *ld = sym->decl;
+        if (!ST_lambda_analyze(se, callee, &ld))
+            return 0;
+        fn_name = ld->name;
+    } else {
+        return 0;
+    }
+
+    ST_expr_t *env_arg = ST_arena_push(se->arena, sizeof *env_arg);
+    *env_arg = *callee;
+    ST_expr_t *fn_id = ST_expr_new(se->arena, ST_EX_IDENT, callee->line, callee->col);
+    fn_id->name = fn_name;
+
+    ST_args_t *args = &e->call.args;
+    ST_da_append_arena(se->arena, args, (ST_arg_t){0});
+    for (u32 k = args->count - 1; k > 0; k--)
+        args->items[k] = args->items[k - 1];
+    args->items[0] = (ST_arg_t){.value = env_arg};
+    e->call.callee = fn_id;
+    return 1;
+}
+
+#define ST_CLOSURE_ENV_WORDS 8
+
+static b8 ST_ty_is_erased_closure(ST_ty_t *t) {
+    return t && t->kind == ST_TY_STRUCT && t->decl && t->decl->kind == ST_DE_STRUCT &&
+           t->decl->struct_.closure_erased;
+}
+
+static b8 ST_ty_is_closure_env(ST_ty_t *t) {
+    return t && t->kind == ST_TY_STRUCT && t->decl && t->decl->kind == ST_DE_STRUCT &&
+           t->decl->struct_.closure_fn.len;
+}
+
+static ST_ty_t *ST_closure_call_ty(ST_ty_t *erased) {
+    if (!ST_ty_is_erased_closure(erased))
+        return NULL;
+    ST_forrange(0, erased->fields.count) {
+        if (ST_string_eq_cstr(erased->fields.items[i].name, "call"))
+            return erased->fields.items[i].ty;
+    }
+    return NULL;
+}
+
+static b8 ST_closure_sig_eq(ST_ty_t *a, u32 skip_a, ST_ty_t *b, u32 skip_b) {
+    if (!a || !b || a->params.count < skip_a || b->params.count < skip_b)
+        return 0;
+    if (a->params.count - skip_a != b->params.count - skip_b || a->rets.count != b->rets.count)
+        return 0;
+    ST_forrange(0, a->params.count - skip_a) {
+        if (!ST_ty_equal(a->params.items[skip_a + i], b->params.items[skip_b + i]))
+            return 0;
+    }
+    ST_forrange(0, a->rets.count) {
+        if (!ST_ty_equal(a->rets.items[i], b->rets.items[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static b8 ST_closure_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
+    if (!from || !ST_ty_is_erased_closure(to) || from == to)
+        return 0;
+    ST_ty_t *call = ST_closure_call_ty(to);
+    if (ST_ty_is_closure_env(from)) {
+        if (from->decl->struct_.closure_ref && !to->decl->struct_.closure_ref)
+            return 0;
+        ST_sym_t *fs = ST_sym_find_in(&se->globals, from->decl->struct_.closure_fn);
+        return fs && fs->t && ST_closure_sig_eq(call, 1, fs->t, 1);
+    }
+    if (ST_ty_is_erased_closure(from)) {
+        if (from->decl->struct_.closure_ref && !to->decl->struct_.closure_ref)
+            return 0;
+        return ST_closure_sig_eq(call, 1, ST_closure_call_ty(from), 1);
+    }
+    if (from->kind == ST_TY_FN)
+        return ST_closure_sig_eq(call, 1, from, 0);
+    return 0;
+}
+
+static ST_string_t ST_syn_str(ST_sema_t *se, const char *buf, int n) {
+    u8 *nb = ST_arena_push(se->arena, (u32)n);
+    memcpy(nb, buf, (u32)n);
+    return (ST_string_t){.data = nb, .len = (u32)n};
+}
+
+static ST_expr_t *ST_syn_ident(ST_sema_t *se, ST_string_t n, u32 line, u32 col) {
+    ST_expr_t *e = ST_expr_new(se->arena, ST_EX_IDENT, line, col);
+    e->name = n;
+    return e;
+}
+
+static ST_expr_t *ST_syn_field(ST_sema_t *se, ST_expr_t *base, const char *name, u32 line,
+                               u32 col) {
+    ST_expr_t *e = ST_expr_new(se->arena, ST_EX_FIELD, line, col);
+    e->field.base = base;
+    e->field.name = ST_lam_cstr(name);
+    return e;
+}
+
+static ST_expr_t *ST_syn_unary(ST_sema_t *se, const char *op, ST_expr_t *operand, u32 line,
+                               u32 col) {
+    ST_expr_t *e = ST_expr_new(se->arena, ST_EX_UNARY, line, col);
+    e->unary.op = ST_lam_cstr(op);
+    e->unary.operand = operand;
+    return e;
+}
+
+static ST_expr_t *ST_syn_cast(ST_sema_t *se, ST_expr_t *operand, ST_ty_t *to, u32 line, u32 col) {
+    ST_expr_t *e = ST_expr_new(se->arena, ST_EX_CAST, line, col);
+    e->cast.operand = operand;
+    e->cast.to = ST_lam_pin_te(se, to, ST_lam_cstr("cast"), line, col);
+    return e;
+}
+
+static ST_expr_t *ST_syn_call(ST_sema_t *se, ST_string_t fn, ST_expr_t **args, u32 n_args, u32 line,
+                              u32 col) {
+    ST_expr_t *e = ST_expr_new(se->arena, ST_EX_CALL, line, col);
+    e->call.callee = ST_syn_ident(se, fn, line, col);
+    ST_forrange(0, n_args) ST_da_append_arena(se->arena, &e->call.args, (ST_arg_t){.value = args[i]});
+    return e;
+}
+
+static ST_stmt_t *ST_syn_assign(ST_sema_t *se, ST_expr_t *lhs, ST_expr_t *rhs, u32 line, u32 col) {
+    ST_stmt_t *a = ST_stmt_new(se->arena, ST_ST_ASSIGN, line, col);
+    a->assign.lhs = lhs;
+    a->assign.op = ST_lam_cstr("=");
+    a->assign.rhs = rhs;
+    return a;
+}
+
+static ST_stmt_t *ST_syn_decl(ST_sema_t *se, ST_string_t name, ST_ty_t *t, ST_expr_t *init, u32 line,
+                              u32 col) {
+    ST_stmt_t *d = ST_stmt_new(se->arena, ST_ST_DECL, line, col);
+    d->decl.name = name;
+    if (t)
+        d->decl.te = ST_lam_pin_te(se, t, ST_lam_cstr("closure"), line, col);
+    d->decl.init = init;
+    return d;
+}
+
+static ST_stmt_t *ST_syn_return(ST_sema_t *se, ST_expr_t **vals, u32 n, u32 line, u32 col) {
+    ST_stmt_t *r = ST_stmt_new(se->arena, ST_ST_RETURN, line, col);
+    ST_forrange(0, n) ST_da_append_arena(se->arena, &r->ret.values, vals[i]);
+    return r;
+}
+
+static ST_param_t ST_syn_param(ST_sema_t *se, const char *name, ST_ty_t *t, u32 line, u32 col) {
+    ST_param_t p = {.name = ST_lam_cstr(name), .line = line, .col = col};
+    p.te = ST_lam_pin_te(se, t, ST_lam_cstr("closure"), line, col);
+    return p;
+}
+
+static ST_param_t ST_syn_param_n(ST_sema_t *se, const char *prefix, u32 idx, ST_ty_t *t, u32 line,
+                                 u32 col) {
+    char buf[48];
+    int n = snprintf(buf, sizeof buf, "%s%u", prefix, idx);
+    ST_param_t p = {.name = ST_syn_str(se, buf, n), .line = line, .col = col};
+    p.te = ST_lam_pin_te(se, t, ST_lam_cstr("closure"), line, col);
+    return p;
+}
+
+static ST_sym_t *ST_syn_register_fn(ST_sema_t *se, ST_string_t name, ST_params_t params,
+                                    ST_tys_t *rets, ST_stmts_t body, ST_string_t file, u32 line,
+                                    u32 col) {
+    ST_decl_t *d = ST_decl_new(se->arena, ST_DE_FN, line, col);
+    d->name = name;
+    d->file = file;
+    d->fn.is_lambda = 0;
+    d->fn.closure_glue = 1;
+    d->fn.sig.params = params;
+    ST_forrange(0, rets->count) {
+        ST_da_append_arena(se->arena, &d->fn.sig.rets,
+                           ST_lam_pin_te(se, rets->items[i], ST_lam_cstr("closure"), line, col));
+    }
+    d->fn.body = body;
+    ST_sym_t *sym = ST_sym_new(se, ST_SYM_FN, name, d, NULL, line, col);
+    d->sema_sym = sym;
+    ST_sym_insert(se, &se->globals, sym);
+    ST_build_fn_ty(se, sym, &d->fn.sig);
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, d);
+    return sym;
+}
+
+static ST_ty_t *ST_closure_erased_ty(ST_sema_t *se, ST_ty_t *sig, b8 is_ref, u32 line, u32 col) {
+    if (sig->rets.count > 1) {
+        ST_diag_error(&se->diag, line, col,
+                      "a closure type can return at most one value, function pointers can't "
+                      "return several yet");
+        return NULL;
+    }
+    const char *mangled = ST_ty_mangle(se->arena, sig);
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, "closure$%s%s", is_ref ? "r$" : "", mangled);
+    ST_string_t name = ST_syn_str(se, buf, n);
+    ST_sym_t *existing = ST_sym_find_in(&se->types, name);
+    if (existing && existing->t)
+        return existing->t;
+
+    const char *shown = ST_ty_cstr(se->arena, sig);
+    if (strncmp(shown, "fn", 2) == 0)
+        shown += 2;
+    char dbuf[512];
+    int dn = snprintf(dbuf, sizeof dbuf, "closure%s%s", is_ref ? "&" : "", shown);
+
+    ST_decl_t *sd = ST_decl_new(se->arena, ST_DE_STRUCT, line, col);
+    sd->name = name;
+    sd->display_name = ST_syn_str(se, dbuf, dn);
+    sd->file = se->diag.file;
+    sd->struct_.closure_erased = 1;
+    sd->struct_.closure_ref = is_ref;
+
+    ST_ty_t *call = ST_ty_fn_new(&se->tys);
+    ST_da_append_arena(se->arena, &call->params, ST_ty_ptr(&se->tys, se->tys.prim[ST_tvoid]));
+    ST_forrange(0, sig->params.count) ST_da_append_arena(se->arena, &call->params, sig->params.items[i]);
+    ST_forrange(0, sig->rets.count) ST_da_append_arena(se->arena, &call->rets, sig->rets.items[i]);
+
+    ST_field_spec_t f_call = {.name = ST_lam_cstr("call"), .line = line, .col = col};
+    f_call.te = ST_lam_pin_te(se, call, ST_lam_cstr("closure"), line, col);
+    ST_da_append_arena(se->arena, &sd->struct_.fields, f_call);
+    ST_field_spec_t f_env = {.name = ST_lam_cstr("env"), .line = line, .col = col};
+    f_env.te = ST_lam_pin_te(
+        se, ST_ty_array(&se->tys, se->tys.prim[ST_tu64], ST_CLOSURE_ENV_WORDS), ST_lam_cstr("closure"),
+        line, col);
+    ST_da_append_arena(se->arena, &sd->struct_.fields, f_env);
+
+    ST_ty_t *ety = ST_ty_for_decls(&se->tys, sd);
+    ST_sym_t *sym = ST_sym_new(se, ST_SYM_TYPE, name, sd, ety, line, col);
+    sd->sema_sym = sym;
+    ST_sym_insert(se, &se->types, sym);
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, sd);
+    ST_complete_ty(se, ety);
+    return ety;
+}
+
+static ST_ty_t *ST_closure_plain_fn_ty(ST_sema_t *se, ST_ty_t *call) {
+    ST_ty_t *f = ST_ty_fn_new(&se->tys);
+    ST_forrange(1, call->params.count) ST_da_append_arena(se->arena, &f->params, call->params.items[i]);
+    ST_forrange(0, call->rets.count) ST_da_append_arena(se->arena, &f->rets, call->rets.items[i]);
+    return f;
+}
+
+static ST_stmt_t *ST_closure_call_stmt(ST_sema_t *se, ST_expr_t *call, ST_tys_t *rets, u32 line,
+                                       u32 col, ST_stmts_t *body) {
+    if (rets->count == 0) {
+        ST_stmt_t *s = ST_stmt_new(se->arena, ST_ST_EXPR, line, col);
+        s->expr = call;
+        ST_da_append_arena(se->arena, body, s);
+        return s;
+    }
+    if (rets->count == 1) {
+        ST_expr_t *vals[1] = {call};
+        ST_stmt_t *s = ST_syn_return(se, vals, 1, line, col);
+        ST_da_append_arena(se->arena, body, s);
+        return s;
+    }
+    return NULL;
+}
+
+static ST_sym_t *ST_closure_converter(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to, u32 line,
+                                      u32 col) {
+    ST_ty_t *call = ST_closure_call_ty(to);
+    ST_string_t file = se->diag.file;
+    ST_string_t from_name = ST_ty_is_closure_env(from) || ST_ty_is_erased_closure(from)
+                                ? from->decl->name
+                                : ST_lam_cstr("fn");
+    char buf[1024];
+    int n = snprintf(buf, sizeof buf, ST_sv_fmt "$from$" ST_sv_fmt, ST_sv_args(to->decl->name),
+                     ST_sv_args(from_name));
+    ST_string_t cname = ST_syn_str(se, buf, n);
+    ST_sym_t *existing = ST_sym_find_in(&se->globals, cname);
+    if (existing)
+        return existing;
+
+    ST_ty_t *rets_src = call;
+    ST_tys_t rets = {0};
+    ST_forrange(0, rets_src->rets.count) ST_da_append_arena(se->arena, &rets, rets_src->rets.items[i]);
+
+    ST_expr_t *r_id = NULL;
+    ST_params_t cparams = {0};
+    ST_stmts_t cbody = {0};
+    ST_string_t r_name = ST_lam_cstr("lambda$r");
+    ST_string_t c_name = ST_lam_cstr("lambda$c");
+    ST_da_append_arena(se->arena, &cparams, ST_syn_param(se, "lambda$c", from, line, col));
+    ST_da_append_arena(se->arena, &cbody, ST_syn_decl(se, r_name, to, NULL, line, col));
+
+    if (ST_ty_is_erased_closure(from)) {
+        ST_da_append_arena(
+            se->arena, &cbody,
+            ST_syn_assign(se,
+                          ST_syn_field(se, ST_syn_ident(se, r_name, line, col), "call", line, col),
+                          ST_syn_field(se, ST_syn_ident(se, c_name, line, col), "call", line, col),
+                          line, col));
+        ST_da_append_arena(
+            se->arena, &cbody,
+            ST_syn_assign(se,
+                          ST_syn_field(se, ST_syn_ident(se, r_name, line, col), "env", line, col),
+                          ST_syn_field(se, ST_syn_ident(se, c_name, line, col), "env", line, col),
+                          line, col));
+    } else {
+        b8 is_env = ST_ty_is_closure_env(from);
+        ST_ty_t *payload = from;
+        if (is_env) {
+            if (from->size > ST_CLOSURE_ENV_WORDS * 8) {
+                ST_diag_error(&se->diag, line, col,
+                              "this closure captures %u bytes, but a 'closure(..)' holds at most %u",
+                              from->size, (u32)(ST_CLOSURE_ENV_WORDS * 8));
+                ST_diag_note(&se->diag, line, col,
+                             "capture a pointer to the large variable by value instead of "
+                             "copying it");
+                return NULL;
+            }
+        }
+
+        ST_string_t tname;
+        {
+            char tb[1024];
+            int tn = snprintf(tb, sizeof tb, ST_sv_fmt "$call$" ST_sv_fmt, ST_sv_args(to->decl->name),
+                              ST_sv_args(from_name));
+            tname = ST_syn_str(se, tb, tn);
+        }
+        ST_params_t tparams = {0};
+        ST_da_append_arena(se->arena, &tparams,
+                           ST_syn_param(se, "lambda$e", ST_ty_ptr(&se->tys, se->tys.prim[ST_tvoid]),
+                                        line, col));
+        ST_forrange(1, call->params.count)
+            ST_da_append_arena(se->arena, &tparams,
+                               ST_syn_param_n(se, "lambda$a", i - 1, call->params.items[i], line, col));
+        ST_stmts_t tbody = {0};
+        ST_expr_t *payload_ptr = ST_syn_cast(se, ST_syn_ident(se, ST_lam_cstr("lambda$e"), line, col),
+                                             ST_ty_ptr(&se->tys, payload), line, col);
+        ST_expr_t **targs = ST_arena_push(se->arena, sizeof(*targs) * (call->params.count + 1));
+        u32 n_targs = 0;
+        ST_string_t callee;
+        if (is_env) {
+            ST_sym_t *fs = ST_sym_find_in(&se->globals, from->decl->struct_.closure_fn);
+            callee = fs->name;
+            targs[n_targs++] = ST_syn_unary(se, "*", payload_ptr, line, col);
+        } else {
+            ST_ty_t *plain = ST_closure_plain_fn_ty(se, call);
+            payload = plain;
+            payload_ptr = ST_syn_cast(se, ST_syn_ident(se, ST_lam_cstr("lambda$e"), line, col),
+                                      ST_ty_ptr(&se->tys, plain), line, col);
+            callee = ST_lam_cstr("lambda$f");
+            ST_da_append_arena(se->arena, &tbody,
+                               ST_syn_decl(se, callee, NULL,
+                                           ST_syn_unary(se, "*", payload_ptr, line, col), line, col));
+            from = plain;
+        }
+        ST_forrange(1, call->params.count) {
+            char ab[48];
+            int an = snprintf(ab, sizeof ab, "lambda$a%u", i - 1);
+            targs[n_targs++] = ST_syn_ident(se, ST_syn_str(se, ab, an), line, col);
+        }
+        ST_expr_t *tcall = ST_syn_call(se, callee, targs, n_targs, line, col);
+        ST_closure_call_stmt(se, tcall, &rets, line, col, &tbody);
+        ST_syn_register_fn(se, tname, tparams, &rets, tbody, file, line, col);
+
+        ST_da_append_arena(
+            se->arena, &cbody,
+            ST_syn_assign(
+                se,
+                ST_syn_unary(
+                    se, "*",
+                    ST_syn_cast(se,
+                                ST_syn_unary(se, "&",
+                                             ST_syn_field(se, ST_syn_ident(se, r_name, line, col),
+                                                          "env", line, col),
+                                             line, col),
+                                ST_ty_ptr(&se->tys, payload), line, col),
+                    line, col),
+                ST_syn_ident(se, c_name, line, col), line, col));
+        ST_da_append_arena(
+            se->arena, &cbody,
+            ST_syn_assign(se,
+                          ST_syn_field(se, ST_syn_ident(se, r_name, line, col), "call", line, col),
+                          ST_syn_ident(se, tname, line, col), line, col));
+        if (!is_env)
+            cparams.items[0] = ST_syn_param(se, "lambda$c", from, line, col);
+    }
+    r_id = ST_syn_ident(se, r_name, line, col);
+    ST_expr_t *rv[1] = {r_id};
+    ST_da_append_arena(se->arena, &cbody, ST_syn_return(se, rv, 1, line, col));
+    ST_tys_t one = {0};
+    ST_da_append_arena(se->arena, &one, to);
+    return ST_syn_register_fn(se, cname, cparams, &one, cbody, file, line, col);
+}
+
+static void ST_erase_closure(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
+    if (!slot || !*slot || !ST_ty_is_erased_closure(to) || se->in_standin)
+        return;
+    ST_expr_t *v = *slot;
+    ST_ty_t *from = v->ty;
+    if (!from || !ST_closure_coerces(se, from, to))
+        return;
+    ST_sym_t *conv = ST_closure_converter(se, from, to, v->line, v->col);
+    if (!conv)
+        return;
+    ST_expr_t *args[1] = {v};
+    ST_expr_t *call = ST_syn_call(se, conv->name, args, 1, v->line, v->col);
+    call->call.callee->ty = conv->t;
+    call->ty = to;
+    *slot = call;
+}
+
+static b8 ST_closure_mismatch_note(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to, u32 line, u32 col) {
+    if (!ST_ty_is_erased_closure(to) || !from)
+        return 0;
+    if ((ST_ty_is_closure_env(from) || ST_ty_is_erased_closure(from)) &&
+        from->decl->struct_.closure_ref && !to->decl->struct_.closure_ref) {
+        ST_diag_note(&se->diag, line, col,
+                     "this closure captures by reference, so it points into the frame that wrote it; "
+                     "only a 'closure&(..)' (a borrowing closure) can hold it");
+        return 1;
+    }
+    return 0;
+}
+
+static ST_ty_t *ST_place_ty(ST_sema_t *se, ST_expr_t *e) {
+    switch (e->kind) {
+        case ST_EX_IDENT: {
+            ST_sym_t *sym = ST_sym_find_expr(se, e);
+            return sym && sym->kind == ST_SYM_VAR ? sym->t : NULL;
+        }
+        case ST_EX_FIELD: {
+            ST_ty_t *bt = ST_place_ty(se, e->field.base);
+            if (bt && bt->kind == ST_TY_PTR)
+                bt = bt->inner;
+            ST_ty_t *ft = NULL;
+            return ST_lam_field_ty(se, bt, e->field.name, &ft) ? ft : NULL;
+        }
+        case ST_EX_INDEX: {
+            ST_ty_t *bt = ST_place_ty(se, e->index.base);
+            if (!bt)
+                return NULL;
+            if (bt->kind == ST_TY_ARRAY || bt->kind == ST_TY_SLICE || bt->kind == ST_TY_DYN_ARRAY ||
+                bt->kind == ST_TY_PTR)
+                return bt->inner;
+            return NULL;
+        }
+        default:
+        return NULL;
+    }
+}
+
+static b8 ST_try_erased_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    if (!callee || (callee->kind != ST_EX_IDENT && callee->kind != ST_EX_FIELD &&
+                    callee->kind != ST_EX_INDEX))
+        return 0;
+    if (callee->kind == ST_EX_FIELD && callee->field.base->kind == ST_EX_CALL)
+        return 0;
+    ST_ty_t *ct = ST_place_ty(se, callee);
+    if (!ST_ty_is_erased_closure(ct))
+        return 0;
+    ST_expr_t *c1 = ST_clone_expr(se->arena, callee);
+    ST_expr_t *c2 = ST_clone_expr(se->arena, callee);
+    ST_expr_t *env = ST_syn_unary(se, "&", ST_syn_field(se, c2, "env", callee->line, callee->col),
+                                  callee->line, callee->col);
+    ST_args_t *args = &e->call.args;
+    ST_da_append_arena(se->arena, args, (ST_arg_t){0});
+    for (u32 k = args->count - 1; k > 0; k--)
+        args->items[k] = args->items[k - 1];
+    args->items[0] = (ST_arg_t){.value = env};
+    e->call.callee = ST_syn_field(se, c1, "call", callee->line, callee->col);
+    return 1;
+}
+
+static b8 ST_ty_frame_bound_rec(ST_sema_t *se, ST_ty_t *t, u32 depth) {
+    if (!t || depth > 8)
+        return 0;
+    if (t->kind == ST_TY_ARRAY)
+        return ST_ty_frame_bound_rec(se, t->inner, depth + 1);
+    if (t->kind != ST_TY_STRUCT || !t->decl || t->decl->kind != ST_DE_STRUCT)
+        return 0;
+    if (t->decl->struct_.closure_ref)
+        return 1;
+    ST_complete_ty(se, t);
+    ST_forrange(0, t->fields.count) {
+        if (ST_ty_frame_bound_rec(se, t->fields.items[i].ty, depth + 1))
+            return 1;
+    }
+    return 0;
+}
+
+static b8 ST_ty_frame_bound(ST_sema_t *se, ST_ty_t *t) {
+    if (se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN && se->cur_fn_decl->fn.closure_glue)
+        return 0;
+    return ST_ty_frame_bound_rec(se, t, 0);
+}
+
+static b8 ST_lhs_leaves_frame(ST_sema_t *se, ST_expr_t *e) {
+    for (;;) {
+        if (!e)
+            return 0;
+        switch (e->kind) {
+            case ST_EX_FIELD:
+            if (e->field.base->ty && e->field.base->ty->kind == ST_TY_PTR)
+                return 1;
+            e = e->field.base;
+            break;
+            case ST_EX_INDEX: {
+                ST_ty_t *bt = e->index.base->ty;
+                if (bt && (bt->kind == ST_TY_PTR || bt->kind == ST_TY_SLICE ||
+                           bt->kind == ST_TY_DYN_ARRAY))
+                    return 1;
+                e = e->index.base;
+                break;
+            }
+            case ST_EX_UNARY: {
+                ST_expr_t *o = e->unary.operand;
+                if (o && o->kind == ST_EX_FIELD && o->field.base->kind == ST_EX_IDENT &&
+                    ST_string_eq_cstr(o->field.base->name, "lambda$env"))
+                    return 0;
+                return 1;
+            }
+            case ST_EX_IDENT: {
+                ST_sym_t *sym = ST_sym_find(se, e->name);
+                return sym && (sym->kind == ST_SYM_GLOBAL || sym->kind == ST_SYM_EXTERN_VAR);
+            }
+            default:
+            return 0;
+        }
+    }
+}
+
+static void ST_closure_escape_error(ST_sema_t *se, u32 line, u32 col, ST_ty_t *t, const char *how) {
+    ST_diag_error(&se->diag, line, col,
+                  "a value of type '%s' can point into the stack frame that wrote the closure "
+                  "(a by reference capture, '|&x|'), so it can't be %s",
+                  ST_tstr(se, t), how);
+    ST_diag_note(&se->diag, line, col,
+                 "capture by value instead ('|x|'), or capture by value a pointer to memory that "
+                 "outlives the function");
+}
+
 static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
     ST_sym_t *sym = ST_sym_find_expr(se, e);
     if (!sym) {
+        ST_sym_t *tsym = ST_sym_find_in(&se->templates, e->name);
+        if (tsym && tsym->decl && tsym->decl->kind == ST_DE_FN && tsym->decl->fn.is_lambda &&
+            tsym->decl->fn.caps.count && !tsym->decl->fn.lambda_done) {
+            ST_decl_t *ld = tsym->decl;
+            if (ST_lambda_analyze(se, e, &ld))
+                return ST_type_expr(se, e);
+            return NULL;
+        }
         ST_diag_error(&se->diag, e->line, e->col, "use of undeclared identifier '" ST_sv_fmt "'",
                       ST_sv_args(e->name));
+        if (se->cur_fn_decl && se->cur_fn_decl->kind == ST_DE_FN && se->cur_fn_decl->fn.is_lambda)
+            ST_diag_note(&se->diag, e->line, e->col,
+                         "a lambda only sees what is in its capture list: if '" ST_sv_fmt "' is a "
+                         "variable of the enclosing function, write 'fn(..) |" ST_sv_fmt "| { .. }' "
+                         "to copy it, or '|&" ST_sv_fmt "|' to modify the original",
+                         ST_sv_args(e->name), ST_sv_args(e->name), ST_sv_args(e->name));
         return NULL;
     }
     if (sym->kind == ST_SYM_FN && sym->decl && !ST_string_eq(e->name, sym->decl->name))
         e->name = sym->decl->name;
+    if (sym->kind == ST_SYM_FN && sym->decl && sym->decl->kind == ST_DE_FN &&
+        sym->decl->fn.is_lambda && !sym->decl->fn.lambda_done) {
+        ST_decl_t *ld = sym->decl;
+        if (ST_lambda_analyze(se, e, &ld))
+            return ST_type_expr(se, e);
+    }
     switch (sym->kind) {
         case ST_SYM_VAR:
         case ST_SYM_EXTERN_VAR:
@@ -3546,6 +4741,8 @@ static b8 ST_try_static_method_call(ST_sema_t *se, ST_expr_t *e) {
 }
 
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
+    if (!ST_try_erased_call(se, e))
+        ST_try_closure_call(se, e);
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
     if (callee && callee->kind == ST_EX_FIELD && callee->field.base &&
@@ -4091,10 +5288,13 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             ST_arg_extern_decay(se, sym, pt, arg);
             ST_ty_t *at = arg->value->ty;
             if (pt && at && !ST_ty_coerces(se, at, pt))
-                ST_diag_error(&se->diag, arg->value->line, arg->value->col,
-                              "argument '" ST_sv_fmt "' expects '%s', got '%s'",
-                              ST_sv_args(sig->params.items[idx].name), ST_tstr(se, pt),
-                              ST_tstr(se, at));
+                {
+                    ST_diag_error(&se->diag, arg->value->line, arg->value->col,
+                                  "argument '" ST_sv_fmt "' expects '%s', got '%s'",
+                                  ST_sv_args(sig->params.items[idx].name), ST_tstr(se, pt),
+                                  ST_tstr(se, at));
+                    ST_closure_mismatch_note(se, at, pt, arg->value->line, arg->value->col);
+                }
             else if (pt && at && (pt->kind == ST_TY_INT || pt->kind == ST_TY_FLOAT))
                 ST_retype_untyped(arg->value, pt);
             else
@@ -4151,6 +5351,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                           "'" ST_sv_fmt "' argument %u expects '%s', got '%s'",
                           ST_sv_args(call_name), i + 1, ST_tstr(se, pt), ST_tstr(se, at));
+            ST_closure_mismatch_note(se, at, pt, arg->value->line, arg->value->col);
             if (sym)
                 ST_diag_note_in_file(se, ST_sym_file(sym), sym->line, sym->col,
                                      "'" ST_sv_fmt "' is declared here",
@@ -4447,6 +5648,7 @@ static void ST_erase_witness(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
 
 static void ST_box_any(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
     ST_erase_witness(se, slot, to);
+    ST_erase_closure(se, slot, to);
     if (!slot || !*slot || !ST_ty_is_any(se, to))
         return;
     ST_expr_t *v = *slot;
@@ -5580,6 +6782,7 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
                       "cannot initialize '" ST_sv_fmt "' of type '%s' "
                       "with a value of type '%s'",
                       ST_sv_args(s->decl.name), ST_tstr(se, dt), ST_tstr(se, it));
+        ST_closure_mismatch_note(se, it, dt, s->line, s->col);
         if (it->kind == ST_TY_UNTYPED_INT && ST_ty_is_float(dt) && s->decl.init)
             ST_diag_note(&se->diag, s->decl.init->line, s->decl.init->col,
                          "whole-number float literals need an explicit '.0', e.g. '%lld.0'",
@@ -5612,6 +6815,8 @@ static void ST_check_decl_stmt(ST_sema_t *se, ST_stmt_t *s) {
                       ST_sv_args(s->decl.name));
 
     ST_ty_t *t = dt ? dt : ST_ty_defaulted(se, it);
+    if (t && s->decl.is_static && ST_ty_frame_bound(se, t))
+        ST_closure_escape_error(se, s->line, s->col, t, "kept in a 'static' variable");
     if (t && t->kind == ST_TY_VOID)
         ST_diag_error(&se->diag, s->line, s->col, "cannot declare '" ST_sv_fmt "' of type 'void'",
                       ST_sv_args(s->decl.name));
@@ -5726,9 +6931,15 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
     ST_string_t op = s->assign.op;
 
     if (ST_string_eq_cstr(op, "=")) {
+        if (ST_ty_frame_bound(se, rt) && ST_lhs_leaves_frame(se, lhs))
+            ST_closure_escape_error(se, s->line, s->col, rt,
+                                    "stored through a pointer, a slice or a global");
         if (!ST_ty_coerces(se, rt, lt))
+        {
             ST_diag_error(&se->diag, s->line, s->col, "cannot assign '%s' to '%s'", ST_tstr(se, rt),
                           ST_tstr(se, lt));
+            ST_closure_mismatch_note(se, rt, lt, s->line, s->col);
+        }
         else
             ST_box_any(se, &s->assign.rhs, lt);
         return;
@@ -5838,6 +7049,8 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
             rv->ty = t;
         } else
             t = ST_type_expr(se, rv);
+        if (t && ST_ty_frame_bound(se, t))
+            ST_closure_escape_error(se, rv->line, rv->col, t, "returned");
         if (i >= want || !se->cur_rets)
             continue;
         if (t && rt && ST_ty_coerces(se, t, rt))
@@ -5846,6 +7059,9 @@ static void ST_check_return(ST_sema_t *se, ST_stmt_t *s) {
             ST_diag_error(&se->diag, s->ret.values.items[i]->line, s->ret.values.items[i]->col,
                           "return value %u expects '%s', got '%s'", i + 1, ST_tstr(se, rt),
                           ST_tstr(se, t));
+        if (t && rt && !ST_ty_coerces(se, t, rt))
+            ST_closure_mismatch_note(se, t, rt, s->ret.values.items[i]->line,
+                                     s->ret.values.items[i]->col);
     }
 }
 
@@ -7446,6 +8662,11 @@ static void ST_declare_block_siblings(ST_sema_t *se, ST_decl_t *d) {
 }
 
 static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {
+    // A lambda with a capture list is only complete once ST_lambda_analyze has run, which
+    // happens while its enclosing function is checked. If that never happened (the function
+    // is a generic template, or the lambda was rejected) there is nothing valid to check.
+    if (d->kind == ST_DE_FN && d->fn.is_lambda && d->fn.caps.count && !d->fn.lambda_done)
+        return;
     ST_fn_sig_t *sig = &d->fn.sig;
     ST_ty_t *fnty = sym->t;
 
@@ -7924,7 +9145,7 @@ static void ST_sema_default_types(ST_sema_t *se, ST_program_t *prog) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)
             continue;
-        if (d->kind == ST_DE_FN && d->fn.sig.generics.count)
+        if (d->kind == ST_DE_FN && (d->fn.sig.generics.count || ST_FN_UNFINISHED_LAMBDA(d)))
             continue;
 
         switch (d->kind) {

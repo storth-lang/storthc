@@ -312,9 +312,17 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         te->inner = ST_parse_type(p);
         return te->inner ? te : NULL;
     }
-    if (ST_tok_is_kw(t, ST_kfn)) {
+    b8 is_clo = ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "closure") &&
+        (ST_tok_is_symbol(ST_peek2(p), "(") ||
+         (ST_tok_is_symbol(ST_peek2(p), "&") && ST_tok_is_symbol(ST_tok_at(p, p->pos + 2), "(")));
+    if (ST_tok_is_kw(t, ST_kfn) || is_clo) {
         p->pos++;
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_FN, t->line, t->col);
+        te->fn_is_closure = is_clo;
+        if (is_clo && ST_at_symbol(p, "&")) {
+            te->fn_closure_ref = 1;
+            p->pos++;
+        }
         if (!ST_expect_sym(p, "("))
             return NULL;
         while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
@@ -599,6 +607,28 @@ static ST_string_t ST_mangle_trait_impl_name(ST_arena_t *a, ST_string_t trait_na
     return (ST_string_t){.data = buf, .len = off};
 }
 
+// '$' can't appear in a user identifier, so this can never collide with a name the user wrote.
+static ST_string_t ST_mangle_lambda_name(ST_arena_t *a, ST_string_t parent, u32 id) {
+    char num[16];
+    int nlen = snprintf(num, sizeof num, "%u", id);
+    static const char mid[] = "lambda$";
+    u32 mlen = (u32)(sizeof mid - 1);
+    u32 plen = parent.len ? parent.len + 1 : 0; // 'parent$'
+    u32 total = plen + mlen + (u32)nlen;
+    u8 *buf = ST_arena_push(a, total);
+    u32 at = 0;
+    if (parent.len) {
+        memcpy(buf, parent.data, parent.len);
+        buf[parent.len] = '$';
+        at = plen;
+    }
+    memcpy(buf + at, mid, mlen);
+    memcpy(buf + at + mlen, num, (u32)nlen);
+    return (ST_string_t){.data = buf, .len = total};
+}
+
+static ST_expr_t *ST_parse_lambda(ST_parser_t *p);
+
 static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
     ST_token_t *t = ST_peek(p);
     if (!t) {
@@ -640,6 +670,8 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
             break;
     }
 
+    if (ST_tok_is_kw(t, ST_kfn) && ST_tok_is_symbol(ST_peek2(p), "("))
+        return ST_parse_lambda(p);
     if (ST_tok_is_kw(t, ST_ktrue) || ST_tok_is_kw(t, ST_kfalse)) {
         p->pos++;
         ST_expr_t *e = ST_expr_new(p->arena, ST_EX_BOOL, t->line, t->col);
@@ -860,7 +892,9 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
                 ti->trait_impl.trait_args = gargs;
                 ST_string_t synth = ST_mangle_trait_impl_name(p->arena, t->text, &gargs, ++p->next_trait_impl_id);
                 ST_da_append_arena(p->arena, &p->fn_name_stack, synth);
+                p->trait_impl_depth++;
                 b8 body_ok = ST_parse_body(p, &ti->trait_impl.body);
+                p->trait_impl_depth--;
                 p->fn_name_stack.count--;
                 if (!body_ok)
                     return NULL;
@@ -931,9 +965,12 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
 
         p->pos++;
         u32 save = p->no_struct_lit;
+        u32 save_bitor = p->no_bitor;
         p->no_struct_lit = 0;
+        p->no_bitor = 0;
         ST_expr_t *e = ST_parse_expr(p);
         p->no_struct_lit = save;
+        p->no_bitor = save_bitor;
         if (!e)
             return NULL;
         if (!ST_expect_sym(p, ")"))
@@ -965,9 +1002,12 @@ static ST_expr_t *ST_parse_postfix(ST_parser_t *p) {
             ST_expr_t *c = ST_expr_new(p->arena, ST_EX_CALL, e->line, e->col);
             c->call.callee = e;
             u32 save = p->no_struct_lit;
+            u32 save_bitor = p->no_bitor;
             p->no_struct_lit = 0;
+            p->no_bitor = 0;
             b8 ok = ST_parse_call_args(p, &c->call.args);
             p->no_struct_lit = save;
+            p->no_bitor = save_bitor;
             if (!ok)
                 return NULL;
             e = c;
@@ -976,7 +1016,9 @@ static ST_expr_t *ST_parse_postfix(ST_parser_t *p) {
             ST_expr_t *ix = ST_expr_new(p->arena, ST_EX_INDEX, t->line, t->col);
             ix->index.base = e;
             u32 save = p->no_struct_lit;
+            u32 save_bitor = p->no_bitor;
             p->no_struct_lit = 0;
+            p->no_bitor = 0;
             ST_expr_t *lo = NULL;
             if (!ST_at_symbol(p, ".."))
                 lo = ST_parse_expr(p);
@@ -1010,6 +1052,7 @@ static ST_expr_t *ST_parse_postfix(ST_parser_t *p) {
             }
             ix->index.index = lo;
             p->no_struct_lit = save;
+            p->no_bitor = save_bitor;
             if (!ST_expect_sym(p, "]"))
                 return NULL;
             e = ix;
@@ -1073,6 +1116,8 @@ static const char *ST_match_binop(ST_parser_t *p, u32 level) {
     for (u32 k = 0; ST_prec[level].ops[k]; k++) {
         const char *op = ST_prec[level].ops[k];
         b8 is_word = (op[0] >= 'a' && op[0] <= 'z');
+        if (p->no_bitor && !is_word && op[0] == '|' && !op[1])
+            continue; // the closing '|' of a capture list, not bitwise or
         if (is_word ? ST_tok_is_keyword(t, op) : ST_tok_is_symbol(t, op))
             return op[0] == 'o' && op[1] == 'r' ? "||" : is_word && op[0] == 'a' ? "&&" : op;
     }
@@ -1926,13 +1971,25 @@ static ST_stmt_t *ST_parse_stmt(ST_parser_t *p) {
     return s;
 }
 
+static b8 ST_parse_body_inner(ST_parser_t *p, ST_stmts_t *out, u32 block_id);
+
 static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
     u32 block_id = ++p->next_block_id;
+    u32 save_block = p->cur_block_id;
+    p->cur_block_id = block_id;
+    b8 ok = ST_parse_body_inner(p, out, block_id);
+    p->cur_block_id = save_block;
+    return ok;
+}
+
+static b8 ST_parse_body_inner(ST_parser_t *p, ST_stmts_t *out, u32 block_id) {
     while (p->pos < p->n_tokens && !ST_at_symbol(p, "}")) {
         if (p->n_errors >= ST_PARSE_MAX_ERRORS)
              return 0;
-        if (ST_tok_is_kw(ST_peek(p), ST_kfn)) {
+        if (ST_tok_is_kw(ST_peek(p), ST_kfn) && !ST_tok_is_symbol(ST_peek2(p), "(")) {
 	    ST_token_t *start_tok = ST_peek(p);
+	    u32 hoist_at = p->nested_fns.count; // anything hoisted while parsing 'nd' goes after it
+	    u32 lambdas_before = p->next_lambda_id;
 	    ST_decl_t *nd = ST_parse_fn_decl(p, 0);
 	    if (!nd) {
 		ST_sync_stmt(p);
@@ -1941,10 +1998,34 @@ static b8 ST_parse_body(ST_parser_t *p, ST_stmts_t *out) {
 
 	    nd->file = start_tok && start_tok->file.len ? start_tok->file : p->file;
 	    nd->fn.decl_block_id = block_id;
+	    if (nd->fn.caps.count)
+	        p->next_lambda_id++; // behaves like a lambda: see the reordering below
 	    if (p->in_comptime_scope)
 	        nd->fn.sig.is_comptime = 1; // only ever callable from a #comptime scope
 	                                   // (see ST_lower_program's existing skip for it)
+	    // Insert 'nd' ahead of the lambdas written inside its body: a lambda that captures
+	    // is rewritten while its enclosing function is checked, so that must come first.
 	    ST_da_append_arena(p->arena, &p->nested_fns, nd);
+	    if (p->next_lambda_id != lambdas_before)
+	    for (u32 k = p->nested_fns.count - 1; k > hoist_at; k--) {
+	        ST_decl_t *tmp = p->nested_fns.items[k];
+	        p->nested_fns.items[k] = p->nested_fns.items[k - 1];
+	        p->nested_fns.items[k - 1] = tmp;
+	    }
+
+	    if (nd->fn.caps.count) {
+	        // 'fn f(..) |x| { .. }' is sugar for 'f := fn(..) |x| { .. };': 'f' is a local
+	        // holding the closure, not a function other code can name.
+	        nd->fn.is_lambda = 1;
+	        nd->fn.decl_block_id = block_id;
+	        ST_stmt_t *bind = ST_stmt_new(p->arena, ST_ST_DECL, start_tok->line, start_tok->col);
+	        bind->decl.name = nd->display_name.len ? nd->display_name : nd->name;
+	        bind->decl.init = ST_expr_new(p->arena, ST_EX_IDENT, start_tok->line, start_tok->col);
+	        bind->decl.init->name = nd->name;
+	        nd->display_name = (ST_string_t){0};
+	        ST_da_append_arena(p->arena, out, bind);
+	        continue;
+	    }
 
 	    // Leave a marker exactly where 'fn' was written so semantic analysis
 	    // can scope its visibility to this block instead of the whole
@@ -1973,6 +2054,176 @@ static ST_string_t ST_mangle_nested_fn(ST_arena_t *a, ST_string_t parent, ST_str
     buf[parent.len] = '$';
     memcpy(buf + parent.len + 1, name.data, name.len);
     return (ST_string_t){.data = buf, .len = total};
+}
+
+// '|x, &y|': variables of the enclosing function a lambda or nested fn uses. '&y' captures by
+// reference, so the body can modify the original.
+static b8 ST_parse_capture_list(ST_parser_t *p, ST_captures_t *out) {
+    ST_token_t *open = ST_peek(p);
+    p->pos++; // '|'
+    while (!ST_at_symbol(p, "|")) {
+        if (p->pos >= p->n_tokens) {
+            ST_perr(p, open->line, open->col, "the capture list is never closed with '|'");
+            return 0;
+        }
+        ST_capture_t c = {0};
+        if (ST_at_symbol(p, "&")) {
+            c.by_ref = 1;
+            p->pos++;
+        }
+        ST_token_t *nt = ST_peek(p);
+        c.line = nt ? nt->line : open->line;
+        c.col = nt ? nt->col : open->col;
+        c.name = ST_expect_ident(p, "a variable name in the capture list");
+        if (!c.name.len)
+            return 0;
+        // 'name: type = value', 'name := value' or 'name = value': a capture that is not an existing
+        // variable but a value written right here, copied into the closure like a by-value capture.
+        b8 has_ty = ST_at_symbol(p, ":");
+        if (has_ty || ST_at_symbol(p, ":=") || ST_at_symbol(p, "=")) {
+            if (c.by_ref) {
+                ST_perr(p, c.line, c.col,
+                        "'&" ST_sv_fmt "' can't be given a value\n"
+                        "a by reference capture points at an existing variable; drop the '&' "
+                        "to capture a value written here",
+                        ST_sv_args(c.name));
+                return 0;
+            }
+            p->pos++;
+            c.is_init = 1;
+            if (has_ty) {
+                c.te = ST_parse_type(p);
+                if (!c.te)
+                    return 0;
+                if (!ST_expect_sym(p, "="))
+                    return 0;
+            }
+            u32 save_bitor = p->no_bitor;
+            p->no_bitor = 1;
+            c.src = ST_parse_expr(p);
+            p->no_bitor = save_bitor;
+            if (!c.src)
+                return 0;
+            ST_forrange(0, out->count) {
+                if (ST_string_eq(out->items[i].name, c.name)) {
+                    ST_perr(p, c.line, c.col, "'" ST_sv_fmt "' is already in the capture list",
+                            ST_sv_args(c.name));
+                    return 0;
+                }
+            }
+            ST_da_append_arena(p->arena, out, c);
+            if (ST_at_symbol(p, ","))
+                p->pos++;
+            else if (!ST_at_symbol(p, "|")) {
+                ST_perr_here(p, "expected ',' or '|' in the capture list");
+                return 0;
+            }
+            continue;
+        }
+        ST_forrange(0, out->count) {
+            if (ST_string_eq(out->items[i].name, c.name)) {
+                ST_perr(p, c.line, c.col, "'" ST_sv_fmt "' is already in the capture list",
+                        ST_sv_args(c.name));
+                return 0;
+            }
+        }
+        c.src = ST_expr_new(p->arena, ST_EX_IDENT, c.line, c.col);
+        c.src->name = c.name;
+        ST_da_append_arena(p->arena, out, c);
+        if (ST_at_symbol(p, ","))
+            p->pos++;
+        else if (!ST_at_symbol(p, "|")) {
+            ST_perr_here(p, "expected ',' or '|' in the capture list");
+            return 0;
+        }
+    }
+    p->pos++; // closing '|'
+    if (!out->count) {
+        ST_perr(p, open->line, open->col,
+                "empty capture list\nlist the variables to capture, e.g. '|x, &y|', or drop the '| |'");
+        return 0;
+    }
+    return 1;
+}
+
+// Anonymous function: hoisted to a top-level fn; the expression becomes a reference to it.
+// A lambda with a capture list, 'fn(..) |x, &y| { .. }', is turned into a closure later by
+// semantic analysis (see ST_lambda_analyze), the first pass that knows the types of the
+// captured variables.
+static ST_expr_t *ST_parse_lambda(ST_parser_t *p) {
+    ST_token_t *ft = ST_peek(p);
+    p->pos++; // 'fn'
+
+    ST_decl_t *d = ST_decl_new(p->arena, ST_DE_FN, ft->line, ft->col);
+    ST_string_t parent = p->fn_name_stack.count
+                             ? p->fn_name_stack.items[p->fn_name_stack.count - 1]
+                             : (ST_string_t){0};
+    d->name = ST_mangle_lambda_name(p->arena, parent, ++p->next_lambda_id);
+    d->file = ft->file.len ? ft->file : p->file;
+    d->fn.is_lambda = 1;
+    // Same block as the code that wrote it, so sibling nested fns of that block are
+    // callable by bare name from inside the lambda.
+    d->fn.decl_block_id = p->cur_block_id;
+
+    u32 type_params_save = p->type_params.count;
+    if (!ST_parse_fn_sig(p, &d->fn.sig, 0)) {
+        p->type_params.count = type_params_save;
+        return NULL;
+    }
+    ST_forrange(0, d->fn.sig.params.count) {
+        ST_param_t *pm = &d->fn.sig.params.items[i];
+        ST_collect_generic_te(p, pm->te, &d->fn.sig.generics);
+        if (pm->def) {
+            ST_perr(p, pm->line, pm->col,
+                    "lambda parameter '" ST_sv_fmt "' can't have a default value\n"
+                    "a lambda is called through a function pointer, which has no defaults",
+                    ST_sv_args(pm->name));
+            p->type_params.count = type_params_save;
+            return NULL;
+        }
+    }
+    ST_forrange(0, d->fn.sig.rets.count)
+        ST_collect_generic_te(p, d->fn.sig.rets.items[i], &d->fn.sig.generics);
+    if (d->fn.sig.generics.count) {
+        ST_perr(p, ft->line, ft->col,
+                "a lambda can't be generic\n"
+                "give its parameters and return type concrete types");
+        p->type_params.count = type_params_save;
+        return NULL;
+    }
+    if (ST_at_symbol(p, "|") && !ST_parse_capture_list(p, &d->fn.caps)) {
+        p->type_params.count = type_params_save;
+        return NULL;
+    }
+    if (!ST_expect_sym(p, "{")) {
+        p->type_params.count = type_params_save;
+        return NULL;
+    }
+    if (p->in_comptime_scope)
+        d->fn.sig.is_comptime = 1;
+
+    // Hoist before parsing the body (pre-order), so a lambda written inside this one is
+    // checked after it and can capture this lambda's own captured variables.
+    ST_da_append_arena(p->arena, &p->nested_fns, d);
+
+    u32 save_no_struct_lit = p->no_struct_lit;
+    u32 save_no_bitor = p->no_bitor;
+    p->no_struct_lit = 0;
+    p->no_bitor = 0;
+    ST_da_append_arena(p->arena, &p->fn_name_stack, d->name);
+    b8 body_ok = ST_parse_body(p, &d->fn.body);
+    p->fn_name_stack.count--;
+    p->no_struct_lit = save_no_struct_lit;
+    p->no_bitor = save_no_bitor;
+    p->type_params.count = type_params_save;
+    if (!body_ok)
+        return NULL;
+    if (!ST_expect_sym(p, "}"))
+        return NULL;
+
+    ST_expr_t *e = ST_expr_new(p->arena, ST_EX_IDENT, ft->line, ft->col);
+    e->name = d->name;
+    return e;
 }
 
 static ST_decl_t *ST_parse_method_decl(ST_parser_t *p, b8 is_pub) {
@@ -2004,6 +2255,32 @@ static void ST_register_type_param(ST_parser_t *p, ST_fn_sig_t *sig) {
         ST_da_append_arena(p->arena, &sig->generics, pm->name);
 }
 
+// A parameter written 'f: fn(x: i32) -> i32' accepts a closure too: it is read as the borrowing closure type
+// 'closure&(x: i32) -> i32', which already takes a plain function, a lambda and any closure (captures by value
+// or by reference), and is called the same way. Left alone, because the closure type can't express them or
+// because the signature has to stay a thin function pointer:
+//  - generic signatures and '#comptime' functions (a trait method, witness or '$T' callback keeps its exact type)
+//  - methods inside a trait implementation, which must match the trait's declaration
+//  - variadic, noreturn and multi-value 'fn' types, and '::' constant parameters
+static void ST_fn_params_accept_closures(ST_parser_t *p, ST_decl_t *d) {
+    if (p->trait_impl_depth || p->in_comptime_scope || d->fn.sig.is_comptime)
+        return;
+    ST_forrange(0, d->fn.sig.params.count) {
+        ST_param_t *pm = &d->fn.sig.params.items[i];
+        ST_tyexpr_t *te = pm->te;
+        if (!te || te->kind != ST_TE_FN || te->fn_is_closure || pm->is_const || pm->is_pack)
+            continue;
+        if (te->fn_is_variadic || te->fn_is_noreturn || te->fn_rets.count > 1)
+            continue;
+        ST_strings_t found = {0};
+        ST_collect_generic_te(p, te, &found);
+        if (found.count)
+            continue;
+        te->fn_is_closure = 1;
+        te->fn_closure_ref = 1;
+    }
+}
+
 static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
     ST_token_t *t = ST_peek(p);
     p->pos++;
@@ -2029,11 +2306,25 @@ static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
         ST_collect_generic_te(p, d->fn.sig.params.items[i].te, &d->fn.sig.generics);
     ST_forrange(0, d->fn.sig.rets.count)
         ST_collect_generic_te(p, d->fn.sig.rets.items[i], &d->fn.sig.generics);
+    ST_fn_params_accept_closures(p, d);
     if (ST_at_symbol(p, ";")) {
         p->pos++;
         d->fn.is_prototype = 1;
         p->type_params.count = type_params_save;
         return d;
+    }
+    if (ST_at_symbol(p, "|")) {
+        ST_token_t *bar = ST_peek(p);
+        if (!ST_parse_capture_list(p, &d->fn.caps)) {
+            p->type_params.count = type_params_save;
+            return NULL;
+        }
+        if (!p->fn_name_stack.count) {
+            ST_perr(p, bar->line, bar->col,
+                    "only a function written inside another function can have a capture list");
+            p->type_params.count = type_params_save;
+            return NULL;
+        }
     }
     if (!ST_expect_sym(p, "{"))
         return NULL;

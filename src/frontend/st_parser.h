@@ -30,6 +30,7 @@ typedef struct {
     ST_string_t file;
     u32 n_errors;
     u32 no_struct_lit;
+    u32 no_bitor; // > 0 while parsing a capture list initializer: a bare '|' ends it
     ST_srcmap_t *srcs;
     u32 suppress_errors; // Issue fix: https://github.com/storth-lang/storthc/issues/40
     ST_decls_t nested_fns;
@@ -39,6 +40,9 @@ typedef struct {
     ST_strings_t type_params;
     u32 next_block_id;
     u32 next_trait_impl_id;
+    u32 trait_impl_depth; // > 0 while parsing the body of a trait implementation
+    u32 next_lambda_id;
+    u32 cur_block_id; // id of the innermost block being parsed (0 outside any body)
     b8 in_comptime_scope;
     u32 expr_depth;
 } ST_parser_t;

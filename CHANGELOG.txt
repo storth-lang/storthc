@@ -1,5 +1,67 @@
 # Storth Programming Language
 
+2026:11:23
+- Lambdas: `fn(x: i32) -> i32 { return x * 2; }` is now an expression. The parser hoists each one to an ordinary
+  top-level function with an unspellable name (`main$lambda$1`, or `parent$lambda$N` inside another function) and the
+  expression becomes a reference to it, so it is a plain function pointer and semantic analysis, lowering and the
+  backends needed no changes. A statement that starts with `fn(` is a lambda, `fn name(` is still a nested function.
+- A lambda can be assigned, passed, called where it is written (`fn(x: i32) -> i32 { .. }(3)`), stored in struct
+  fields and arrays, returned, nested, and written in nested functions, generic functions, trait witnesses, modules
+  and `defer`.
+- Untyped parameters, default values, generic parameters and a missing body in a lambda are errors.
+- Closures: a lambda or nested fn can have a capture list after its signature, `fn(x: i32) -> i32 |a, &b| { .. }`.
+  `a` is copied when the lambda is written and is read only (assigning to it is an error), `&b` is captured by
+  reference, so the body reads and modifies the original. Nothing is captured implicitly: using an outer variable that
+  is not in the list is "use of undeclared identifier" plus a note showing the list.
+- How: semantic analysis, the first pass that knows the captured types, synthesizes a struct `NAME$env` with a field
+  per capture (the value, or a pointer for `&b`), gives the hoisted function that struct as a hidden first parameter,
+  starts its body with `a := env.a;` and turns every use of `b` into `*env.b`. The lambda expression becomes the
+  literal `NAME$env { a = a, b = &b }` and `f(3)` on such a value becomes `NAME(f, 3)`.
+- A closure is an ordinary struct value: copy it, store it in a local, pass it to a `$T` parameter. Its own type can't
+  be spelled, but `closure(x: i32) -> i32` can: it is the type-erased form, a struct `{ call, env }` holding the
+  hoisted function and up to 64 bytes of captured data inline. Anything with that signature converts to it where a
+  value of that type is expected (arguments, `:=` with a type, assignment, return, struct fields, array elements): a
+  closure with by-value captures, a plain lambda or any `fn(..)` value. Calling it is `f(3)`, which becomes
+  `f.call(&f.env, 3)`, so the callee must be a variable, field or element. It returns at most one value.
+- `closure(..)` owns its captures, so it can be returned, stored and copied freely. A closure with a `&b` capture only
+  converts to the borrowing form `closure&(..)`, which also accepts everything `closure(..)` does. The compiler
+  rejects returning, storing through a pointer, slice or global, or keeping in a `static` a value whose type is, or
+  contains, a by-reference closure or a `closure&(..)`, because it points into the frame that wrote the lambda. The
+  check follows types, not data flow, so a callee that returns a `closure&(..)` parameter is caught but a closure
+  smuggled out through an `any` or a `*void` is not.
+- A closure is still not a function pointer: `fn(..)` has no room for the captured data, so a closure can't be
+  assigned to a `fn(x: i32) -> i32` variable or struct field, or returned as one. Write that type as
+  `closure(x: i32) -> i32`; a plain `fn(..)` value converts to that, so one signature accepts both.
+- A capture can be a value written in the list instead of an existing variable: `fn(x: i32) -> i32 |a: i32 = 1, b: i32 = 2| { .. }`.
+  `name: type = value`, `name := value` and `name = value` (type taken from the value) are copied into the closure like a
+  by-value capture, so the result still converts to `closure(..)`; they can be mixed with `|x, &y|`. The value is
+  evaluated where the lambda is written and can use the enclosing function's variables. `&name = value` is an error. A
+  bare `|` ends the list, so write bitwise or inside parentheses: `|mask: u32 = (A | B)|`.
+  `tests/18-capture-init.st`: run `tests/set.sh 18-capture-init.st` to record its snapshot.
+- A function parameter written `f: fn(x: i32) -> i32` takes a closure too. The parser reads it as the borrowing
+  type `closure&(x: i32) -> i32`, which accepts a plain function, a lambda and a closure with by-value or by-reference
+  captures, and `f(3)` is called the same way. Because the parameter is now a closure, inside the function it can be
+  called and passed on to another such parameter, but not stored in a `fn(..)` field, returned as a `fn(..)` or
+  passed to an extern C function: declare the parameter as `closure(..)` to store or return it. Left as a plain
+  function pointer: signatures that mention a generic parameter (`fn(x: $T) -> $T`), `#comptime` functions, methods
+  inside a trait implementation, `::` parameters, and `fn` types that are variadic, noreturn or return more than one
+  value. `tests/17-fn-param-closure.st`: run `tests/set.sh 17-fn-param-closure.st` to record its snapshot.
+- Writes to a by-value capture are checked by type: assigning to `s.ptr[0]` or `p.x` where the path goes through a
+  pointer, slice or dyn array reaches shared memory and is allowed; `s.arr[0] = x` on a copied array is the error.
+- A by-reference capture can be assigned by a multiple assignment: `a, b = f()` and `a, b = b, a` are rewritten to
+  temporaries followed by plain assignments.
+- `fn name(..) |a| { .. }` inside a function is sugar for `name := fn(..) |a| { .. };`. `name` is a local holding the
+  closure, so it can't call itself.
+- A capture list works inside a generic function (the lambda is cloned for every instantiation, so `$T` can be used
+  in its body and captured variables may have generic types) and on a generic nested function,
+  `fn add(x: $U) |&total| { .. }`. Still not allowed: on a top-level function, on a generic nested function written
+  inside another generic function, and in a `#comptime` scope, where the VM can't pass a struct argument to a
+  function yet.
+- A lambda can call the nested functions written in the same block by bare name. A nested fn that contains a lambda
+  is now hoisted before it, so the enclosing function is checked first.
+- `tests/14-lambda.st`, `tests/15-closure.st`, `tests/16-closure-types.st`: run
+  `tests/set.sh 14-lambda.st 15-closure.st 16-closure-types.st` to record their snapshots.
+
 2026:11:18
 - `#caller_location` as a default parameter value (`loc := #caller_location`) is stamped with the call site's
   file, line and column. It replaces `#code`. The value has the builtin type `Source_Code_Location` with the

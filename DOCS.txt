@@ -184,6 +184,56 @@ fn foo() -> void {
 }
 `
 This function bar is completely inacessible by functions of the outside world making it truely local to that specific defintion.
+A function can also be written without a name, as an expression. This is a lambda and the result is a plain function pointer.
+`src_code
+fn main() -> i32 {
+   dbl := fn(x: i32) -> i32 { return x * 2; };
+   y := dbl(21);
+   z := fn(x: i32) -> i32 { return x * 3; }(3);
+   return 0;
+}
+`
+Parameter types are required and a lambda can't be generic or have default parameters.
+To use variables of the function around it, a lambda lists them between bars after the signature.
+A plain name is copied where the lambda is written and is read only, a name with & is captured by reference so the lambda can modify it.
+`src_code
+fn main() -> i32 {
+   base := 10;
+   count := 0;
+   add := fn(x: i32) -> i32 |base, &count| {
+      count += 1;
+      return x + base;
+   };
+   y := add(5);
+   return 0;
+}
+`
+A capture can also be a value written in the list, given as name: type = value (or name := value to take the type from the value),
+which is copied into the closure like a by value capture. The value is evaluated where the lambda is written, and a bare | ends the
+list so bitwise or needs parentheses.
+`src_code
+f := fn(x: i32) -> i32 |a: i32 = 1, b: i32 = 2| {
+   return x * a * b;
+};
+`
+Nothing is captured that is not listed. A lambda with a capture list is a struct value and not a function pointer, so it can not
+be assigned to a fn pointer variable or field, but it can be passed to a template parameter, to a parameter of type closure, or to
+a function parameter written as a fn type: `f: fn(x: i32) -> i32` on a function parameter accepts a plain function, a lambda and a
+closure alike (it is read as closure&(x: i32) -> i32, so inside the function it can be called and passed on, but not stored in a fn
+field, returned as a fn or handed to a C function; use a parameter of type closure(..) for that). Generic signatures, #comptime
+functions and trait implementation methods keep a plain fn pointer.
+`closure(x: i32) -> i32` is a type you can write: it holds the function and up to 64 bytes of captured data, so it can be returned,
+stored in structs and arrays and copied. A plain fn value converts to it as well, so a parameter of that type takes either.
+`src_code
+fn make_adder(k: i32) -> closure(x: i32) -> i32 {
+   return fn(x: i32) -> i32 |k| { return x + k; };
+}
+fn twice(f: closure&(x: i32) -> i32, v: i32) -> i32 {
+   return f(f(v));
+}
+`
+A by reference capture points into the function that wrote the lambda, so it only converts to closure&(..), the borrowing form,
+and the compiler rejects returning one or storing it through a pointer, a slice or a global.
 Functions can also have default parameters. These default params can be named parameters to be modfied.
 The idea of positionally named argument is that the compiler already knows what variable is associated with
 which argument so hard locking on the argument position is stupid for that regard.
