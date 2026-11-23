@@ -2259,10 +2259,11 @@ static void ST_register_type_param(ST_parser_t *p, ST_fn_sig_t *sig) {
 // 'closure&(x: i32) -> i32', which already takes a plain function, a lambda and any closure (captures by value
 // or by reference), and is called the same way. Left alone, because the closure type can't express them or
 // because the signature has to stay a thin function pointer:
-//  - generic signatures and '#comptime' functions (a trait method, witness or '$T' callback keeps its exact type)
+//  - generic signatures and '#comptime' functions (a trait method, witness or '$T' callback keeps its exact type),
+//    except a method of a plain 'impl Type { .. }' block whose callback only uses the type's own generics
 //  - methods inside a trait implementation, which must match the trait's declaration
 //  - variadic, noreturn and multi-value 'fn' types, and '::' constant parameters
-static void ST_fn_params_accept_closures(ST_parser_t *p, ST_decl_t *d) {
+static void ST_fn_params_accept_closures(ST_parser_t *p, ST_decl_t *d, ST_strings_t *impl_generics) {
     if (p->trait_impl_depth || p->in_comptime_scope || d->fn.sig.is_comptime)
         return;
     ST_forrange(0, d->fn.sig.params.count) {
@@ -2274,7 +2275,19 @@ static void ST_fn_params_accept_closures(ST_parser_t *p, ST_decl_t *d) {
             continue;
         ST_strings_t found = {0};
         ST_collect_generic_te(p, te, &found);
-        if (found.count)
+        // A method in a plain 'impl Type { .. }' block may use the type's own generics ('f: fn(x: $T) -> $T'):
+        // they are fixed by the receiver, so the callback can still take a closure. Any other generic stays exact.
+        b8 only_impl_generics = impl_generics != NULL;
+        ST_forrange(0, found.count) {
+            b8 ok = 0;
+            if (impl_generics)
+                for (u32 g = 0; g < impl_generics->count; g++)
+                    if (ST_string_eq(found.items[i], impl_generics->items[g]))
+                        ok = 1;
+            if (!ok)
+                only_impl_generics = 0;
+        }
+        if (found.count && !only_impl_generics)
             continue;
         te->fn_is_closure = 1;
         te->fn_closure_ref = 1;
@@ -2306,7 +2319,7 @@ static ST_decl_t *ST_parse_fn_decl(ST_parser_t *p, b8 is_pub) {
         ST_collect_generic_te(p, d->fn.sig.params.items[i].te, &d->fn.sig.generics);
     ST_forrange(0, d->fn.sig.rets.count)
         ST_collect_generic_te(p, d->fn.sig.rets.items[i], &d->fn.sig.generics);
-    ST_fn_params_accept_closures(p, d);
+    ST_fn_params_accept_closures(p, d, NULL);
     if (ST_at_symbol(p, ";")) {
         p->pos++;
         d->fn.is_prototype = 1;
@@ -2654,6 +2667,7 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
             if (!present)
                 ST_da_append_arena(p->arena, &d->fn.sig.generics, generics.items[i]);
         }
+        ST_fn_params_accept_closures(p, d, &generics);
         d->display_name = d->name;
         if (is_static) {
             ST_tyexpr_t *self_te = ST_tyexpr_new(p->arena, ST_TE_NAME, d->line, d->col);
