@@ -33,12 +33,20 @@ typedef struct {
 } ST_dbg_fn_t;
 
 typedef struct {
+    ST_string_t name;  // name shown in the debugger
+    ST_string_t label; // assembler label of the storage
+    ST_ty_t *ty;
+} ST_dbg_global_t;
+
+typedef struct {
     ST_string_t *files;
     u32 n_files, files_cap;
     ST_dbg_row_t *rows;
     u32 n_rows, rows_cap;
     ST_dbg_fn_t *fns;
     u32 n_fns, fns_cap;
+    ST_dbg_global_t *globals;
+    u32 n_globals, globals_cap;
 } ST_dbg_info_t;
 
 u32 ST_dbg_intern_file(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t file);
@@ -51,6 +59,9 @@ u32 ST_dbg_add_row(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t label, u3
 
 void ST_dbg_add_var(ST_arena_t *arena, ST_dbg_info_t *info, u32 fn_idx, ST_string_t name,
                     ST_ty_t *ty, i32 frame_off, b8 is_param);
+
+void ST_dbg_add_global(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t name,
+                       ST_string_t label, ST_ty_t *ty);
 
 void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir);
 void ST_dwarf_emit_nasm_asan_lines(FILE *out, ST_dbg_info_t *info);

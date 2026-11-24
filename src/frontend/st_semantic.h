@@ -125,6 +125,7 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
 // unary/binary integer ops, and sizeof/alignof). Returns 0 if 'e' cannot be
 // folded to a constant at compile time.
 b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out);
+ST_expr_t *ST_const_struct_lit_of(ST_sema_t *se, ST_expr_t *e);
 
 // @note: looks up the symbol for exactly this decl, not just any symbol sharing
 // its name

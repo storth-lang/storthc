@@ -2678,7 +2678,7 @@ static void ST_impl_finish(ST_parser_t *p, ST_program_t *out, ST_string_t file) 
             d->fn.is_method = 1;
         }
         d->name = ST_mangle_method_name(p->arena, m->type_name, d->name);
-        d->file = file;
+        d->file = m->head && m->head->file.len ? m->head->file : file;
         ST_da_append_arena(p->arena, &out->decls, d);
     }
 }
@@ -2945,12 +2945,7 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
             p->pos++;
             if (ST_at_symbol(p, "..") || ST_at_symbol(p, "...")) {
                 ST_tyexpr_t *vt = ST_tyexpr_new(p->arena, ST_TE_NAME, param.line, param.col);
-                vt->is_generic_param = 1;
-                char nm[128];
-                int nl = snprintf(nm, sizeof(nm), "__va_" ST_sv_fmt, ST_sv_args(param.name));
-                u8 *nb = ST_arena_push(p->arena, (u32)nl);
-                memcpy(nb, nm, (u32)nl);
-                vt->name = (ST_string_t){.data = nb, .len = (u32)nl};
+                vt->name = ST_cstr_to_str("any");
                 param.te = vt;
             } else {
                 param.te = ST_parse_type(p);
@@ -3001,10 +2996,14 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                     return 0;
                 }
                 param.is_pack = 1;
-                if (is_any)
-                    sig->has_any_pack = 1; // runtime: collected into a real array, see ST_lower.c
-                else
-                    sig->has_generic_pack = 1; // comptime: one synthetic param per call-site arg,
+                if (is_any) {
+                    ST_tyexpr_t *slice = ST_tyexpr_new(p->arena, ST_TE_ARRAY, param.line, param.col);
+                    slice->inner = param.te;
+                    param.te = slice;
+                    sig->has_any_pack = 1;
+                } else {
+                    sig->has_generic_pack = 1;
+                }
                 ST_da_append_arena(p->arena, &sig->params, param);
                 if (!ST_at_symbol(p, ")")) {
                     ST_perr_here(p, "'" ST_sv_fmt "...' must be the last parameter",

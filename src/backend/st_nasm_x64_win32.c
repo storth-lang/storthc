@@ -149,10 +149,9 @@ static int ST_global_field_init_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
+static void ST_gen_struct_global_data(FILE *out, ST_arena_t *arena, ST_ir_global_var_t *g) {
     u32 n = g->field_inits.count;
-    ST_ir_global_field_init_t *sorted = malloc(sizeof(*sorted) * (n ? n : 1));
-    ST_assert(sorted);
+    ST_ir_global_field_init_t *sorted = ST_arena_push(arena, sizeof(*sorted) * (n ? n : 1));
     ST_forrange(0, n) sorted[i] = g->field_inits.items[i];
     qsort(sorted, n, sizeof(*sorted), ST_global_field_init_cmp);
     u32 cursor = 0;
@@ -171,7 +170,6 @@ static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
     u32 total = g->ty && g->ty->size ? g->ty->size : cursor;
     if (total > cursor)
         fprintf(out, "    times %u db 0\n", total - cursor);
-    free(sorted);
 }
 
 static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
@@ -196,7 +194,7 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
             fprintf(out, "align %u\n", align);
             fprintf(out, ST_sv_fmt ":\n", ST_sv_args(g->name));
             if (g->field_inits.count) {
-                ST_gen_struct_global_data(out, g);
+                ST_gen_struct_global_data(out, m->arena, g);
                 continue;
             }
             u32 size = g->ty && g->ty->size ? g->ty->size : 8;

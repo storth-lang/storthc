@@ -2,6 +2,7 @@
 
 #include "st_semantic.h"
 #include "st_lexer.h"
+#include "st_parser.h"
 #include "comptime/st_comptime.h"
 #include "comptime/st_comptime_compile.h"
 
@@ -356,6 +357,19 @@ static void ST_ast_substitute_stmt(ST_sema_t *se, ST_stmt_t *s, ST_string_t targ
                                    ST_expr_t *replacement); // used by ST_instantiate_fn_ex's
 // 'where' clause witness substitution, defined later in this file
 static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig);
+static void ST_erase_witness(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to);
+
+typedef struct {
+    ST_expr_t **slot;
+    ST_ty_t *ty;
+} ST_pending_default_erase_t;
+
+typedef struct {
+    ST_pending_default_erase_t *items;
+    u32 count, capacity;
+} ST_pending_default_erases_t;
+
+static ST_pending_default_erases_t ST_pending_default_erases;
 static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 
 b8 ST_const_eval(ST_sema_t *se, ST_expr_t *e, i64 *out);
@@ -931,15 +945,85 @@ static ST_sym_t *ST_find_witness(ST_sema_t *se, ST_string_t name, ST_ty_t *want_
     return NULL;
 }
 
+static void ST_bind_generic_name(ST_sema_t *se, ST_ht_t *bindings, ST_string_t name, ST_ty_t *ty) {
+    ST_ht_generic_t *bk = ST_arena_push(se->arena, sizeof(*bk));
+    bk->tag = name.data;
+    bk->size = name.len;
+    ST_ht_set(bindings, bk, (ST_ht_generic_t){.tag = ty, .size = 0});
+}
+
+static ST_ty_t *ST_erased_generic_method_ty(ST_sema_t *se, ST_decl_t *trait,
+                                            ST_trait_method_t *m) {
+    ST_ht_t bindings;
+    ST_ht_init(se->arena, &bindings, 8);
+    ST_ty_t *vt = se->tys.prim[ST_tvoid];
+    ST_forrange(0, trait->trait_.generics.count)
+        ST_bind_generic_name(se, &bindings, trait->trait_.generics.items[i], vt);
+    ST_forrange(0, m->sig.generics.count)
+        ST_bind_generic_name(se, &bindings, m->sig.generics.items[i], vt);
+
+    ST_tyexpr_t *fnte = ST_tyexpr_new(se->arena, ST_TE_FN, m->line, m->col);
+    fnte->fn_is_variadic = m->sig.is_variadic;
+    fnte->fn_is_noreturn = m->sig.is_noreturn;
+    ST_forrange(0, m->sig.params.count) {
+        ST_param_t *mp = &m->sig.params.items[i];
+        if (!mp->te)
+            return NULL;
+        ST_da_append_arena(se->arena, &fnte->fn_params, mp->te);
+    }
+    ST_forrange(0, m->sig.rets.count)
+        ST_da_append_arena(se->arena, &fnte->fn_rets, m->sig.rets.items[i]);
+
+    ST_ht_t *save = se->generic_bindings;
+    b8 save_s = se->stamp_tyexprs;
+    se->generic_bindings = &bindings;
+    se->stamp_tyexprs = 0;
+    ST_ty_t *ft = ST_resolve_tyexpr(se, fnte);
+    se->stamp_tyexprs = save_s;
+    se->generic_bindings = save;
+    return ft;
+}
+
 static ST_ty_t *ST_erased_witness_ty(ST_sema_t *se, ST_decl_t *trait, u32 line, u32 col) {
     if (trait->trait_.generics.count != 1)
         return NULL;
     ST_tys_t args = {0};
     ST_da_append_arena(se->arena, &args, se->tys.prim[ST_tvoid]);
     ST_ty_t *t = ST_instantiate_trait_witness(se, trait, args, line, col);
-    if (t)
+    if (t && !t->is_erased_witness) {
         t->is_erased_witness = 1;
+        ST_forrange(0, trait->trait_.methods.count) {
+            ST_trait_method_t *m = &trait->trait_.methods.items[i];
+            if (!m->sig.generics.count || i >= t->fields.count)
+                continue;
+            ST_ty_t *ft = ST_erased_generic_method_ty(se, trait, m);
+            if (ft)
+                t->fields.items[i].ty = ft;
+        }
+    }
     return t;
+}
+
+// @note: a global/const initializer that is just the name of another global/const whose own
+// initializer is a constant struct literal (e.g. 'allocator : Allocator = libc;', where
+// 'libc' is a trait witness). Returns that literal, following chains of such names.
+ST_expr_t *ST_const_struct_lit_of(ST_sema_t *se, ST_expr_t *e) {
+    for (int depth = 0; e && depth < 16; depth++) {
+        if (e->kind == ST_EX_STRUCT_LIT || e->kind == ST_EX_TRAIT_IMPL)
+            return e;
+        if (e->kind != ST_EX_IDENT)
+            return NULL;
+        ST_sym_t *s = ST_sym_find_expr(se, e);
+        if (!s || !s->decl)
+            return NULL;
+        if (s->decl->kind == ST_DE_CONST)
+            e = s->decl->const_.value;
+        else if (s->decl->kind == ST_DE_GLOBAL)
+            e = s->decl->global_.init;
+        else
+            return NULL;
+    }
+    return NULL;
 }
 
 static ST_ty_t *ST_type_trait_impl(ST_sema_t *se, ST_expr_t *e) {
@@ -4413,6 +4497,16 @@ static void ST_expand_pack_spread_args(ST_sema_t *se, ST_expr_t *e) {
             continue;
         }
 
+        if (v->kind != ST_EX_STRUCT_LIT) {
+            ST_ty_t *av = ST_type_expr(se, v);
+            if (av && av->kind == ST_TY_SLICE && ST_ty_is_any(se, av->inner)) {
+                ST_arg_t pass = *arg;
+                pass.is_pack_spread = 0;
+                ST_da_append_arena(se->arena, &new_args, pass);
+                continue;
+            }
+        }
+
         if (v->kind == ST_EX_STRUCT_LIT && v->struct_lit.is_bracket_lit) {
             for (u32 k = 0; k < v->struct_lit.inits.count; k++) {
                 ST_arg_t new_arg = {.name = (ST_string_t){0},
@@ -4802,9 +4896,79 @@ static b8 ST_try_static_method_call(ST_sema_t *se, ST_expr_t *e) {
     return 1;
 }
 
+static ST_sym_t *ST_enum_name_helper(ST_sema_t *se, ST_ty_t *et, u32 line, u32 col) {
+    ST_decl_t *ed = et->decl;
+    char hn[512];
+    int hl = snprintf(hn, sizeof(hn), "__enum_name__" ST_sv_fmt, ST_sv_args(ed->name));
+    u8 *hb = ST_arena_push(se->arena, (u32)hl);
+    memcpy(hb, hn, (u32)hl);
+    ST_string_t hname = {.data = hb, .len = (u32)hl};
+    ST_sym_t *existing = ST_sym_find_in(&se->globals, hname);
+    if (existing)
+        return existing;
+
+    u32 cap = 256 + ed->name.len * 2 + hname.len;
+    ST_forrange(0, ed->enum_.variants.count)
+        cap += 64 + ed->enum_.variants.items[i].name.len * 2;
+    char *buf = ST_arena_push(se->arena, cap);
+    u32 n = (u32)snprintf(buf, cap, "fn " ST_sv_fmt "(v: " ST_sv_fmt ") -> string {\n    if v {\n",
+                          ST_sv_args(hname), ST_sv_args(ed->name));
+    ST_forrange(0, ed->enum_.variants.count) {
+        ST_string_t vn = ed->enum_.variants.items[i].name;
+        n += (u32)snprintf(buf + n, cap - n, "        case ." ST_sv_fmt " { return \"" ST_sv_fmt "\"; }\n",
+                           ST_sv_args(vn), ST_sv_args(vn));
+    }
+    n += (u32)snprintf(buf + n, cap - n, "        default { return \"\"; }\n    }\n    return \"\";\n}\n");
+
+    ST_string_t src = {.data = (u8 *)buf, .len = n};
+    ST_string_t file = ST_cstr_to_str("<enum_name>");
+    ST_tokens_t toks = ST_lex(se->arena, src, file);
+    ST_program_t tmp = {0};
+    if (!toks.ok || !ST_parse(se->arena, toks, src, file, se->srcs, &tmp) || !tmp.decls.count) {
+        ST_diag_error(&se->diag, line, col, "internal: could not generate 'enum_name' helper");
+        return NULL;
+    }
+    ST_decl_t *d = tmp.decls.items[0];
+    d->file = ed->file;
+    d->is_pub = ed->is_pub;
+    ST_sym_t *sym = ST_sym_new(se, ST_SYM_FN, d->name, d, NULL, line, col);
+    d->sema_sym = sym;
+    ST_sym_insert(se, &se->globals, sym);
+    ST_build_fn_ty(se, sym, &d->fn.sig);
+    if (se->prog)
+        ST_da_append_arena(se->arena, &se->prog->decls, d);
+    return sym;
+}
+
+static void ST_try_enum_name_call(ST_sema_t *se, ST_expr_t *e) {
+    ST_expr_t *callee = e->call.callee;
+    if (!callee || callee->kind != ST_EX_IDENT || !ST_string_eq_cstr(callee->name, "enum_name"))
+        return;
+    if (ST_sym_find(se, callee->name))
+        return;
+    if (e->call.args.count != 1 || e->call.args.items[0].name.len) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'enum_name' takes exactly one enum value, e.g. 'enum_name(color)'");
+        return;
+    }
+    ST_ty_t *at = ST_type_expr(se, e->call.args.items[0].value);
+    if (!at)
+        return;
+    if (at->kind != ST_TY_ENUM || !at->decl) {
+        ST_diag_error(&se->diag, e->call.args.items[0].value->line,
+                      e->call.args.items[0].value->col,
+                      "'enum_name' expects an enum value, got '%s'", ST_tstr(se, at));
+        return;
+    }
+    ST_sym_t *h = ST_enum_name_helper(se, at, e->line, e->col);
+    if (h)
+        callee->name = h->name;
+}
+
 static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
     if (!ST_try_erased_call(se, e))
         ST_try_closure_call(se, e);
+    ST_try_enum_name_call(se, e);
     ST_expand_pack_spread_args(se, e);
     ST_expr_t *callee = e->call.callee;
     if (callee && callee->kind == ST_EX_FIELD && callee->field.base &&
@@ -5371,6 +5535,33 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         return &fnty->rets;
     }
 
+    if (fnty->has_any_pack && fnty->params.count && e->call.args.count >= fnty->params.count - 1) {
+        u32 fixed = fnty->params.count - 1;
+        ST_ty_t *any_ty = se->tys.prim[ST_tany];
+        ST_ty_t *slice_ty = ST_ty_slice(&se->tys, any_ty);
+        u32 tail = e->call.args.count - fixed;
+        ST_ty_t *only = tail == 1 ? e->call.args.items[fixed].value->ty : NULL;
+        if (!(only && only->kind == ST_TY_SLICE && ST_ty_is_any(se, only->inner))) {
+            ST_expr_t *lit = ST_expr_new(se->arena, ST_EX_STRUCT_LIT, e->line, e->col);
+            lit->struct_lit.is_bracket_lit = 1;
+            ST_forrange(fixed, e->call.args.count) {
+                ST_arg_t *ta = &e->call.args.items[i];
+                if (ta->value->ty && ta->value->ty->kind == ST_TY_UNTYPED_INT)
+                    ST_retype_untyped(ta->value, se->tys.prim[ST_ti32]);
+                else if (ta->value->ty && ta->value->ty->kind == ST_TY_UNTYPED_FLOAT)
+                    ST_retype_untyped(ta->value, se->tys.prim[ST_tf64]);
+                ST_box_any(se, &ta->value, any_ty);
+                ST_field_init_t fi = {.value = ta->value, .line = ta->value->line,
+                                      .col = ta->value->col};
+                ST_da_append_arena(se->arena, &lit->struct_lit.inits, fi);
+            }
+            lit->ty = slice_ty;
+            e->call.args.count = fixed;
+            ST_arg_t packed = {.value = lit};
+            ST_da_append_arena(se->arena, &e->call.args, packed);
+        }
+    }
+
     u32 n = e->call.args.count;
     u32 max_p = fnty->params.count;
     u32 min_args = max_p;
@@ -5673,6 +5864,47 @@ static ST_ty_t *ST_type_index(ST_sema_t *se, ST_expr_t *e) {
     return NULL;
 }
 
+static ST_expr_t *ST_erased_generic_method_ref(ST_sema_t *se, ST_expr_t *v, ST_ty_t *from,
+                                               ST_trait_method_t *m) {
+    ST_sym_t *wsym = v->kind == ST_EX_IDENT ? ST_sym_find(se, v->name) : NULL;
+    ST_expr_t *init = NULL;
+    if (wsym && wsym->decl) {
+        if (wsym->decl->kind == ST_DE_CONST)
+            init = wsym->decl->const_.value;
+        else if (wsym->decl->kind == ST_DE_GLOBAL)
+            init = wsym->decl->global_.init;
+    }
+    ST_string_t impl_name = {0};
+    if (init && init->kind == ST_EX_STRUCT_LIT)
+        for (u32 i = 0; i < init->struct_lit.generic_impl_methods.count; i++)
+            if (ST_string_eq(init->struct_lit.generic_impl_methods.items[i], m->name)) {
+                impl_name = init->struct_lit.generic_impl_names.items[i];
+                break;
+            }
+    ST_sym_t *tsym = impl_name.len ? ST_sym_find_in(&se->templates, impl_name) : NULL;
+    if (!tsym || !tsym->decl) {
+        ST_diag_error(&se->diag, v->line, v->col,
+                      "'" ST_sv_fmt "' has its own generic parameters, so '%s' can only be "
+                      "stored as a trait-typed value from a named witness known at compile time",
+                      ST_sv_args(m->name), ST_tstr(se, from));
+        return NULL;
+    }
+    ST_decl_t *tmpl = tsym->decl;
+    ST_ht_t bindings;
+    ST_ht_init(se->arena, &bindings, 8);
+    ST_forrange(0, tmpl->fn.sig.generics.count)
+        ST_bind_generic_name(se, &bindings, tmpl->fn.sig.generics.items[i],
+                             se->tys.prim[ST_tvoid]);
+    ST_sym_t *inst = ST_instantiate_fn_ex(se, tmpl, &bindings, 0, 0, 0, (ST_string_t){0},
+                                          (ST_string_t){0}, v->line, v->col);
+    if (!inst)
+        return NULL;
+    ST_expr_t *ref = ST_expr_new(se->arena, ST_EX_IDENT, v->line, v->col);
+    ref->name = inst->name;
+    ref->ty = inst->t;
+    return ref;
+}
+
 static void ST_erase_witness(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
     if (!slot || !*slot || !to || !to->is_erased_witness)
         return;
@@ -5684,6 +5916,27 @@ static void ST_erase_witness(ST_sema_t *se, ST_expr_t **slot, ST_ty_t *to) {
     ST_expr_t *lit = ST_expr_new(se->arena, ST_EX_STRUCT_LIT, v->line, v->col);
     lit->struct_lit.type_name = to->decl->name;
     ST_forrange(0, to->fields.count) {
+        if ((u32)i < from->trait_decl->trait_.methods.count &&
+            from->trait_decl->trait_.methods.items[i].sig.generics.count) {
+            ST_expr_t *ref =
+                ST_erased_generic_method_ref(se, v, from, &from->trait_decl->trait_.methods.items[i]);
+            if (!ref)
+                return;
+            ST_expr_t *c = ST_expr_new(se->arena, ST_EX_CAST, v->line, v->col);
+            ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, v->line, v->col);
+            te->name = ST_cstr_to_str("void");
+            te->resolved = to->fields.items[i].ty;
+            te->pinned = 1;
+            c->cast.operand = ref;
+            c->cast.to = te;
+            c->ty = to->fields.items[i].ty;
+            ST_field_init_t gfi = {.name = to->fields.items[i].name,
+                                   .value = c,
+                                   .line = v->line,
+                                   .col = v->col};
+            ST_da_append_arena(se->arena, &lit->struct_lit.inits, gfi);
+            continue;
+        }
         ST_expr_t *src = ST_clone_place(se, v);
         if (!src) {
             ST_diag_error(&se->diag, v->line, v->col,
@@ -8531,6 +8784,10 @@ static void ST_build_fn_ty(ST_sema_t *se, ST_sym_t *sym, ST_fn_sig_t *sig) {
                 ST_diag_error(&se->diag, p->line, p->col,
                               "default for '" ST_sv_fmt "' expects '%s', got '%s'",
                               ST_sv_args(p->name), ST_tstr(se, pt), ST_tstr(se, dt));
+            else if (pt && dt && pt->is_erased_witness) {
+                ST_pending_default_erase_t pe = {.slot = &p->def, .ty = pt};
+                ST_da_append_arena(se->arena, &ST_pending_default_erases, pe);
+            }
         }
         ST_da_append_arena(se->arena, &t->params, pt);
     }
@@ -8703,6 +8960,7 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                                       "global '" ST_sv_fmt "' expects '%s', got '%s'",
                                       ST_sv_args(d->name), ST_tstr(se, dt), ST_tstr(se, it));
                     else if (sym->t->kind == ST_TY_STRUCT && d->global_.init->kind == ST_EX_STRUCT_LIT) {
+                    } else if (sym->t->kind == ST_TY_STRUCT && ST_const_struct_lit_of(se, d->global_.init)) {
                     } else if (!ST_global_init_is_const(se, sym->t, d->global_.init)) {
                         ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
                                       "initializer for global '" ST_sv_fmt "' must be a "
@@ -9110,6 +9368,10 @@ static void ST_drain_standins(ST_sema_t *se) {
 }
 
 static void ST_sema_check(ST_sema_t *se, ST_program_t *prog) {
+    ST_forrange(0, ST_pending_default_erases.count)
+        ST_erase_witness(se, ST_pending_default_erases.items[i].slot,
+                         ST_pending_default_erases.items[i].ty);
+    ST_pending_default_erases.count = 0;
     ST_forrange(0, prog->decls.count) {
         ST_drain_standins(se);
         ST_decl_t *d = prog->decls.items[i];
@@ -9446,6 +9708,7 @@ b8 ST_sema_run(ST_arena_t *arena, ST_program_t *prog, ST_string_t src, ST_string
         ST_string_t name = ST_cstr_to_str((char *)ST_builtin_fns[i]);
         ST_sym_insert(se, &se->globals, ST_sym_new(se, ST_SYM_FN, name, NULL, NULL, 0, 0));
     }
+    ST_pending_default_erases = (ST_pending_default_erases_t){0};
     ST_sema_synth_type_info(se);
     ST_sema_synth_any(se);
     ST_sema_collect(se, prog);

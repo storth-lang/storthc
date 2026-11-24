@@ -82,7 +82,7 @@ pub fn chop_by_delimiter(str: *string, c: char) -> string {
     return new_str;
 }
 
-#load "StringBuilder.st";
+#load "String_Builder.st";
 
 #import "Libc";
 #import "Allocator";

@@ -4287,6 +4287,7 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
     c.diag.src = src;
     c.diag.file = file;
     c.diag.max_errors = ST_SEMA_MAX_ERRORS;
+    ST_expr_t *slit = NULL;
 
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
@@ -4308,11 +4309,12 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
             ST_ty_t *ty = sym ? sym->t : NULL;
             if (!ty)
                 continue;
-            if (ty->kind == ST_TY_STRUCT && d->global_.init &&
-                d->global_.init->kind == ST_EX_STRUCT_LIT) {
+            if (ty->kind == ST_TY_STRUCT && d->global_.init)
+                slit = ST_const_struct_lit_of(sema, d->global_.init);
+            if (slit && slit->kind == ST_EX_STRUCT_LIT) {
                 ST_ir_module_add_global(out, d->name, ty, d->is_pub, 0, 0, 0, 0.0);
                 ST_ir_global_var_t *g = ST_ir_module_find_global(out, d->name);
-                ST_lower_const_struct_fields(&c, g, ty, d->global_.init, 0);
+                ST_lower_const_struct_fields(&c, g, ty, slit, 0);
                 ST_lower_flush_pending_globals(&c);
                 continue;
             }

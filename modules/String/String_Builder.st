@@ -1,17 +1,13 @@
-pub struct StringBuilder {
+pub struct String_Builder {
     data: *char;
     count: u32;
     capacity: u32;
     allocator : Allocator;
 }
 
-pub impl StringBuilder {
-    fn set_allocator(self: *Self, allocator: Allocator = mem) {
-        if self.allocator.self == null then self.allocator = allocator;
-    }
-
+pub impl String_Builder {
     fn reserve(self: *Self, size : u32 = 256) {
-        self.set_allocator();
+        self.allocator = allocator;
         if self.count >= self.capacity {
             if self.capacity {
                 case 0 { self.capacity = size; }

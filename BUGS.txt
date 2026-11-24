@@ -146,3 +146,15 @@ storthc: error: semantic analysis for 'non_quit.st' failed
 make: *** [Makefile:18: non_quit] Error 1
 segfault@penger $ vim
 In freaking traits a []slice and [N] are d/t type though we can pass [N] into a function that accepts []
+
+-- New bug
+
+when trying to import a module with a slash in its name, the error message is dubious (handles the slash as division operator from what i'm gathering):
+```
+#import "Test/Example";
+
+pub fn main() -> i32 {
+    greet("World");
+    return 0;
+}
+```

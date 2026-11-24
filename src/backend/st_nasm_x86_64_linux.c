@@ -202,10 +202,9 @@ static int ST_global_field_init_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
+static void ST_gen_struct_global_data(FILE *out, ST_arena_t *arena, ST_ir_global_var_t *g) {
     u32 n = g->field_inits.count;
-    ST_ir_global_field_init_t *sorted = malloc(sizeof(*sorted) * (n ? n : 1));
-    ST_assert(sorted);
+    ST_ir_global_field_init_t *sorted = ST_arena_push(arena, sizeof(*sorted) * (n ? n : 1));
     ST_forrange(0, n) sorted[i] = g->field_inits.items[i];
     qsort(sorted, n, sizeof(*sorted), ST_global_field_init_cmp);
     u32 cursor = 0;
@@ -226,10 +225,31 @@ static void ST_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
     u32 total = g->ty && g->ty->size ? g->ty->size : cursor;
     if (total > cursor)
         fprintf(out, "    times %u db 0\n", total - cursor);
-    free(sorted);
 }
 
-static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
+// @note: module globals are mangled as 'Module__name'; the debugger should see 'name'.
+static ST_string_t ST_dbg_global_display_name(ST_string_t n) {
+    for (u32 i = n.len; i >= 3; i--)
+        if (n.data[i - 1] == '_' && n.data[i - 2] == '_' && i - 2 > 0 && i < n.len)
+            return (ST_string_t){.data = n.data + i, .len = n.len - i};
+    return n;
+}
+
+static void ST_dbg_register_global(ST_ir_module_t *m, ST_ir_global_var_t *g, ST_dbg_info_t *dbg) {
+    if (!dbg || g->is_extern || !g->ty)
+        return;
+    ST_string_t label = g->name;
+    if (ST_asm_name_reserved(g->name)) {
+        u8 *b = ST_arena_push(m->arena, g->name.len + 1);
+        b[0] = '_';
+        memcpy(b + 1, g->name.data, g->name.len);
+        label = (ST_string_t){.data = b, .len = g->name.len + 1};
+    }
+    ST_dbg_add_global(m->arena, dbg, ST_dbg_global_display_name(g->name), label, g->ty);
+}
+
+static void ST_generate_globals(FILE *out, ST_ir_module_t *m, ST_dbg_info_t *dbg) {
+    ST_forrange(0, m->globals.count) ST_dbg_register_global(m, &m->globals.items[i], dbg);
     if (!m->globals.count)
         return;
     ST_forrange(0, m->globals.count) {
@@ -262,7 +282,7 @@ static void ST_generate_globals(FILE *out, ST_ir_module_t *m) {
             fprintf(out, "align %u\n", align);
             ST_emit_sym(out, g->name); fprintf(out, ":\n");
             if (g->field_inits.count) {
-                ST_gen_struct_global_data(out, g);
+                ST_gen_struct_global_data(out, m->arena, g);
                 continue;
             }
             u32 size = g->ty && g->ty->size ? g->ty->size : 8;
@@ -1185,7 +1205,7 @@ static b8 ST_nasm_generate_linux(FILE *out, ST_ir_module_t *m, ST_string_t src, 
     fprintf(out, "BITS 64\n");
     ST_generate_strs(out, m);
     ST_generate_tinfos(out, m);
-    ST_generate_globals(out, m);
+    ST_generate_globals(out, m, dbg);
     fprintf(out, "section .text\n");
     ST_forrange(0, m->fns.count) {
         ST_ir_fn_t *fn = m->fns.items[i];

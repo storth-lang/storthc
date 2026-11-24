@@ -88,7 +88,22 @@ void ST_dbg_add_var(ST_arena_t *arena, ST_dbg_info_t *info, u32 fn_idx, ST_strin
     fn->n_vars++;
 }
 
-#define ST_DBG_MAX_TYS 256
+void ST_dbg_add_global(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t name,
+                       ST_string_t label, ST_ty_t *ty) {
+    if (!name.len || !label.len || !ty)
+        return;
+    if (info->n_globals == info->globals_cap) {
+        u32 ncap = info->globals_cap ? info->globals_cap * 2 : 16;
+        ST_dbg_global_t *n = ST_arena_push(arena, ncap * (u32)sizeof(*n));
+        if (info->n_globals)
+            memcpy(n, info->globals, info->n_globals * sizeof(*n));
+        info->globals = n;
+        info->globals_cap = ncap;
+    }
+    info->globals[info->n_globals++] = (ST_dbg_global_t){.name = name, .label = label, .ty = ty};
+}
+
+#define ST_DBG_MAX_TYS 2048
 
 typedef struct {
     ST_ty_t *items[ST_DBG_MAX_TYS];
@@ -167,6 +182,22 @@ static void ST_dwarf_emit_slice_like(FILE *out, ST_dbg_tys_t *tys, u32 idx, ST_t
     fputs("    db 0x00\n", out);
 }
 
+// @note: the name a debugger should show for a struct. A concrete trait witness's decl
+// name already carries its arguments ('Allocator(Libc)'); the type-erased witness is shown
+// as the bare trait name. Returns 0 when the type has no name.
+static b8 ST_dbg_struct_name(ST_ty_t *ty, char *buf, size_t n) {
+    ST_decl_t *d = ty->decl ? ty->decl : ty->trait_decl;
+    if (ty->is_erased_witness && ty->trait_decl)
+        d = ty->trait_decl;
+    if (!d)
+        return 0;
+    ST_string_t nm = d->display_name.len ? d->display_name : d->name;
+    if (!nm.len)
+        return 0;
+    snprintf(buf, n, "%.*s", (int)nm.len, nm.data);
+    return 1;
+}
+
 static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
     ST_dwarf_emit_shared_tys(out);
 
@@ -200,6 +231,12 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                 fprintf(out, "    db %u\n", sz);
             } break;
             case ST_TY_PTR: {
+                if (ty->inner && ty->inner->kind == ST_TY_VOID) {
+                    fprintf(out, "Ldbgty_%u:\n", i);
+                    fputs("    db 0x0b\n", out);
+                    fputs("    db 8\n", out);
+                    break;
+                }
                 u32 inner_idx = ty->inner ? ST_dbg_ty_lookup(tys, ty->inner) : (u32)-1;
                 fprintf(out, "Ldbgty_%u:\n", i);
                 fputs("    db 0x04\n", out);
@@ -210,8 +247,14 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                 fputs("    db 8\n", out);
             } break;
             case ST_TY_STRUCT: {
+                char sname[256];
                 fprintf(out, "Ldbgty_%u:\n", i);
-                fputs("    db 0x05\n", out);
+                if (ST_dbg_struct_name(ty, sname, sizeof(sname))) {
+                    fputs("    db 0x09\n", out);
+                    fprintf(out, "    db \"%s\", 0\n", sname);
+                } else {
+                    fputs("    db 0x05\n", out);
+                }
                 fprintf(out, "    dd %u\n", ty->size);
                 for (u32 fi = 0; fi < ty->fields.count; fi++) {
                     ST_ty_field_t *f = &ty->fields.items[fi];
@@ -244,6 +287,16 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                 fputs("    dd 8\n", out);
                 fputs("    db 0x00\n", out);
             } break;
+            case ST_TY_FN: {
+                if (ty->size == 8 || !ty->size) {
+                    // a plain code pointer: gdb prints it as '(void *) 0x... <function>'
+                    fprintf(out, "Ldbgty_%u:\n", i);
+                    fputs("    db 0x0b\n", out);
+                    fputs("    db 8\n", out);
+                    break;
+                }
+            }
+            // fallthrough
             default: {
                 u32 sz = ty->size ? ty->size : 8;
                 if (sz > 255)
@@ -404,6 +457,20 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     fputs("    db 0x49, 0x13\n", out);
     fputs("    db 0x02, 0x0a\n", out);
     fputs("    db 0x00, 0x00\n", out);
+    // 0x09: named struct, 0x0a: global variable, 0x0b: untyped (code) pointer
+    fputs("    db 0x09, 0x13, 0x01\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x0b, 0x06\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x0a, 0x34, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x3f, 0x0c\n", out);
+    fputs("    db 0x02, 0x18\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x0b, 0x0f, 0x00\n", out);
+    fputs("    db 0x0b, 0x0b\n", out);
+    fputs("    db 0x00, 0x00\n", out);
     fputs("    db 0x00\n", out);
     fputc('\n', out);
 
@@ -435,7 +502,23 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     for (u32 fi = 0; fi < info->n_fns; fi++)
         for (u32 vi = 0; vi < info->fns[fi].n_vars; vi++)
             ST_dbg_collect_ty(&tys, info->fns[fi].vars[vi].ty);
+    for (u32 gi = 0; gi < info->n_globals; gi++)
+        ST_dbg_collect_ty(&tys, info->globals[gi].ty);
     ST_dwarf_emit_types(out, &tys);
+
+    for (u32 gi = 0; gi < info->n_globals; gi++) {
+        ST_dbg_global_t *g = &info->globals[gi];
+        u32 tidx = ST_dbg_ty_lookup(&tys, g->ty);
+        fputs("    db 0x0a\n", out);
+        fprintf(out, "    db \"%.*s\", 0\n", (int)g->name.len, g->name.data);
+        if (tidx != (u32)-1)
+            fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", tidx);
+        else
+            fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+        fputs("    db 1\n", out);
+        fputs("    db 9, 0x03\n", out);
+        fprintf(out, "    dq %.*s\n", (int)g->label.len, g->label.data);
+    }
 
     for (u32 i = 0; i < info->n_fns; i++) {
         ST_dbg_fn_t *f = &info->fns[i];

@@ -1,16 +1,22 @@
 #import "Libc";
 
-fn show(fmt: string, args: ...) -> i32 {
-    return printf(fmt.ptr, ...args);
+fn show(fmt: string, args: ...) -> void {
+    printf("%s n=%ld\n", fmt.ptr, args.len);
+    i : i64 = 0;
+    while i < args.len {
+        a := args[i];
+        printf("  size=%d\n", a.info.size);
+        i += 1;
+    }
 }
 
-fn count(tag: i32, rest: ...) -> i32 {
-    return tag;
+fn outer(args: ...) -> void {
+    show("outer", ...args);
 }
 
 pub fn main() -> i32 {
-    show("hi %d %s %f\n", 4, "x".ptr, 2.5);
-    show("plain\n");
-    printf("%d\n", count(7, 1, "a", 3.0));
+    show("a", 4, "x", 2.5);
+    show("none");
+    outer(1, 2, 3);
     return 0;
 }

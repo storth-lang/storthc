@@ -1,8 +1,5 @@
-#import "Libc";
-#import "Error";
-
 pub trait Allocator($T) {
-    self = *$T;
+   self = *$T;
     fn reallocate(self: *Self, ptr: *void, size : u32) -> Option(*void);
     fn allocate(self: *Self, size : u32) -> Option(*void);
     fn copy(self: *Self, ptr: *void, ptr2 : *void, size : u32) -> void;
@@ -12,8 +9,7 @@ pub trait Allocator($T) {
 struct Libc{}
 inst := Libc{};
 
-// TODO: Check for unallocated memory
-pub mem := Allocator(Libc) {
+pub libc := Allocator(Libc) {
     self = &inst;
     fn allocate(self: *Self, size : u32) -> Option(*void) {
         p := malloc(cast(u64)size);
@@ -36,4 +32,15 @@ pub mem := Allocator(Libc) {
     }
 };
 
+// NOTE: This is the default context allocator
+pub allocator : Allocator = libc;
+
+pub fn set_allocator(a: Allocator) -> void {
+    allocator = a;
+}
+
 #load "Flat_Pool.st";
+#load "Temp_Allocator.st";
+
+#import "Libc";
+#import "Error";
