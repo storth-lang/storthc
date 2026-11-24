@@ -12,37 +12,10 @@ struct Out {
     buf: [1024]char;
 }
 
-fn sys_write(fd: i32, ptr: *char, len: i64) -> i64 {
-    return #asm {
-        mov rax, 1
-        mov rdi, fd
-        mov rsi, ptr
-        mov rdx, len
-        syscall
-    };
-}
-
-fn sys_exit(code: i32) -> i64 {
-    return #asm {
-        mov rax, 231
-        mov rdi, code
-        syscall
-    };
-}
-
-fn mem_copy(dst: *char, src: *char, n: i64) {
-    #asm {
-        mov rdi, dst
-        mov rsi, src
-        mov rcx, n
-        rep movsb
-    }
-}
-
-fn write_all(fd: i32, p: *char, n: i64) {
-    off : i64 = 0;
+fn write_all(fd: i32, p: *char, n: u64) {
+    off : u64 = 0;
     while off < n {
-        r := sys_write(fd, p + off, n - off);
+        r := cast(u64)write(fd, p + off, n - off);
         if r > 0 {
             off += r;
         } else if r != -4 {
@@ -53,7 +26,7 @@ fn write_all(fd: i32, p: *char, n: i64) {
 
 fn out_flush(o: *Out) {
     if o.len > 0 {
-        write_all(o.fd, &o.buf[0], o.len);
+        write_all(o.fd, &o.buf[0], cast(u64)o.len);
         o.len = 0;
     }
 }
@@ -64,20 +37,20 @@ fn out_char(o: *Out, c: char) {
     o.len += 1;
 }
 
-fn out_bytes(o: *Out, p: *char, n: i64) {
+fn out_bytes(o: *Out, p: *char, n: u64) {
     if n <= 0 then return;
     if n >= 1024 {
         out_flush(o);
         write_all(o.fd, p, n);
         return;
     }
-    if o.len + n > 1024 then out_flush(o);
-    mem_copy(&o.buf[o.len], p, n);
-    o.len += n;
+    if o.len + cast(i64)n > 1024 then out_flush(o);
+    memcpy(&o.buf[o.len], p, n);
+    o.len += cast(i64) n;
 }
 
 fn out_str(o: *Out, s: string) {
-    out_bytes(o, s.ptr, s.len);
+    out_bytes(o, s.ptr, cast(u64)s.len);
 }
 
 fn out_u64(o: *Out, v: u64) {
@@ -93,7 +66,7 @@ fn out_u64(o: *Out, v: u64) {
         tmp[i] = cast(char) (48 + x % 10);
         x = x / 10;
     }
-    out_bytes(o, &tmp[i], 20 - i);
+    out_bytes(o, &tmp[i], 20 - cast(u64)i);
 }
 
 fn out_i64(o: *Out, v: i64) {
@@ -124,7 +97,7 @@ fn out_hex(o: *Out, v: u64) {
         x = x / 16;
     }
     out_str(o, "0x");
-    out_bytes(o, &tmp[i], 16 - i);
+    out_bytes(o, &tmp[i], 16 - cast(u64)i);
 }
 
 fn out_f64(o: *Out, v: f64) {
@@ -170,7 +143,7 @@ fn out_f64(o: *Out, v: f64) {
         while last > 0 && digits[last] == '0' {
             last -= 1;
         }
-        out_bytes(o, &digits[0], last + 1);
+        out_bytes(o, &digits[0], cast(u64)(last + 1));
     }
     if big {
         out_char(o, 'e');
@@ -187,7 +160,7 @@ fn out_cstr(o: *Out, p: *char) {
     while p[i] != '\0' {
         i += 1;
     }
-    out_bytes(o, p, i);
+    out_bytes(o, p, cast(u64)i);
 }
 
 fn ld_u8(d: *void) -> u8 {
@@ -300,7 +273,7 @@ fn format_text(o: *Out) -> bool {
     while o.pos < f.len {
         c := f.ptr[o.pos];
         if c == '{' || c == '}' {
-            out_bytes(o, f.ptr + start, o.pos - start);
+            out_bytes(o, f.ptr + start, cast(u64)(o.pos - start));
             has_next := o.pos + 1 < f.len;
             if has_next && f.ptr[o.pos + 1] == c {
                 out_char(o, c);
@@ -318,7 +291,7 @@ fn format_text(o: *Out) -> bool {
             o.pos += 1;
         }
     }
-    out_bytes(o, f.ptr + start, o.pos - start);
+    out_bytes(o, f.ptr + start, cast(u64)(o.pos - start));
     return false;
 }
 
@@ -370,7 +343,7 @@ pub fn eprintln(fmt: string, args: $T...) {
     out_flush(&o);
 }
 
-fn die(type: logKind, loc: Source_Code_Location, fmt: string, args: $T...) {
+fn panic(type: logKind, loc: Source_Code_Location, fmt: string, args: $T...) -> noreturn {
     o : Out;
     o.fd = 2;
     o.fmt = fmt;
@@ -381,25 +354,25 @@ fn die(type: logKind, loc: Source_Code_Location, fmt: string, args: $T...) {
     out_i64(&o, cast(i64) loc.column);
     out_str(&o, ": ");
     if type {
-        case logKind.Todo then out_str(&o, "TODO: ");
-        case logKind.Error then out_str(&o, "ERROR: ");
-        case logKind.Assert then out_str(&o, "ASSERT: ");
+        case .Todo then out_str(&o, "TODO: ");
+        case .Error then out_str(&o, "ERROR: ");
+        case .Assert then out_str(&o, "ASSERT: ");
     }
     format_args(&o, ...args);
     out_char(&o, '\n');
     out_flush(&o);
-    sys_exit(1);
+    exit(1);
 }
 
 pub fn todo(msg: string, loc := #caller_location, args: $T...) -> void {
-    die(logKind.Todo, loc, msg, ...args);
+    panic(logKind.Todo, loc, msg, ...args);
 }
 
-pub fn log_error(msg: string, loc := #caller_location, args: $T...) -> void {
-    die(logKind.Error, loc, msg, ...args);
+pub fn log_error(msg: string, loc := #caller_location, args: $T...) -> noreturn {
+    panic(logKind.Error, loc, msg, ...args);
 }
 
 pub fn assert(cond: bool, msg: string = "assertion failed", loc := #caller_location, args: $T...) -> void {
     if cond then return;
-    die(logKind.Assert, loc, msg, ...args);
+    panic(logKind.Assert, loc, msg, ...args);
 }

@@ -1,5 +1,3 @@
-#load "log.st";
-
 pub union Option {
     None;
     Some($T);
@@ -13,17 +11,27 @@ pub impl Option {
         }
     }
 
-    pub fn unwrap(self: Self, msg := "") -> $T {
+    pub fn unwrap(self: Self, msg := "", loc := #caller_location) -> $T {
         if self {
             case Some(v) { return v; }
-            // case None { error_out(msg, loc); }
-            case None { abort(); }
+            case None { log_error(msg, loc); }
+        }
+    }
+
+    pub fn map(self: Self, func: fn(x: $T) -> $T, loc := #caller_location) -> $T {
+        if self {
+            case Some(v) { return fun(v); }
+            case None { log_error("Trying to map on none value", loc); }
+        }
+    }
+
+    pub fn map_or(self: Self, func: fn(x: $T) -> $T, val: $T) -> $T {
+        if self {
+            case Some(v) { return fun(v); }
+            case None { return val; }
         }
     }
 }
-
-
-/*The Result type in Rust provides various methods for error handling, including is_ok, is_err, map, and_then, and or_else. These methods allow you to check the result's status, transform values, and handle errors more effectively*/
 
 pub union Result {
     Ok($O);
@@ -31,34 +39,63 @@ pub union Result {
 }
 
 pub impl Result {
-    fn is_ok(self: Self) -> bool {
+    pub fn is_ok(self: Self) -> bool {
         if self {
             case Ok(v) { return true; }
-            default { return false; }
+            case Error(_) { return false; }
         }
     }
 
-    fn is_err(self: Self) -> bool {
+    pub fn is_err(self: Self) -> bool {
         if self {
             case Error(v) { return true; }
-            default { return false; }
+            case Ok(_) { return false; }
         }
     }
 
-    fn unwrap(self: Self) -> $O {
+    pub fn unwrap(self: Self, msg := "", loc := #caller_location) -> $O {
         if self {
             case Ok(v) { return v; }
-            default { abort(); } 
+            case Error(e) {
+                log_error("{} {}", loc, msg, e);
+            }
         }
     }
 
-    fn unwrap_or(self: Self, val: $O) -> $O {
+    pub fn ok(self: Self, loc := #caller_location) -> $O {
         if self {
             case Ok(v) { return v; }
-            default    { return val; }
+            case Error(e) {
+                log_error("Value is not okay {}", loc, e);
+            }
         }
     }
 
+    pub fn unwrap_or(self: Self, val: $O) -> $O {
+        if self {
+            case Ok(v) { return v; }
+            case Error(_) { return val; }
+        }
+    }
+
+    pub fn map(self: Self, func: fn(x: $O) -> $O, loc := #caller_location) -> $O {
+        if self {
+            case Ok(v) { return func(v); }
+            case Error(e) {
+                log_error("Could not map because of error {}", loc, e);
+            }
+        }
+    }
+
+    pub fn map_or(self: Self, func: fn(x: $O) -> $O, val: $O) -> $O {
+        if self {
+            case Ok(v) { return fun(v); }
+            case Error(_) { return val; }
+        }
+    }
 }
 
 #import "Libc";
+#import "Os";
+
+#load "log.st";
