@@ -20,6 +20,7 @@ DEP := $(OBJ:.o=.d)
 
 TESTROOT := tests
 TESTBIN := $(TESTROOT)/build
+TESTSOURCES := $(shell find $(TESTROOT) -type d -name 'build' -prune -o -name '*.st' -print)
 TESTSET := $(TESTROOT)/set.sh
 TESTSRC := $(TESTROOT)/st_tester.c
 TESTOBJ := $(patsubst $(TESTROOT)/%.c,$(OBJROOT)/%.o,$(TESTSRC))
@@ -57,8 +58,8 @@ $(TESTTARGET): $(TESTOBJ) $(TESTUTIL) $(TESTBIN) | $(BINDIR)
 		&& printf "$(GREEN)build ok$(RESET)  %s\n" "$@" \
 		|| { printf "$(RED)build failed$(RESET)  %s\n" "$@"; exit 1; }
 
-$(TESTBIN):
-	$(QUIET)$(TESTSET) build
+$(TESTBIN): $(TESTSOURCES)
+	$(QUIET)$(TESTSET) record
 
 $(OBJROOT)/%.o: $(TESTROOT)/%.c | $(OBJROOT)
 	$(QUIET)printf "$(GREEN)CC$(RESET)  %s\n" "$@"
