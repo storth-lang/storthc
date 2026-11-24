@@ -92,6 +92,13 @@ void ST_ir_global_add_field_fn_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32
     ST_da_append_arena(arena, &g->field_inits, fi);
 }
 
+void ST_ir_global_add_field_str_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                    u32 str_index) {
+    ST_ir_global_field_init_t fi = {.offset = offset, .size = size, .is_str_ref = 1,
+                                    .str_index = str_index};
+    ST_da_append_arena(arena, &g->field_inits, fi);
+}
+
 ST_ir_block_t *ST_ir_block_new(ST_ir_fn_t *fn, const char *label_hint) {
     ST_ir_block_t *b = ST_arena_push_zeroed(fn->arena, sizeof(*b));
     b->id = fn->next_block_id++;

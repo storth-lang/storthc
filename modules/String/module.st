@@ -1,6 +1,3 @@
-#load "StringBuilder.st";
-#import "Libc";
-
 pub fn toString(arr: [..]char) -> string {
     return string {
         ptr = &arr.items[0],
@@ -48,3 +45,44 @@ pub fn ends_with(buf: []char, str: string) -> bool {
     return true;
 }
 
+pub fn chop_left(xs: string, n: i64) -> (string, string) {
+    if n > xs.len { n = xs.len; }
+    new_str := string { ptr = xs.ptr, len = n };
+    old_str := string { ptr = xs.ptr + n, len = xs.len - n };
+    return new_str, old_str;
+}
+
+pub fn chop_left(xs: *string, n: i64) -> string {
+    if n > xs.len { n = xs.len; }
+    new_str := string { ptr = xs.ptr, len = n };
+    xs.ptr = xs.ptr + n;
+    xs.len -= n;
+    return new_str;
+}
+
+pub fn chop_by_delimiter(str: string, c: char) -> (string, string) {
+    i : i64 = 0;
+    while str.len > i and str.ptr[i] != c {
+        i += 1;
+    }
+
+    new_str, old_str := chop_left(str, i);
+    chop_left(&old_str, 1);
+    return new_str, old_str;
+}
+
+pub fn chop_by_delimiter(str: *string, c: char) -> string {
+    i : i64 = 0;
+    while str.len > i and str.ptr[i] != c {
+        i += 1;
+    }
+
+    new_str := chop_left(str, i);
+    chop_left(str, 1);
+    return new_str;
+}
+
+#load "StringBuilder.st";
+
+#import "Libc";
+#import "Allocator";

@@ -263,6 +263,8 @@ typedef struct {
     i64 i;
     f64 f;
     ST_string_t fn_name;
+    b8 is_str_ref;
+    u32 str_index;
 } ST_ir_global_field_init_t;
 
 typedef struct {
@@ -330,6 +332,9 @@ void ST_ir_global_add_field_init(ST_arena_t *arena, ST_ir_global_var_t *g, u32 o
 
 void ST_ir_global_add_field_fn_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
                                    ST_string_t fn_name);
+
+void ST_ir_global_add_field_str_ref(ST_arena_t *arena, ST_ir_global_var_t *g, u32 offset, u32 size,
+                                    u32 str_index);
 
 // @note: ST_ir_block_new is for creating a new block inside the function with a label.
 ST_ir_block_t *ST_ir_block_new(ST_ir_fn_t *fn, const char *label_hint);

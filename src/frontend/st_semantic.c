@@ -336,6 +336,10 @@ static b8 ST_ty_is_int_like(ST_ty_t *t) {
 
 static ST_ty_t *ST_type_expr(ST_sema_t *se, ST_expr_t *e);
 static ST_expr_t *ST_dot_field(ST_expr_t *e);
+static b8 ST_variant_declares_payload(ST_variant_spec_t *v);
+static b8 ST_global_init_is_const(ST_sema_t *se, ST_ty_t *ty, ST_expr_t *v);
+static b8 ST_tyexpr_generics_bound(ST_tyexpr_t *te, ST_ht_t *bindings);
+static b8 ST_ctor_normalize(ST_sema_t *se, ST_expr_t *e, b8 allow_bare, ST_ty_t *expect);
 static b8 ST_lit_takes_expected(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 static void ST_enum_expect_walk(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect);
 static b8 ST_ct_eval_expr(ST_sema_t *se, ST_expr_t *e, ST_ct_val_t *out, b8 report_errors);
@@ -3933,9 +3937,53 @@ static b8 ST_op_is(ST_string_t op, const char *a, const char *b) {
     return ST_string_eq_cstr(op, a) || (b && ST_string_eq_cstr(op, b));
 }
 
+static b8 ST_has_dot_leaf(ST_expr_t *e) {
+    if (!e)
+        return 0;
+    if (ST_dot_field(e))
+        return 1;
+    if (e->kind == ST_EX_BINARY &&
+        (ST_op_is(e->bin.op, "|", "&") || ST_op_is(e->bin.op, "^", NULL)))
+        return ST_has_dot_leaf(e->bin.l) || ST_has_dot_leaf(e->bin.r);
+    if (e->kind == ST_EX_UNARY && ST_string_eq_cstr(e->unary.op, "~"))
+        return ST_has_dot_leaf(e->unary.operand);
+    return 0;
+}
+
+static b8 ST_is_kind_access(ST_expr_t *e) {
+    return e && e->kind == ST_EX_FIELD && e->field.base && ST_string_eq_cstr(e->field.name, "kind");
+}
+
+static void ST_mark_tag_operand(ST_expr_t *e) {
+    if (e && e->kind == ST_EX_FIELD && e->field.base && e->field.base->kind == ST_EX_IDENT)
+        e->field.tag_only = 1;
+}
+
 static ST_ty_t *ST_type_binary(ST_sema_t *se, ST_expr_t *e) {
-    ST_ty_t *l = ST_type_expr(se, e->bin.l);
-    ST_ty_t *r = ST_type_expr(se, e->bin.r);
+    ST_ty_t *l = NULL;
+    ST_ty_t *r = NULL;
+    if (ST_op_is(e->bin.op, "==", "!=")) {
+        if (ST_is_kind_access(e->bin.l))
+            ST_mark_tag_operand(e->bin.r);
+        if (ST_is_kind_access(e->bin.r))
+            ST_mark_tag_operand(e->bin.l);
+    }
+    b8 ldot = ST_op_is(e->bin.op, "==", "!=") && ST_has_dot_leaf(e->bin.l);
+    b8 rdot = ST_op_is(e->bin.op, "==", "!=") && ST_has_dot_leaf(e->bin.r);
+    if (ldot && !rdot) {
+        r = ST_type_expr(se, e->bin.r);
+        if (r && r->kind == ST_TY_ENUM)
+            ST_enum_expect_walk(se, e->bin.l, r);
+        l = ST_type_expr(se, e->bin.l);
+    } else if (rdot && !ldot) {
+        l = ST_type_expr(se, e->bin.l);
+        if (l && l->kind == ST_TY_ENUM)
+            ST_enum_expect_walk(se, e->bin.r, l);
+        r = ST_type_expr(se, e->bin.r);
+    } else {
+        l = ST_type_expr(se, e->bin.l);
+        r = ST_type_expr(se, e->bin.r);
+    }
     if (!l || !r)
         return NULL;
     ST_string_t op = e->bin.op;
@@ -5131,12 +5179,16 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                                      arg->value->line, arg->value->col))
                 unify_ok = 0;
 
-            if (!has_bound_str && idx < tsig->params.count && tsig->params.items[idx].te &&
-                !tsig->params.items[idx].te->is_generic_param) {
+            if (unify_ok && !has_bound_str && idx < tsig->params.count &&
+                tsig->params.items[idx].te && !tsig->params.items[idx].te->is_generic_param &&
+                ST_tyexpr_generics_bound(tsig->params.items[idx].te, &bindings)) {
                 ST_ht_t *save_gb = se->generic_bindings;
+                ST_string_t save_file, save_src;
+                ST_diag_switch_file(se, fn_tmpl->file, &save_file, &save_src);
                 se->generic_bindings = &bindings;
                 ST_ty_t *pty = ST_resolve_tyexpr(se, tsig->params.items[idx].te);
                 se->generic_bindings = save_gb;
+                ST_diag_restore_file(se, save_file, save_src);
                 if (pty && pty->kind == ST_TY_STRING) {
                     ST_ct_val_t val;
                     if (ST_ct_eval_expr(se, arg->value, &val, 0) && val.kind == ST_CT_STRING) {
@@ -5417,8 +5469,13 @@ static ST_ty_t *ST_type_field(ST_sema_t *se, ST_expr_t *e) {
                               ST_sv_args(base->name));
                 return NULL;
             }
-            ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name))
+            ST_forrange(0, vs->count) if (ST_string_eq(vs->items[i].name, e->field.name)) {
+                if (is_union && !e->field.tag_only && !sym->decl->tag_union.generics.count &&
+                    !ST_variant_declares_payload(&vs->items[i]) &&
+                    ST_ctor_normalize(se, e, 1, NULL))
+                    return ST_type_struct_lit(se, e, NULL);
                 return is_union ? se->tys.prim[ST_ti64] : t;
+            }
             ST_diag_error(&se->diag, e->line, e->col,
                           "'" ST_sv_fmt "' has no variant '" ST_sv_fmt "'", ST_sv_args(base->name),
                           ST_sv_args(e->field.name));
@@ -6054,7 +6111,21 @@ static ST_ty_t *ST_infer_union_lit(ST_sema_t *se, ST_expr_t *e, ST_decl_t *td) {
 
 static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect) {
     if (e->struct_lit.is_bracket_lit) {
-        ST_ty_t *ety = (expect && expect->kind == ST_TY_SLICE) ? expect->inner : NULL;
+        b8 expect_array = expect && expect->kind == ST_TY_ARRAY && expect->inner;
+        ST_ty_t *ety =
+            (expect && expect->kind == ST_TY_SLICE) || expect_array ? expect->inner : NULL;
+
+        if (expect_array && e->struct_lit.inits.count != expect->count) {
+            ST_diag_error(&se->diag, e->line, e->col,
+                          "'[...]' has %u element(s) but '%s' needs exactly %u",
+                          e->struct_lit.inits.count, ST_tstr(se, expect), (u32)expect->count);
+            return NULL;
+        }
+
+        if (expect_array && e->struct_lit.inits.count == 0) {
+            ST_complete_ty(se, ety);
+            return expect;
+        }
 
         if (e->struct_lit.inits.count == 0) {
             if (!ety) {
@@ -6109,6 +6180,8 @@ static ST_ty_t *ST_type_struct_lit(ST_sema_t *se, ST_expr_t *e, ST_ty_t *expect)
         if (!ety)
             return NULL;
         ST_complete_ty(se, ety);
+        if (expect_array)
+            return ST_ty_array(&se->tys, ety, e->struct_lit.inits.count);
         return ST_ty_slice(&se->tys, ety);
     }
 
@@ -8601,8 +8674,14 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                 if (dt)
                     ST_complete_ty(se, dt);
                 ST_ty_t *it = NULL;
-                if (d->global_.init)
-                    it = ST_type_expr(se, d->global_.init);
+                if (d->global_.init) {
+                    if (dt && ST_lit_takes_expected(se, d->global_.init, dt)) {
+                        it = ST_type_struct_lit(se, d->global_.init, dt);
+                        d->global_.init->ty = it;
+                    } else {
+                        it = ST_type_expr(se, d->global_.init);
+                    }
+                }
                 if (!dt && !it) {
                     ST_diag_error(&se->diag, d->line, d->col,
                                   "'" ST_sv_fmt "' needs a type or an initializer",
@@ -8624,13 +8703,11 @@ static void ST_sema_types(ST_sema_t *se, ST_program_t *prog) {
                                       "global '" ST_sv_fmt "' expects '%s', got '%s'",
                                       ST_sv_args(d->name), ST_tstr(se, dt), ST_tstr(se, it));
                     else if (sym->t->kind == ST_TY_STRUCT && d->global_.init->kind == ST_EX_STRUCT_LIT) {
-                    } else if (!ST_ty_is_float(sym->t)) {
-                        i64 iv;
-                        if (!ST_const_eval(se, d->global_.init, &iv))
-                            ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
-                                          "initializer for global '" ST_sv_fmt "' must be a "
-                                          "compile-time constant",
-                                          ST_sv_args(d->name));
+                    } else if (!ST_global_init_is_const(se, sym->t, d->global_.init)) {
+                        ST_diag_error(&se->diag, d->global_.init->line, d->global_.init->col,
+                                      "initializer for global '" ST_sv_fmt "' must be a "
+                                      "compile-time constant",
+                                      ST_sv_args(d->name));
                     }
                 }
                 break;
@@ -8673,6 +8750,56 @@ static void ST_declare_block_siblings(ST_sema_t *se, ST_decl_t *d) {
             continue;
         ST_declare_nested_fn_sym(se, cand);
     }
+}
+
+static b8 ST_tyexpr_generics_bound(ST_tyexpr_t *te, ST_ht_t *bindings) {
+    if (!te)
+        return 1;
+    if (te->kind == ST_TE_NAME) {
+        if (!te->is_generic_param)
+            return 1;
+        ST_ht_generic_t k = {.tag = te->name.data, .size = te->name.len};
+        return ST_ht_get(bindings, k).tag != NULL;
+    }
+    if (te->kind == ST_TE_FN) {
+        ST_forrange(0, te->fn_params.count)
+            if (!ST_tyexpr_generics_bound(te->fn_params.items[i], bindings))
+                return 0;
+        ST_forrange(0, te->fn_rets.count)
+            if (!ST_tyexpr_generics_bound(te->fn_rets.items[i], bindings))
+                return 0;
+        return 1;
+    }
+    if (te->kind == ST_TE_GENERIC_INST) {
+        ST_forrange(0, te->generic_args.count)
+            if (!ST_tyexpr_generics_bound(te->generic_args.items[i], bindings))
+                return 0;
+        return 1;
+    }
+    return ST_tyexpr_generics_bound(te->inner, bindings);
+}
+
+static b8 ST_global_init_is_const(ST_sema_t *se, ST_ty_t *ty, ST_expr_t *v) {
+    if (!ty || !v)
+        return 0;
+    if (ST_ty_is_float(ty))
+        return 1;
+    if (ty->kind == ST_TY_STRING)
+        return v->kind == ST_EX_STR;
+    if (ty->kind == ST_TY_STRUCT)
+        return v->kind == ST_EX_STRUCT_LIT;
+    if (ty->kind == ST_TY_ARRAY || ty->kind == ST_TY_SLICE) {
+        if (v->kind != ST_EX_STRUCT_LIT || v->struct_lit.type_name.len)
+            return 0;
+        ST_forrange(0, v->struct_lit.inits.count) {
+            ST_field_init_t *fi = &v->struct_lit.inits.items[i];
+            if (fi->name.len || !ST_global_init_is_const(se, ty->inner, fi->value))
+                return 0;
+        }
+        return 1;
+    }
+    i64 iv;
+    return ST_const_eval(se, v, &iv);
 }
 
 static void ST_check_fn_body(ST_sema_t *se, ST_sym_t *sym, ST_decl_t *d) {

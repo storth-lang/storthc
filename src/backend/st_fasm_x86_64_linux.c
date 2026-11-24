@@ -132,22 +132,20 @@ static void ST_fasm_gen_scalar_data(FILE *out, u32 size, b8 is_float, i64 iv, f6
     }
 }
 
+static int ST_global_field_init_cmp(const void *a, const void *b) {
+    const ST_ir_global_field_init_t *x = a;
+    const ST_ir_global_field_init_t *y = b;
+    if (x->offset != y->offset)
+        return x->offset < y->offset ? -1 : 1;
+    return 0;
+}
+
 static void ST_fasm_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
     u32 n = g->field_inits.count;
-    ST_ir_global_field_init_t sorted[256];
-    ST_assert(n <= ST_array_len(sorted));
+    ST_ir_global_field_init_t *sorted = malloc(sizeof(*sorted) * (n ? n : 1));
+    ST_assert(sorted);
     ST_forrange(0, n) sorted[i] = g->field_inits.items[i];
-    ST_forrange(0, n) {
-        u32 min = i;
-        for (u32 j = i + 1; j < n; j++)
-            if (sorted[j].offset < sorted[min].offset)
-                min = j;
-        if (min != i) {
-            ST_ir_global_field_init_t tmp = sorted[i];
-            sorted[i] = sorted[min];
-            sorted[min] = tmp;
-        }
-    }
+    qsort(sorted, n, sizeof(*sorted), ST_global_field_init_cmp);
     u32 cursor = 0;
     ST_forrange(0, n) {
         ST_ir_global_field_init_t *fi = &sorted[i];
@@ -155,6 +153,8 @@ static void ST_fasm_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
             fprintf(out, "    times %u db 0\n", fi->offset - cursor);
         if (fi->is_fn_ref)
             fprintf(out, "    dq " ST_sv_fmt "\n", ST_sv_args(fi->fn_name));
+        else if (fi->is_str_ref)
+            fprintf(out, "    dq str_%u_data\n", fi->str_index);
         else
             ST_fasm_gen_scalar_data(out, fi->size, fi->is_float, fi->i, fi->f);
         cursor = fi->offset + fi->size;
@@ -162,6 +162,7 @@ static void ST_fasm_gen_struct_global_data(FILE *out, ST_ir_global_var_t *g) {
     u32 total = g->ty && g->ty->size ? g->ty->size : cursor;
     if (total > cursor)
         fprintf(out, "    times %u db 0\n", total - cursor);
+    free(sorted);
 }
 
 static void ST_fasm_generate_globals(FILE *out, ST_ir_module_t *m) {

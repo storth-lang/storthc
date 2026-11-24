@@ -77,6 +77,8 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te);
 static ST_ir_inst_t *ST_lower_lvalue_addr(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_lvalue_addr_impl(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_global_var_t *ST_lower_ensure_const_global(ST_lower_ctx_t *c, ST_sym_t *sym);
+static void ST_lower_const_value(ST_lower_ctx_t *c, ST_ir_global_var_t *g, ST_ty_t *ty,
+                                  ST_expr_t *v, u32 off);
 static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e);
 static ST_ir_inst_t *ST_lower_short_and(ST_lower_ctx_t *c, ST_expr_t *e);
@@ -1627,6 +1629,10 @@ static void ST_lower_const_struct_fields(ST_lower_ctx_t *c, ST_ir_global_var_t *
                           ST_sv_args(fi->name), ST_sv_args(fi->value->name));
             continue;
         }
+        if (fty->kind == ST_TY_STRING || fty->kind == ST_TY_ARRAY || fty->kind == ST_TY_SLICE) {
+            ST_lower_const_value(c, g, fty, fi->value, base_off + foff);
+            continue;
+        }
         b8 is_float = ST_ty_is_float(fty);
         i64 iv = 0;
         f64 fv = 0.0;
@@ -1641,6 +1647,92 @@ static void ST_lower_const_struct_fields(ST_lower_ctx_t *c, ST_ir_global_var_t *
         }
         ST_ir_global_add_field_init(c->arena, g, base_off + foff, fty->size, is_float, iv, fv);
     }
+}
+
+static f64 ST_lower_const_float(ST_expr_t *v) {
+    if (v->kind == ST_EX_FLOAT)
+        return v->fval;
+    if (v->kind == ST_EX_INT)
+        return (f64)v->ival;
+    if (v->kind == ST_EX_UNARY && ST_string_eq_cstr(v->unary.op, "-"))
+        return -ST_lower_const_float(v->unary.operand);
+    return 0.0;
+}
+
+static u32 ST_lower_hidden_global_seq;
+
+typedef struct {
+    ST_string_t name;
+    ST_ty_t *ty;
+    ST_expr_t *lit;
+} ST_lower_pending_global_t;
+
+typedef struct {
+    ST_lower_pending_global_t *items;
+    u32 count, capacity;
+} ST_lower_pending_globals_t;
+
+static ST_lower_pending_globals_t ST_lower_pending_globals;
+
+static void ST_lower_flush_pending_globals(ST_lower_ctx_t *c) {
+    while (ST_lower_pending_globals.count) {
+        ST_lower_pending_global_t p =
+            ST_lower_pending_globals.items[--ST_lower_pending_globals.count];
+        ST_ir_module_add_global(c->module, p.name, p.ty, 0, 0, 0, 0, 0.0);
+        ST_ir_global_var_t *backing = ST_ir_module_find_global(c->module, p.name);
+        ST_lower_const_value(c, backing, p.ty, p.lit, 0);
+    }
+}
+
+static void ST_lower_const_value(ST_lower_ctx_t *c, ST_ir_global_var_t *g, ST_ty_t *ty,
+                                 ST_expr_t *v, u32 off) {
+    if (ty->kind == ST_TY_STRING && v->kind == ST_EX_STR) {
+        u32 idx = ST_ir_module_intern_str(c->module, v->sval);
+        ST_ir_global_add_field_str_ref(c->arena, g, off, 8, idx);
+        ST_ir_global_add_field_init(c->arena, g, off + 8, 8, 0, (i64)v->sval.len, 0.0);
+        return;
+    }
+    if (ty->kind == ST_TY_STRUCT && v->kind == ST_EX_STRUCT_LIT) {
+        ST_lower_const_struct_fields(c, g, ty, v, off);
+        return;
+    }
+    if (ty->kind == ST_TY_ARRAY && v->kind == ST_EX_STRUCT_LIT) {
+        u32 esz = ty->inner->size;
+        ST_forrange(0, v->struct_lit.inits.count)
+            ST_lower_const_value(c, g, ty->inner, v->struct_lit.inits.items[i].value,
+                                 off + (u32)i * esz);
+        return;
+    }
+    if (ty->kind == ST_TY_SLICE && v->kind == ST_EX_STRUCT_LIT) {
+        u32 n = v->struct_lit.inits.count;
+        if (n == 0) {
+            ST_ir_global_add_field_init(c->arena, g, off, 8, 0, 0, 0.0);
+            ST_ir_global_add_field_init(c->arena, g, off + 8, 8, 0, 0, 0.0);
+            return;
+        }
+        char nm[64];
+        int len = snprintf(nm, sizeof(nm), "__st_slice_data_%u", ST_lower_hidden_global_seq++);
+        u8 *buf = ST_arena_push(c->arena, (u32)len);
+        memcpy(buf, nm, (u32)len);
+        ST_string_t gname = {.data = buf, .len = (u32)len};
+        ST_ty_t *arr_ty = ST_ty_array(&c->sema->tys, ty->inner, n);
+        ST_lower_pending_global_t pend = {.name = gname, .ty = arr_ty, .lit = v};
+        ST_da_append_arena(c->arena, &ST_lower_pending_globals, pend);
+        ST_ir_global_add_field_fn_ref(c->arena, g, off, 8, gname);
+        ST_ir_global_add_field_init(c->arena, g, off + 8, 8, 0, (i64)n, 0.0);
+        return;
+    }
+    if (ST_ty_is_float(ty)) {
+        ST_ir_global_add_field_init(c->arena, g, off, ty->size, 1, 0, ST_lower_const_float(v));
+        return;
+    }
+    i64 iv = 0;
+    if (!ST_const_eval(c->sema, v, &iv)) {
+        ST_diag_error(&c->diag, v->line, v->col,
+                      "internal: global initializer isn't a compile-time constant");
+        return;
+    }
+    ST_ir_global_add_field_init(c->arena, g, off, ty->size, 0, iv, 0.0);
 }
 
 static ST_ir_global_var_t *ST_lower_ensure_const_global(ST_lower_ctx_t *c, ST_sym_t *sym) {
@@ -3149,6 +3241,14 @@ static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s) {
                 break;
             }
 
+            if (lhs->ty && (lhs->ty->kind == ST_TY_SLICE || lhs->ty->kind == ST_TY_ARRAY) &&
+                ST_string_eq_cstr(s->assign.op, "=")) {
+                ST_ir_inst_t *dst = ST_lower_lvalue_addr(c, lhs);
+                if (dst)
+                    ST_lower_value_into(c, dst, 0, lhs->ty, s->assign.rhs);
+                break;
+            }
+
             if (lhs->kind == ST_EX_FIELD || lhs->kind == ST_EX_INDEX) {
                 ST_ir_inst_t *addr = ST_lower_lvalue_addr(c, lhs);
                 if (addr)
@@ -4213,6 +4313,16 @@ b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_s
                 ST_ir_module_add_global(out, d->name, ty, d->is_pub, 0, 0, 0, 0.0);
                 ST_ir_global_var_t *g = ST_ir_module_find_global(out, d->name);
                 ST_lower_const_struct_fields(&c, g, ty, d->global_.init, 0);
+                ST_lower_flush_pending_globals(&c);
+                continue;
+            }
+            if (d->global_.init && d->global_.init->kind != ST_EX_IDENT &&
+                (ty->kind == ST_TY_STRING || ty->kind == ST_TY_ARRAY ||
+                 ty->kind == ST_TY_SLICE)) {
+                ST_ir_module_add_global(out, d->name, ty, d->is_pub, 0, 0, 0, 0.0);
+                ST_ir_global_var_t *g = ST_ir_module_find_global(out, d->name);
+                ST_lower_const_value(&c, g, ty, d->global_.init, 0);
+                ST_lower_flush_pending_globals(&c);
                 continue;
             }
             b8 has_init = d->global_.init != NULL;

@@ -2943,7 +2943,18 @@ static b8 ST_parse_fn_sig(ST_parser_t *p, ST_fn_sig_t *sig, b8 is_extern) {
                 return 0;
         } else if (ST_at_symbol(p, ":")) {
             p->pos++;
-            param.te = ST_parse_type(p);
+            if (ST_at_symbol(p, "..") || ST_at_symbol(p, "...")) {
+                ST_tyexpr_t *vt = ST_tyexpr_new(p->arena, ST_TE_NAME, param.line, param.col);
+                vt->is_generic_param = 1;
+                char nm[128];
+                int nl = snprintf(nm, sizeof(nm), "__va_" ST_sv_fmt, ST_sv_args(param.name));
+                u8 *nb = ST_arena_push(p->arena, (u32)nl);
+                memcpy(nb, nm, (u32)nl);
+                vt->name = (ST_string_t){.data = nb, .len = (u32)nl};
+                param.te = vt;
+            } else {
+                param.te = ST_parse_type(p);
+            }
             if (!param.te)
                 return 0;
         }

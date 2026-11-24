@@ -160,6 +160,7 @@ struct ST_expr_t {
             ST_expr_t *base;
             ST_string_t name;
             b8 implicit_payload;
+            b8 tag_only;
         } field;
         struct {
             ST_expr_t *base;

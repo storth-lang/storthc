@@ -3,7 +3,7 @@
 
 pub trait Allocator($T) {
     self = *$T;
-    fn reallocate(self: *Self, ptr: *$P, size : u32) -> Option(*$P);
+    fn reallocate(self: *Self, ptr: *void, size : u32) -> Option(*void);
     fn allocate(self: *Self, size : u32) -> Option(*void);
     fn copy(self: *Self, ptr: *void, ptr2 : *void, size : u32) -> void;
     fn deallocate(self: *Self, ptr: *void) -> void;
@@ -20,8 +20,8 @@ pub mem := Allocator(Libc) {
         if p == null then return .None;
         return .Some(p);
     }
-    fn reallocate(self: *Self, ptr: *$P, size : u32) -> Option(*$P) {
-        p := cast(type_of(ptr))realloc(cast(*void)ptr, cast(u64)size * sizeof(ptr));
+    fn reallocate(self: *Self, ptr: *void, size : u32) -> Option(*void) {
+        p := realloc(ptr, cast(u64)size);
         if p == null then return .None;
         return .Some(p);
     }

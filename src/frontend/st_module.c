@@ -667,6 +667,8 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
             continue;
         if (d->kind == ST_DE_IMPORT) {
             ST_string_t dep_path;
+            ctx->diag->file = path;
+            ctx->diag->src = ST_srcmap_get(ctx->srcs, path);
             if (!ST_mod_resolve(ctx->arena, ctx->project_root, d->import_.module_name,
                                 ctx->import_dirs, sibling_root, &dep_path)) {
                 ST_diag_error(ctx->diag, d->line, d->col,
@@ -758,6 +760,8 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
         if (!d || d->kind != ST_DE_IMPORT)
             continue;
         ST_string_t dep_path;
+        diag->file = root_file;
+        diag->src = ST_srcmap_get(srcs, root_file);
         if (!ST_mod_resolve(arena, ctx.project_root, d->import_.module_name, ctx.import_dirs,
                             (ST_string_t){0}, &dep_path)) {
             ST_diag_error(diag, d->line, d->col,
