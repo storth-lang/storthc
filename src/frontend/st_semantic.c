@@ -279,6 +279,20 @@ static b8 ST_ty_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
     return 0;
 }
 
+// Call-argument-only coercion: '*[N]T' and '*[..]T' are accepted where '*[]T' is expected. The
+// lowering of a call builds a temporary {ptr, len} slice header viewing the array and passes the
+// address of that header, so this must not be used for contexts the lowering does not handle.
+static b8 ST_ty_arg_coerces(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
+    if (ST_ty_coerces(se, from, to))
+        return 1;
+    if (from && to && from->kind == ST_TY_PTR && to->kind == ST_TY_PTR && from->inner &&
+        to->inner && to->inner->kind == ST_TY_SLICE &&
+        (from->inner->kind == ST_TY_ARRAY || from->inner->kind == ST_TY_DYN_ARRAY) &&
+        from->inner->inner == to->inner->inner)
+        return 1;
+    return 0;
+}
+
 static void ST_retype_untyped(ST_expr_t *e, ST_ty_t *to) {
     if (!e || !e->ty)
         return;
@@ -4085,7 +4099,7 @@ static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *call
         b8 ok = 1;
         for (u32 p = 0; p < n_args && p < n_params; p++) {
             if (arg_tys[p] && cand->t->params.items[p] &&
-                !ST_ty_coerces(se, arg_tys[p], cand->t->params.items[p])) {
+                !ST_ty_arg_coerces(se, arg_tys[p], cand->t->params.items[p])) {
                 ok = 0;
                 break;
             }
@@ -4205,7 +4219,7 @@ static b8 ST_plain_fn_accepts(ST_sema_t *se, ST_sym_t *cand, ST_expr_t *call) {
                 continue;
         }
         ST_ty_t *at = ST_type_expr(se, arg->value);
-        if (at && cand->t->params.items[k] && !ST_ty_coerces(se, at, cand->t->params.items[k]))
+        if (at && cand->t->params.items[k] && !ST_ty_arg_coerces(se, at, cand->t->params.items[k]))
             return 0;
     }
     return 1;
@@ -4860,7 +4874,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
                         ST_ty_t *at = ST_type_expr(se, e->call.args.items[ai].value);
                         ST_ty_t *pt =
                             (ai + arg_off) < pc ? cand_ty->params.items[ai + arg_off] : NULL;
-                        if (at && pt && !ST_ty_coerces(se, at, pt)) {
+                        if (at && pt && !ST_ty_arg_coerces(se, at, pt)) {
                             matches = 0;
                             break;
                         }
@@ -5287,7 +5301,7 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
             ST_ty_t *pt = fnty->params.items[idx];
             ST_arg_extern_decay(se, sym, pt, arg);
             ST_ty_t *at = arg->value->ty;
-            if (pt && at && !ST_ty_coerces(se, at, pt))
+            if (pt && at && !ST_ty_arg_coerces(se, at, pt))
                 {
                     ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                                   "argument '" ST_sv_fmt "' expects '%s', got '%s'",
@@ -5345,9 +5359,9 @@ static ST_tys_t *ST_type_call(ST_sema_t *se, ST_expr_t *e) {
         ST_ty_t *pt = fnty->params.items[i];
         ST_arg_extern_decay(se, sym, pt, arg);
         ST_ty_t *at = arg->value->ty;
-        if (pt && at && ST_ty_coerces(se, at, pt))
+        if (pt && at && ST_ty_arg_coerces(se, at, pt))
             ST_box_any(se, &arg->value, pt);
-        if (pt && at && !ST_ty_coerces(se, at, pt)) {
+        if (pt && at && !ST_ty_arg_coerces(se, at, pt)) {
             ST_diag_error(&se->diag, arg->value->line, arg->value->col,
                           "'" ST_sv_fmt "' argument %u expects '%s', got '%s'",
                           ST_sv_args(call_name), i + 1, ST_tstr(se, pt), ST_tstr(se, at));

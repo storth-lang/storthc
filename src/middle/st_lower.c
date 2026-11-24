@@ -1754,9 +1754,24 @@ static b8 ST_lower_push_array_as_slice_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out
                                            ST_expr_t *re, ST_ty_t *pty) {
     if (!re->ty || !pty)
         return 0;
-    if (re->ty->kind != ST_TY_ARRAY || pty->kind != ST_TY_SLICE)
+    if (pty->kind != ST_TY_SLICE || re->ty->inner != pty->inner)
         return 0;
-    if (re->ty->inner != pty->inner)
+
+    if (re->ty->kind == ST_TY_DYN_ARRAY) {
+        // [..]T -> []T by value: a dyn-array is {items, count, capacity}, so its first two
+        // eightbytes are exactly the slice {ptr, len} header. Pass those, not the 24-byte object.
+        ST_ir_inst_t *dyn_addr = ST_lower_struct_addr(c, re, re->ty);
+        if (!dyn_addr)
+            return 0;
+        u32 n_parts = ST_abi_part_count(pty);
+        for (u32 k = 0; k < n_parts && k < 2; k++) {
+            ST_ty_t *ebty = ST_lower_part_ty(c, pty, k);
+            ST_ir_inst_t *fp = ST_lower_field_ptr(c, dyn_addr, (i32)(k * 8), ebty, re->line, re->col);
+            out[(*count)++] = ST_ir_load(c->cur, ebty, fp, re->line, re->col);
+        }
+        return 1;
+    }
+    if (re->ty->kind != ST_TY_ARRAY)
         return 0;
 
     ST_ir_inst_t *arr_addr = ST_lower_lvalue_addr(c, re);
@@ -1779,6 +1794,46 @@ static b8 ST_lower_push_array_as_slice_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out
         ST_ir_inst_t *fp = ST_lower_field_ptr(c, slot, (i32)(k * 8), ebty, re->line, re->col);
         out[(*count)++] = ST_ir_load(c->cur, ebty, fp, re->line, re->col);
     }
+    return 1;
+}
+
+// '*[N]T' / '*[..]T' passed where '*[]T' is expected: build a temporary {ptr, len} slice header
+// viewing the array in the caller's frame and pass the address of that header. Mutating the
+// elements through the slice affects the original array; reassigning the header does not.
+static b8 ST_lower_push_ptr_view_arg(ST_lower_ctx_t *c, ST_ir_inst_t **out, u32 *count,
+                                     ST_expr_t *re, ST_ty_t *pty) {
+    if (!re || !re->ty || !pty)
+        return 0;
+    ST_ty_t *from = re->ty;
+    if (from->kind != ST_TY_PTR || pty->kind != ST_TY_PTR || !from->inner || !pty->inner)
+        return 0;
+    ST_ty_t *arr = from->inner;
+    ST_ty_t *sl = pty->inner;
+    if (sl->kind != ST_TY_SLICE || (arr->kind != ST_TY_ARRAY && arr->kind != ST_TY_DYN_ARRAY) ||
+        arr->inner != sl->inner)
+        return 0;
+
+    ST_ir_inst_t *base = ST_lower_expr(c, re);
+    ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, sl, (ST_string_t){0}, re->line, re->col);
+    ST_ty_t *elem_ptr_ty = ST_ty_ptr(&c->sema->tys, sl->inner);
+    ST_ty_t *len_ty = c->sema->tys.prim[ST_ti64];
+
+    ST_ir_inst_t *data, *len;
+    if (arr->kind == ST_TY_ARRAY) {
+        data = base;
+        len = ST_ir_const_int(c->cur, len_ty, (i64)arr->count);
+    } else {
+        // [..]T is {items, count, capacity}: its first two fields are the slice header.
+        ST_ir_inst_t *dp = ST_lower_field_ptr(c, base, 0, elem_ptr_ty, re->line, re->col);
+        data = ST_ir_load(c->cur, elem_ptr_ty, dp, re->line, re->col);
+        ST_ir_inst_t *lp = ST_lower_field_ptr(c, base, 8, len_ty, re->line, re->col);
+        len = ST_ir_load(c->cur, len_ty, lp, re->line, re->col);
+    }
+    ST_ir_inst_t *pf = ST_lower_field_ptr(c, slot, 0, elem_ptr_ty, re->line, re->col);
+    ST_ir_store(c->cur, elem_ptr_ty, pf, data, re->line, re->col);
+    ST_ir_inst_t *lf = ST_lower_field_ptr(c, slot, 8, len_ty, re->line, re->col);
+    ST_ir_store(c->cur, len_ty, lf, len, re->line, re->col);
+    out[(*count)++] = slot;
     return 1;
 }
 
@@ -1870,6 +1925,8 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
             ST_ty_t *pty = ST_lower_tyexpr(c, sig->params.items[i].te);
             if (ST_lower_push_array_as_slice_arg(c, args, &n_args, re, pty))
                 continue;
+            if (ST_lower_push_ptr_view_arg(c, args, &n_args, re, pty))
+                continue;
             if (re->ty && (re->ty->kind == ST_TY_STRUCT || re->ty->kind == ST_TY_STRING ||
                           re->ty->kind == ST_TY_TAG_UNION || re->ty->kind == ST_TY_ARRAY ||
                           re->ty->kind == ST_TY_DYN_ARRAY || re->ty->kind == ST_TY_SLICE))
@@ -1894,6 +1951,22 @@ static ST_ir_inst_t *ST_lower_call_raw(ST_lower_ctx_t *c, ST_expr_t *e) {
 
         ST_forrange(0, e->call.args.count) {
             ST_expr_t *ae = e->call.args.items[i].value;
+            {
+                ST_ty_t *pty = NULL;
+                if (sig && i < sig->params.count)
+                    pty = ST_lower_tyexpr(c, sig->params.items[i].te);
+                else {
+                    ST_ty_t *ft = e->call.callee ? e->call.callee->ty : NULL;
+                    if (ft && ft->kind == ST_TY_PTR && ft->inner && ft->inner->kind == ST_TY_FN)
+                        ft = ft->inner;
+                    if (ft && ft->kind == ST_TY_FN && i < ft->params.count)
+                        pty = ft->params.items[i];
+                }
+                if (ST_lower_push_ptr_view_arg(c, args, &idx, ae, pty))
+                    continue;
+                if (ST_lower_push_array_as_slice_arg(c, args, &idx, ae, pty))
+                    continue;
+            }
             if (ae->ty && (ae->ty->kind == ST_TY_STRUCT || ae->ty->kind == ST_TY_STRING ||
                           ae->ty->kind == ST_TY_TAG_UNION || ae->ty->kind == ST_TY_ARRAY ||
                           ae->ty->kind == ST_TY_DYN_ARRAY || ae->ty->kind == ST_TY_SLICE)) {
@@ -3860,7 +3933,7 @@ static void ST_lower_string_zero(ST_lower_ctx_t *c, ST_ir_inst_t *slot, u32 line
     ST_ir_store(c->cur, lty, p, ST_ir_const_int(c->cur, lty, 0), line, col);
 }
 
-static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
+static void ST_lower_fn_body_inner(ST_lower_ctx_t *c, ST_decl_t *d) {
     if (d->fn.is_prototype)
         return;
 
@@ -4080,6 +4153,25 @@ static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
                           "function '" ST_sv_fmt "' does not return a value on all paths",
                           ST_sv_args(d->name));
     }
+}
+
+// Lower one function body with diagnostics (and runtime source locations) attributed to the file
+// the function was declared in, so errors inside imported modules show the module's path, line,
+// column and source snippet instead of the importing file's.
+static void ST_lower_fn_body(ST_lower_ctx_t *c, ST_decl_t *d) {
+    ST_string_t save_file = c->diag.file;
+    ST_string_t save_src = c->diag.src;
+    if (d->file.len) {
+        c->diag.file = d->file;
+        if (c->sema && c->sema->srcs) {
+            ST_string_t s = ST_srcmap_get(c->sema->srcs, d->file);
+            if (s.len)
+                c->diag.src = s;
+        }
+    }
+    ST_lower_fn_body_inner(c, d);
+    c->diag.file = save_file;
+    c->diag.src = save_src;
 }
 
 b8 ST_lower_program(ST_arena_t *arena, ST_program_t *prog, ST_sema_t *sema, ST_string_t src,
