@@ -28,7 +28,8 @@
 //   2. <importing file's dir>/modules/<name>/module.st (relative to the
 //      *importing file's own directory*, not the process cwd)
 //   3. $STORTHC_MODULE_PATH/<name>/module.st   (if that env var is set)
-//   4. /usr/local/storthc/modules/<name>/module.st
+//   4. ST_MODULES_DIR/<name>/module.st (ST_MODULES_DIR defaults to
+//      /usr/local/storthc/modules)
 //
 // Known limitations (kept small on purpose):
 //   - The rename of a module's own top-level names is lexical, not

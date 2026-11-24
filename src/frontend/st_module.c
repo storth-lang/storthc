@@ -11,6 +11,10 @@
 #include "st_load.h"
 #include "st_parser.h"
 
+#ifndef ST_MODULES_DIR
+#define ST_MODULES_DIR "/usr/local/storthc/modules"
+#endif
+
 static char *ST_mod_cstr(ST_arena_t *a, ST_string_t s) {
     char *buf = ST_arena_push(a, s.len + 1);
     memcpy(buf, s.data, s.len);
@@ -113,7 +117,7 @@ static b8 ST_mod_resolve(ST_arena_t *arena, ST_string_t importer_dir, ST_string_
         }
     }
 
-    candidate = ST_mod_module_file(arena, "/usr/local/storthc/modules", name);
+    candidate = ST_mod_module_file(arena, ST_MODULES_DIR, name);
     #endif
 
     if (ST_access_file(ST_mod_cstr(arena, candidate)) == 0) {
@@ -676,7 +680,7 @@ static b8 ST_module_process_file(ST_module_ctx_t *ctx, ST_string_t path, ST_stri
                               "-import_dir dirs, "
                               "'<file dir>/modules/" ST_sv_fmt "/module.st', "
                               "$STORTHC_MODULE_PATH, and "
-                              "/usr/local/storthc/modules/" ST_sv_fmt "/module.st)",
+                              ST_MODULES_DIR "/" ST_sv_fmt "/module.st)",
                               ST_sv_args(d->import_.module_name), ST_sv_args(d->import_.module_name),
                               ST_sv_args(d->import_.module_name));
                 ok = 0;
@@ -769,7 +773,7 @@ b8 ST_modules_process(ST_arena_t *arena, ST_program_t *root_prog, ST_string_t ro
                           "-import_dir dirs, "
                           "'<file dir>/modules/" ST_sv_fmt "/module.st', "
                           "$STORTHC_MODULE_PATH, and "
-                          "/usr/local/storthc/modules/" ST_sv_fmt "/module.st)",
+                          ST_MODULES_DIR "/" ST_sv_fmt "/module.st)",
                           ST_sv_args(d->import_.module_name), ST_sv_args(d->import_.module_name),
                           ST_sv_args(d->import_.module_name));
             ok = 0;
