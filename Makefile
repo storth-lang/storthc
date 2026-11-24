@@ -19,6 +19,8 @@ OBJ := $(patsubst $(SRCROOT)/%.c,$(OBJROOT)/%.o,$(SRC))
 DEP := $(OBJ:.o=.d)
 
 TESTROOT := tests
+TESTBIN := $(TESTROOT)/build
+TESTSET := $(TESTROOT)/set.sh
 TESTSRC := $(TESTROOT)/st_tester.c
 TESTOBJ := $(patsubst $(TESTROOT)/%.c,$(OBJROOT)/%.o,$(TESTSRC))
 TESTUTIL := $(addprefix $(OBJROOT)/utils/,st_arena.o st_ht.o st_process.o st_string.o platform/st_process_linux.o)
@@ -49,11 +51,14 @@ all: $(TARGET)
 test: $(TESTTARGET)
 	$< -dir ./tests
 
-$(TESTTARGET): $(TESTOBJ) $(TESTUTIL) | $(BINDIR)
+$(TESTTARGET): $(TESTOBJ) $(TESTUTIL) $(TESTBIN) | $(BINDIR)
 	$(QUIET)printf "$(GREEN)LD$(RESET)  %s\n" "$@"
 	$(QUIET)$(CC) $(TESTCFLAGS) -o $@ $(TESTOBJ) $(TESTUTIL) $(LDLIBS) \
 		&& printf "$(GREEN)build ok$(RESET)  %s\n" "$@" \
 		|| { printf "$(RED)build failed$(RESET)  %s\n" "$@"; exit 1; }
+
+$(TESTBIN):
+	$(QUIET)$(TESTSET) build
 
 $(OBJROOT)/%.o: $(TESTROOT)/%.c | $(OBJROOT)
 	$(QUIET)printf "$(GREEN)CC$(RESET)  %s\n" "$@"
@@ -100,4 +105,4 @@ $(OBJROOT):
 	@mkdir -p $(OBJROOT)
 
 clean:
-	rm -rf $(OBJROOT) $(BINDIR)
+	rm -rf $(OBJROOT) $(BINDIR) $(TESTBIN)
