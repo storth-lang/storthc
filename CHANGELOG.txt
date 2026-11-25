@@ -1,3 +1,15 @@
+2026:11:25
+- `Type_Info` grew from 32 to 64 bytes: `is_signed`, `is_flag`, `elem` (pointee / array / slice element),
+  `count` (array length) and `members: []Member_Info`. `Member_Info` is `{ name: string, info: *Type_Info,
+  offset: i64, value: i64 }` and describes struct fields, tag union variants (tag in `value`, payload at
+  offset 8) and enum values. The first 32 bytes are unchanged.
+- Type records are built once per type (cycle safe, so `next: *Node` works) and written by one shared
+  `ST_ir_emit_tinfo` instead of three copies in the backends. `type_info(T)` now copies that same record.
+- `{}` in `print`/`println` prints structs (`F { x: 7, y: "hi" }`), tag unions (`Some(42)`, `None`), enums by
+  name (`Green`, `Read | Exec` for enum_flag), arrays, slices and dynamic arrays (`[1, 2, 3]`) and nested `any`.
+  Strings and chars are quoted when nested. Pointers other than `*char` print as hex.
+- `tests/27-rtti-print.st`: run `tests/set.sh 27-rtti-print.st` to record its snapshot.
+
 # Storth Programming Language
 
 2026:11:23

@@ -354,15 +354,56 @@ ST_ir_inst_t *ST_ir_const_tinfo(ST_ir_block_t *b, ST_ty_t *ty, u32 index) {
     return inst;
 }
 
-u32 ST_ir_module_intern_tinfo(ST_ir_module_t *m, u8 kind, u32 size, u32 align, u32 name_idx) {
+i32 ST_ir_module_find_tinfo(ST_ir_module_t *m, ST_ty_t *ty) {
     ST_forrange(0, m->tinfos.count) {
-        ST_ir_tinfo_t *t = &m->tinfos.items[i];
-        if (t->name_idx == name_idx && t->kind == kind && t->size == size && t->align == align)
-            return i;
+        if (m->tinfos.items[i].ty == ty)
+            return (i32)i;
     }
-    ST_ir_tinfo_t t = { kind, size, align, name_idx };
+    return -1;
+}
+
+u32 ST_ir_module_add_tinfo(ST_ir_module_t *m, ST_ir_tinfo_t t) {
     ST_da_append_arena(m->arena, &m->tinfos, t);
     return m->tinfos.count - 1;
+}
+
+void ST_ir_emit_tinfo(FILE *out, ST_ir_module_t *m, u32 idx) {
+    ST_ir_tinfo_t *t = &m->tinfos.items[idx];
+
+    if (t->members.count) {
+        fprintf(out, "align 8\n");
+        fprintf(out, "tinfo_%u_m:\n", idx);
+        ST_forrange(0, t->members.count) {
+            ST_ir_member_t *mb = &t->members.items[i];
+            fprintf(out, "    dq str_%u_data\n", mb->name_idx);
+            fprintf(out, "    dq %u\n", (u32)m->strs.items[mb->name_idx].len);
+            if (mb->info_idx >= 0)
+                fprintf(out, "    dq tinfo_%d\n", mb->info_idx);
+            else
+                fprintf(out, "    dq 0\n");
+            fprintf(out, "    dq %lld\n", (long long)mb->offset);
+            fprintf(out, "    dq %lld\n", (long long)mb->value);
+        }
+    }
+
+    fprintf(out, "align 8\n");
+    fprintf(out, "tinfo_%u:\n", idx);
+    fprintf(out, "    db %u, %u, %u, 0, 0, 0, 0, 0\n", (u32)t->kind, (u32)t->is_signed,
+            (u32)t->is_flag);
+    fprintf(out, "    dq str_%u_data\n", t->name_idx);
+    fprintf(out, "    dq %u\n", (u32)m->strs.items[t->name_idx].len);
+    fprintf(out, "    dd %u\n", t->size);
+    fprintf(out, "    dd %u\n", t->align);
+    if (t->elem_idx >= 0)
+        fprintf(out, "    dq tinfo_%d\n", t->elem_idx);
+    else
+        fprintf(out, "    dq 0\n");
+    fprintf(out, "    dq %lld\n", (long long)t->count);
+    if (t->members.count)
+        fprintf(out, "    dq tinfo_%u_m\n", idx);
+    else
+        fprintf(out, "    dq 0\n");
+    fprintf(out, "    dq %u\n", t->members.count);
 }
 
 u32 ST_ir_module_intern_str(ST_ir_module_t *m, ST_string_t bytes) {

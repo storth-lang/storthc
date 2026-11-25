@@ -313,16 +313,7 @@ static void ST_generate_tinfos(FILE *out, ST_ir_module_t *m) {
     if (!m->tinfos.count)
         return;
     fprintf(out, "\nsection .rodata\n");
-    ST_forrange(0, m->tinfos.count) {
-        ST_ir_tinfo_t *t = &m->tinfos.items[i];
-        fprintf(out, "align 8\n");
-        fprintf(out, "tinfo_%u:\n", (u32)i);
-        fprintf(out, "    db %u, 0, 0, 0, 0, 0, 0, 0\n", (u32)t->kind);
-        fprintf(out, "    dq str_%u_data\n", t->name_idx);
-        fprintf(out, "    dq %u\n", (u32)m->strs.items[t->name_idx].len);
-        fprintf(out, "    dd %u\n", t->size);
-        fprintf(out, "    dd %u\n", t->align);
-    }
+    ST_forrange(0, m->tinfos.count) ST_ir_emit_tinfo(out, m, (u32)i);
 }
 
 static void ST_generate_strs(FILE *out, ST_ir_module_t *m) {

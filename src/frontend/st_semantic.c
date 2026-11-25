@@ -9590,18 +9590,68 @@ static ST_field_spec_t ST_type_info_field(ST_arena_t *a, const char *fname, cons
     return f;
 }
 
+static ST_field_spec_t ST_type_info_wrapped_field(ST_arena_t *a, const char *fname,
+                                                  const char *tyname, ST_tyexpr_kind_t wrap) {
+    ST_field_spec_t f = ST_type_info_field(a, fname, tyname);
+    ST_tyexpr_t *outer = ST_tyexpr_new(a, wrap, 0, 0);
+    outer->inner = f.te;
+    f.te = outer;
+    return f;
+}
+
+// The runtime type record behind 'any' and 'type_info(T)'. The byte offsets below are
+// mirrored by ST_TINFO_* / ST_MEMBER_* in middle/st_ir.h, which the static records emitted
+// by the backends are written against, and by 'out_any' in modules/Error/log.st.
+//
+//   struct Member_Info {          // 40 bytes
+//       name: string;             //  0  field / variant / enum value name
+//       info: *Type_Info;         // 16  field or payload type, null when there is none
+//       offset: i64;              // 24  field offset (a tag union payload starts at 8)
+//       value: i64;               // 32  enum value / tag union tag
+//   }
+//   struct Type_Info {            // 64 bytes
+//       kind: u8;                 //  0  ST_ty_kind_t
+//       is_signed: u8;            //  1  integers and enums
+//       is_flag: u8;              //  2  enum_flag
+//       name: string;             //  8
+//       size: u32;                // 24
+//       align: u32;               // 28
+//       elem: *Type_Info;         // 32  pointee / array / slice element
+//       count: i64;               // 40  array length
+//       members: []Member_Info;   // 48  struct fields, tag union variants, enum values
+//   }
 static void ST_sema_synth_type_info(ST_sema_t *se) {
+    ST_decl_t *mi = ST_decl_new(se->arena, ST_DE_STRUCT, 0, 0);
+    mi->name = ST_cstr_to_str("Member_Info");
+    mi->is_pub = 1;
+    ST_da_append_arena(se->arena, &mi->struct_.fields, ST_type_info_field(se->arena, "name", "string"));
+    ST_da_append_arena(se->arena, &mi->struct_.fields,
+                       ST_type_info_wrapped_field(se->arena, "info", "Type_Info", ST_TE_PTR));
+    ST_da_append_arena(se->arena, &mi->struct_.fields, ST_type_info_field(se->arena, "offset", "i64"));
+    ST_da_append_arena(se->arena, &mi->struct_.fields, ST_type_info_field(se->arena, "value", "i64"));
+
     ST_decl_t *d = ST_decl_new(se->arena, ST_DE_STRUCT, 0, 0);
     d->name = ST_cstr_to_str("Type_Info");
     d->is_pub = 1;
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "kind", "u8"));
+    ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "is_signed", "u8"));
+    ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "is_flag", "u8"));
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "name", "string"));
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "size", "u32"));
     ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "align", "u32"));
+    ST_da_append_arena(se->arena, &d->struct_.fields,
+                       ST_type_info_wrapped_field(se->arena, "elem", "Type_Info", ST_TE_PTR));
+    ST_da_append_arena(se->arena, &d->struct_.fields, ST_type_info_field(se->arena, "count", "i64"));
+    ST_da_append_arena(se->arena, &d->struct_.fields,
+                       ST_type_info_wrapped_field(se->arena, "members", "Member_Info", ST_TE_ARRAY));
 
+    // both names must be visible before either struct is laid out: they refer to each other
+    ST_sym_insert(se, &se->types, ST_sym_new(se, ST_SYM_TYPE, mi->name, mi, NULL, 0, 0));
     ST_sym_insert(se, &se->types, ST_sym_new(se, ST_SYM_TYPE, d->name, d, NULL, 0, 0));
     se->type_info_ty = ST_ty_for_decls(&se->tys, d);
+    se->member_info_ty = ST_ty_for_decls(&se->tys, mi);
     ST_complete_ty(se, se->type_info_ty);
+    ST_complete_ty(se, se->member_info_ty);
 }
 
 static void ST_sema_synth_any(ST_sema_t *se) {

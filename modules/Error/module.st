@@ -96,6 +96,5 @@ pub impl Result {
 }
 
 #import "Libc";
+#import "Logger";
 #import "Os";
-
-#load "log.st";

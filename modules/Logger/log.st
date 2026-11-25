@@ -228,43 +228,184 @@ fn ld_cstr(d: *void) -> *char {
     return *p;
 }
 
-fn out_any(o: *Out, a: any) {
-    info := a.info;
+fn ld_ptr(d: *void) -> *void {
+    p := cast(**void) d;
+    return *p;
+}
+
+fn at(d: *void, off: i64) -> *void {
+    p := cast(*char) d;
+    return cast(*void) (p + off);
+}
+
+// Reads an integer of 'size' bytes and widens it to i64 (sign extended when 'is_signed').
+fn ld_int(d: *void, size: u32, is_signed: u8) -> i64 {
+    neg := is_signed != 0;
+    if size == 1 {
+        if neg { return cast(i64) ld_i8(d); }
+        return cast(i64) ld_u8(d);
+    } else if size == 2 {
+        if neg { return cast(i64) ld_i16(d); }
+        return cast(i64) ld_u16(d);
+    } else if size == 4 {
+        if neg { return cast(i64) ld_i32(d); }
+        return cast(i64) ld_u32(d);
+    }
+    return ld_i64(d);
+}
+
+fn out_enum(o: *Out, info: *Type_Info, v: i64) {
+    n := info.members.len;
+    if info.is_flag != 0 {
+        if v == 0 {
+            out_str(o, "0");
+            return;
+        }
+        rest := v;
+        first := true;
+        i : i64 = 0;
+        while i < n {
+            m := info.members.ptr + i;
+            if m.value != 0 && (rest & m.value) == m.value {
+                if !first { out_str(o, " | "); }
+                out_str(o, m.name);
+                rest = rest & ~m.value;
+                first = false;
+            }
+            i += 1;
+        }
+        if rest != 0 {
+            if !first { out_str(o, " | "); }
+            out_hex(o, cast(u64) rest);
+        }
+        return;
+    }
+    i : i64 = 0;
+    while i < n {
+        m := info.members.ptr + i;
+        if m.value == v {
+            out_str(o, m.name);
+            return;
+        }
+        i += 1;
+    }
+    out_i64(o, v);
+}
+
+fn out_union(o: *Out, info: *Type_Info, d: *void) {
+    tag := ld_i64(d);
+    n := info.members.len;
+    i : i64 = 0;
+    while i < n {
+        m := info.members.ptr + i;
+        if m.value == tag {
+            out_str(o, m.name);
+            if m.info != null {
+                out_char(o, '(');
+                out_val(o, m.info, at(d, m.offset), true);
+                out_char(o, ')');
+            }
+            return;
+        }
+        i += 1;
+    }
+    out_str(o, "<invalid ");
+    out_str(o, info.name);
+    out_str(o, ">");
+}
+
+fn out_struct(o: *Out, info: *Type_Info, d: *void) {
+    out_str(o, info.name);
+    n := info.members.len;
+    if n == 0 {
+        out_str(o, " {}");
+        return;
+    }
+    out_str(o, " { ");
+    i : i64 = 0;
+    while i < n {
+        m := info.members.ptr + i;
+        if i > 0 { out_str(o, ", "); }
+        out_str(o, m.name);
+        out_str(o, ": ");
+        out_val(o, m.info, at(d, m.offset), true);
+        i += 1;
+    }
+    out_str(o, " }");
+}
+
+fn out_list(o: *Out, elem: *Type_Info, base: *void, count: i64) {
+    out_char(o, '[');
+    stride := cast(i64) elem.size;
+    i : i64 = 0;
+    while i < count {
+        if i > 0 { out_str(o, ", "); }
+        out_val(o, elem, at(base, i * stride), true);
+        i += 1;
+    }
+    out_char(o, ']');
+}
+
+// Prints the value of type 'info' stored at 'd'. 'nested' is true for a value inside another
+// one (a field, an element, a payload): strings and characters are then quoted.
+fn out_val(o: *Out, info: *Type_Info, d: *void, nested: bool) {
     kind := info.kind;
     size := info.size;
-    name := info.name;
-    d := a.data;
     if kind == 1 {
         b := ld_u8(d);
         if b != 0 { out_str(o, "true"); } else { out_str(o, "false"); }
     } else if kind == 2 {
+        if nested { out_char(o, '\''); }
         out_char(o, ld_char(d));
+        if nested { out_char(o, '\''); }
     } else if kind == 3 {
+        if nested { out_char(o, '"'); }
         out_str(o, ld_string(d));
-    } else if kind == 5 || kind == 14 {
-        neg := name.len > 0 && name.ptr[0] == 'i';
-        if size == 1 {
-            if neg { out_i64(o, cast(i64) ld_i8(d)); } else { out_u64(o, cast(u64) ld_u8(d)); }
-        } else if size == 2 {
-            if neg { out_i64(o, cast(i64) ld_i16(d)); } else { out_u64(o, cast(u64) ld_u16(d)); }
-        } else if size == 4 {
-            if neg { out_i64(o, cast(i64) ld_i32(d)); } else { out_u64(o, cast(u64) ld_u32(d)); }
+        if nested { out_char(o, '"'); }
+    } else if kind == 4 {
+        inner := cast(*any) d;
+        out_val(o, inner.info, inner.data, nested);
+    } else if kind == 5 {
+        if info.is_signed != 0 {
+            out_i64(o, ld_int(d, size, 1));
+        } else if size == 8 {
+            out_u64(o, ld_u64(d));
         } else {
-            if neg { out_i64(o, ld_i64(d)); } else { out_u64(o, ld_u64(d)); }
+            out_i64(o, ld_int(d, size, 0));
         }
     } else if kind == 6 {
         if size == 4 { out_f64(o, cast(f64) ld_f32(d)); } else { out_f64(o, ld_f64(d)); }
     } else if kind == 9 {
-        if name == "*char" {
+        if info.elem != null && info.elem.kind == 2 && info.elem.size == 1 {
+            if nested { out_char(o, '"'); }
             out_cstr(o, ld_cstr(d));
+            if nested { out_char(o, '"'); }
         } else {
             out_hex(o, ld_u64(d));
         }
+    } else if kind == 10 {
+        out_list(o, info.elem, d, info.count);
+    } else if kind == 11 {
+        out_list(o, info.elem, ld_ptr(d), ld_i64(at(d, 8)));
+    } else if kind == 12 {
+        out_list(o, info.elem, ld_ptr(d), ld_i64(at(d, 8)));
+    } else if kind == 13 {
+        out_struct(o, info, d);
+    } else if kind == 14 {
+        out_enum(o, info, ld_int(d, size, info.is_signed));
+    } else if kind == 15 {
+        out_union(o, info, d);
+    } else if kind == 16 {
+        out_hex(o, ld_u64(d));
     } else {
         out_str(o, "<");
-        out_str(o, name);
+        out_str(o, info.name);
         out_str(o, ">");
     }
+}
+
+fn out_any(o: *Out, a: any) {
+    out_val(o, a.info, a.data, false);
 }
 
 fn format_text(o: *Out) -> bool {

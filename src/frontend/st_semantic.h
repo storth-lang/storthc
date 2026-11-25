@@ -85,6 +85,7 @@ typedef struct {
     ST_strings_t standin_done;
     ST_standin_fails_t standin_fails;
     ST_ty_t *type_info_ty;
+    ST_ty_t *member_info_ty;
     ST_program_t *prog;
     ST_ht_t templates;
     ST_ht_t instantiations;

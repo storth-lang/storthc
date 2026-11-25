@@ -239,17 +239,59 @@ typedef struct {
     u32 count, capacity;
 } ST_ir_strs_t;
 
+// @note: one entry of a type record's member table (struct field, tag union variant or
+// enum value). 'info_idx' is an index into the module's tinfos, or -1 for "no type"
+// (an enum value or a tag union variant without a payload).
 typedef struct {
+    u32 name_idx;
+    i32 info_idx;
+    i64 offset; // byte offset of the field / of the tag union payload
+    i64 value;  // enum value / tag union variant tag
+} ST_ir_member_t;
+
+typedef struct {
+    ST_ir_member_t *items;
+    u32 count, capacity;
+} ST_ir_members_t;
+
+// @note: the static RTTI record of a type. It is emitted into .rodata by
+// ST_ir_emit_tinfo and must match the layout of the compiler synthesized 'Type_Info'
+// (see ST_sema_synth_type_info and ST_TINFO_* below).
+typedef struct {
+    ST_ty_t *ty; // identity: one record per type
     u8 kind;
+    u8 is_signed;
+    u8 is_flag;
     u32 size;
     u32 align;
     u32 name_idx;
+    i32 elem_idx; // pointee / element type, -1 if none
+    i64 count;    // array length
+    ST_ir_members_t members;
 } ST_ir_tinfo_t;
 
 typedef struct {
     ST_ir_tinfo_t *items;
     u32 count, capacity;
 } ST_ir_tinfos_t;
+
+// Byte offsets inside 'Type_Info' and 'Member_Info'. The lowerer checks them against the
+// synthesized structs so a layout change is caught at compile time of the program.
+#define ST_TINFO_KIND 0
+#define ST_TINFO_SIGNED 1
+#define ST_TINFO_FLAG 2
+#define ST_TINFO_NAME 8
+#define ST_TINFO_SIZE 24
+#define ST_TINFO_ALIGN 28
+#define ST_TINFO_ELEM 32
+#define ST_TINFO_COUNT 40
+#define ST_TINFO_MEMBERS 48
+#define ST_TINFO_SIZEOF 64
+#define ST_MEMBER_NAME 0
+#define ST_MEMBER_INFO 16
+#define ST_MEMBER_OFFSET 24
+#define ST_MEMBER_VALUE 32
+#define ST_MEMBER_SIZEOF 40
 
 // @note: a single top-level 'global'/'global const' variable: reserves
 // storage in .bss (zero/no initializer) or .data (constant scalar
@@ -369,7 +411,11 @@ ST_ir_inst_t *ST_ir_const_float(ST_ir_block_t *b, ST_ty_t *ty, f64 v);
 // pass it to the module. This will return the bytes of the strings that got interened.
 u32 ST_ir_module_intern_str(ST_ir_module_t *m, ST_string_t bytes);
 
-u32 ST_ir_module_intern_tinfo(ST_ir_module_t *m, u8 kind, u32 size, u32 align, u32 name_idx);
+i32 ST_ir_module_find_tinfo(ST_ir_module_t *m, ST_ty_t *ty);
+u32 ST_ir_module_add_tinfo(ST_ir_module_t *m, ST_ir_tinfo_t t);
+// Writes the record 'tinfo_<idx>' and its member table 'tinfo_<idx>_m' as assembler text that
+// nasm and fasm both accept. Call it inside a read-only data section.
+void ST_ir_emit_tinfo(FILE *out, ST_ir_module_t *m, u32 idx);
 
 ST_ir_inst_t *ST_ir_const_tinfo(ST_ir_block_t *b, ST_ty_t *ty, u32 index);
 

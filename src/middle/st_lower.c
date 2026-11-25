@@ -398,6 +398,11 @@ static ST_ty_t *ST_lower_tyexpr(ST_lower_ctx_t *c, ST_tyexpr_t *te) {
             }
             if (d)
                 return ST_ty_for_decls(&c->sema->tys, d);
+            // compiler synthesized types have no decl in the program
+            if (ST_string_eq_cstr(te->name, "Type_Info"))
+                return c->sema->type_info_ty;
+            if (ST_string_eq_cstr(te->name, "Member_Info"))
+                return c->sema->member_info_ty;
             ST_diag_error(&c->diag, te->line, te->col,
                           "internal: unknown type name '" ST_sv_fmt "'", ST_sv_args(te->name));
             return ST_ty_prim(&c->sema->tys, ST_ti32);
@@ -2118,6 +2123,133 @@ static ST_ir_inst_t *ST_lower_call(ST_lower_ctx_t *c, ST_expr_t *e) {
     return result;
 }
 
+// Builds (once per type) the static RTTI record of 't' and returns its index in the module's
+// tinfos. The record is reserved before its members are visited, so a struct that points back
+// at itself ('next: *Node') ends up referring to its own record instead of recursing forever.
+static i32 ST_lower_tinfo_idx(ST_lower_ctx_t *c, ST_ty_t *t) {
+    if (!t)
+        return -1;
+    if (t->kind == ST_TY_UNTYPED_INT)
+        t = c->sema->tys.prim[ST_ti32];
+    else if (t->kind == ST_TY_UNTYPED_FLOAT)
+        t = c->sema->tys.prim[ST_tf32];
+
+    i32 found = ST_ir_module_find_tinfo(c->module, t);
+    if (found >= 0)
+        return found;
+
+    ST_ty_kind_t kind = t == c->sema->tys.prim[ST_tany] ? ST_TY_ANY : t->kind;
+
+    ST_ir_tinfo_t rec = {0};
+    rec.ty = t;
+    rec.kind = (u8)kind;
+    rec.size = t->size;
+    rec.align = t->align;
+    rec.elem_idx = -1;
+    rec.name_idx = ST_ir_module_intern_str(
+        c->module, ST_cstr_to_str((char *)ST_ty_cstr(c->arena, t)));
+    if (kind == ST_TY_INT || kind == ST_TY_ENUM)
+        rec.is_signed = t->is_signed ? 1 : 0;
+    if (kind == ST_TY_ENUM && t->decl)
+        rec.is_flag = t->decl->enum_.is_flag ? 1 : 0;
+    if (kind == ST_TY_ARRAY)
+        rec.count = (i64)t->count;
+
+    i32 idx = (i32)ST_ir_module_add_tinfo(c->module, rec);
+
+    ST_ir_members_t members = {0};
+    i32 elem = -1;
+
+    switch (kind) {
+        case ST_TY_PTR:
+        case ST_TY_ARRAY:
+        case ST_TY_SLICE:
+        case ST_TY_DYN_ARRAY:
+            elem = ST_lower_tinfo_idx(c, t->inner);
+            break;
+        case ST_TY_STRUCT:
+            ST_forrange(0, t->fields.count) {
+                ST_ty_field_t *f = &t->fields.items[i];
+                ST_ir_member_t m = {0};
+                m.name_idx = ST_ir_module_intern_str(c->module, f->name);
+                m.info_idx = ST_lower_tinfo_idx(c, f->ty);
+                m.offset = (i64)f->offset;
+                ST_da_append_arena(c->arena, &members, m);
+            }
+            break;
+        case ST_TY_ENUM:
+            if (t->decl) {
+                ST_variant_specs_t *vs = &t->decl->enum_.variants;
+                ST_forrange(0, vs->count) {
+                    ST_ir_member_t m = {0};
+                    m.name_idx = ST_ir_module_intern_str(c->module, vs->items[i].name);
+                    m.info_idx = -1;
+                    m.value = vs->items[i].computed;
+                    ST_da_append_arena(c->arena, &members, m);
+                }
+            }
+            break;
+        case ST_TY_TAG_UNION:
+            if (t->decl) {
+                ST_variant_specs_t *vs = &t->decl->tag_union.variants;
+                ST_forrange(0, vs->count) {
+                    ST_ir_member_t m = {0};
+                    m.name_idx = ST_ir_module_intern_str(c->module, vs->items[i].name);
+                    m.info_idx = -1;
+                    if (vs->items[i].payload) {
+                        ST_ty_t *pt = ST_lower_tyexpr(c, vs->items[i].payload);
+                        m.info_idx = ST_lower_tinfo_idx(c, pt);
+                        m.offset = 8;
+                    }
+                    m.value = (i64)i;
+                    ST_da_append_arena(c->arena, &members, m);
+                }
+            }
+            break;
+        default:
+            break;
+    }
+
+    // @note: the DA may have been reallocated while the members were visited, so the record is
+    // addressed by index only now.
+    c->module->tinfos.items[idx].elem_idx = elem;
+    c->module->tinfos.items[idx].members = members;
+    return idx;
+}
+
+static b8 ST_lower_tinfo_layout_one(ST_ty_t *ty, const char **names, const u32 *offs, u32 n,
+                                    u32 total) {
+    if (ty->size != total)
+        return 0;
+    ST_forrange(0, ty->fields.count) {
+        ST_ty_field_t *f = &ty->fields.items[i];
+        for (u32 k = 0; k < n; k++)
+            if (ST_string_eq_cstr(f->name, names[k]) && f->offset != offs[k])
+                return 0;
+    }
+    return 1;
+}
+
+// The static records the backends write are laid out by hand (ST_TINFO_* / ST_MEMBER_*), so a
+// change to the synthesized 'Type_Info' / 'Member_Info' must fail loudly here.
+static b8 ST_lower_tinfo_layout_ok(ST_lower_ctx_t *c, u32 line, u32 col) {
+    static const char *ti_names[] = {"kind", "is_signed", "is_flag", "name", "size",
+                                     "align", "elem", "count", "members"};
+    static const u32 ti_offs[] = {ST_TINFO_KIND, ST_TINFO_SIGNED, ST_TINFO_FLAG, ST_TINFO_NAME,
+                                  ST_TINFO_SIZE, ST_TINFO_ALIGN, ST_TINFO_ELEM, ST_TINFO_COUNT,
+                                  ST_TINFO_MEMBERS};
+    static const char *mi_names[] = {"name", "info", "offset", "value"};
+    static const u32 mi_offs[] = {ST_MEMBER_NAME, ST_MEMBER_INFO, ST_MEMBER_OFFSET,
+                                  ST_MEMBER_VALUE};
+    if (ST_lower_tinfo_layout_one(c->sema->type_info_ty, ti_names, ti_offs, 9, ST_TINFO_SIZEOF) &&
+        ST_lower_tinfo_layout_one(c->sema->member_info_ty, mi_names, mi_offs, 4, ST_MEMBER_SIZEOF))
+        return 1;
+    ST_diag_error(&c->diag, line, col,
+                  "internal: Type_Info / Member_Info layout changed, update ST_TINFO_* and "
+                  "ST_MEMBER_* in st_ir.h and the static type records");
+    return 0;
+}
+
 static ST_ir_inst_t *ST_lower_box_any(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_expr_t *v = e->cast.operand;
     ST_ty_t *vt = v->ty;
@@ -2135,26 +2267,14 @@ static ST_ir_inst_t *ST_lower_box_any(ST_lower_ctx_t *c, ST_expr_t *e) {
     ST_ty_t *tinfo_ptr = ST_ty_ptr(&c->sema->tys, tity);
     ST_ty_t *void_ptr = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tvoid]);
 
-    ST_forrange(0, tity->fields.count) {
-        ST_ty_field_t *f = &tity->fields.items[i];
-        u32 want = ST_string_eq_cstr(f->name, "kind")    ? 0
-                   : ST_string_eq_cstr(f->name, "name")  ? 8
-                   : ST_string_eq_cstr(f->name, "size")  ? 24
-                                                        : 28;
-        if (f->offset != want) {
-            ST_diag_error(&c->diag, e->line, e->col,
-                          "internal: Type_Info layout changed, update the static type records");
-            return ST_ir_const_int(c->cur, e->ty, 0);
-        }
-    }
+    if (!ST_lower_tinfo_layout_ok(c, e->line, e->col))
+        return ST_ir_const_int(c->cur, e->ty, 0);
 
     ST_ir_inst_t *vslot = ST_ir_alloca(c->fn, &c->sema->tys, vt, (ST_string_t){0}, e->line, e->col);
     ST_lower_value_into(c, vslot, 0, vt, v);
 
     ST_ir_inst_t *aslot = ST_ir_alloca(c->fn, &c->sema->tys, anyty, (ST_string_t){0}, e->line, e->col);
-    ST_string_t name_sv = ST_cstr_to_str((char *)ST_ty_cstr(c->arena, vt));
-    u32 nidx = ST_ir_module_intern_str(c->module, name_sv);
-    u32 tidx = ST_ir_module_intern_tinfo(c->module, (u8)vt->kind, vt->size, vt->align, nidx);
+    u32 tidx = (u32)ST_lower_tinfo_idx(c, vt);
     ST_ir_inst_t *ti = ST_ir_const_tinfo(c->cur, tinfo_ptr, tidx);
 
     ST_ir_inst_t *fp0 = ST_lower_field_ptr(c, aslot, 0, tinfo_ptr, e->line, e->col);
@@ -2441,31 +2561,16 @@ static ST_ir_inst_t *ST_lower_expr_impl(ST_lower_ctx_t *c, ST_expr_t *e) {
                               "internal: 'type_info' operand has no resolved type");
                 return ST_ir_const_int(c->cur, e->ty, 0);
             }
+            if (!ST_lower_tinfo_layout_ok(c, e->line, e->col))
+                return ST_ir_const_int(c->cur, e->ty, 0);
+            // the value is a copy of the same static record 'any' points at
             ST_ty_t *tity = c->sema->type_info_ty;
-            ST_ir_inst_t *slot = ST_ir_alloca(c->fn, &c->sema->tys, tity, (ST_string_t){0}, e->line, e->col);
-            const char *name_c = ST_ty_cstr(c->arena, ot);
-            ST_string_t name_sv = ST_cstr_to_str((char *)name_c);
-
-            ST_forrange(0, tity->fields.count) {
-                ST_ty_field_t *f = &tity->fields.items[i];
-                ST_ir_inst_t *fp =
-                    ST_lower_field_ptr(c, slot, (i32)f->offset, f->ty, e->line, e->col);
-                if (ST_string_eq_cstr(f->name, "kind")) {
-                    ST_ir_store(c->cur, f->ty, fp,
-                               ST_ir_const_int(c->cur, f->ty, (i64)ot->kind), e->line, e->col);
-                } else if (ST_string_eq_cstr(f->name, "size")) {
-                    ST_ir_store(c->cur, f->ty, fp,
-                               ST_ir_const_int(c->cur, f->ty, (i64)ot->size), e->line, e->col);
-                } else if (ST_string_eq_cstr(f->name, "align")) {
-                    ST_ir_store(c->cur, f->ty, fp,
-                               ST_ir_const_int(c->cur, f->ty, (i64)ot->align), e->line, e->col);
-                } else if (ST_string_eq_cstr(f->name, "name")) {
-                    u32 idx = ST_ir_module_intern_str(c->module, name_sv);
-                    ST_ty_t *sptr_ty = ST_ty_ptr(&c->sema->tys, c->sema->tys.prim[ST_tstring]);
-                    ST_ir_inst_t *str_addr = ST_ir_const_str(c->cur, sptr_ty, idx);
-                    ST_lower_string_copy(c, fp, str_addr, e->line, e->col);
-                }
-            }
+            ST_ty_t *tinfo_ptr = ST_ty_ptr(&c->sema->tys, tity);
+            ST_ir_inst_t *slot =
+                ST_ir_alloca(c->fn, &c->sema->tys, tity, (ST_string_t){0}, e->line, e->col);
+            ST_ir_inst_t *rec =
+                ST_ir_const_tinfo(c->cur, tinfo_ptr, (u32)ST_lower_tinfo_idx(c, ot));
+            ST_lower_raw_copy(c, slot, 0, rec, 0, tity->size, e->line, e->col);
             return slot;
         }
 

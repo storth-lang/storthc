@@ -7,15 +7,9 @@
 // with in the standard library of modules.
 // Traits -> Capitalized.
 // Functions -> camelCase.
-
-#import "Libc";
-#import "Error";
-#import "Allocator";
-#import "String";
-
 // @note: Properties for the function open with in the trait File.
 
-pub enum_flag openKind {
+pub enum_flag Open_Kind {
     Append,
     Read,
     Write,
@@ -24,8 +18,8 @@ pub enum_flag openKind {
 // @note this should be a feature.
 pub trait File($T) {
     self = *$T;
-    // Opens a file with a path on the permssion kind of openKind.
-    fn open(self: *Self, path: string, op_kind: openKind) -> (*void, bool);
+    // Opens a file with a path on the permssion kind of Open_Kind.
+    fn open(self: *Self, path: string, op_kind: Open_Kind) -> (*void, bool);
     // Close the file handle created by open.
     fn close(f: *Self, fd: *void) -> void;
 
@@ -34,12 +28,12 @@ pub trait File($T) {
     // usage: content, ok := fs.read(path); Upon failure, ok is guaranteed to be false.
     // If you want to log the error of where it failed at runtime, you can. Just change
     // log_error = true
-    fn read(self: *Self, path: string) -> (StringBuilder, bool);
-    fn read(self: *Self, path: *char) -> (StringBuilder, bool);
+    fn read(self: *Self, path: string) -> (String_Builder, bool);
+    fn read(self: *Self, path: *char) -> (String_Builder, bool);
 
     // If, instead of a file path, you are reading a file from a handle, while the same
     // logic applies, you just need to provide a valid handle for the file.
-    fn read(self: *Self, handle: *void) -> (StringBuilder, bool);
+    fn read(self: *Self, handle: *void) -> (String_Builder, bool);
 
     // Write accepts the path and the content and makes it so that we auto create the
     // path if it does not exist, however, if does, it will override it instead of appending.
@@ -58,7 +52,7 @@ pub struct Libc {}
 
 // TODO: log errors if provided
 // open_file returns handle if the file is valid otherwise returns null and false.
-fn open_file(path: string, mode: openKind) -> (*void, bool) {
+fn open_file(path: string, mode: Open_Kind) -> (*void, bool) {
     f : *void;
     mod := "rb";
 
@@ -77,8 +71,8 @@ fn open_file(path: string, mode: openKind) -> (*void, bool) {
         return null, false;
 }
 
-fn read_all(handle: *void) -> (StringBuilder, bool) {
-    buffer : StringBuilder;
+fn read_all(handle: *void) -> (String_Builder, bool) {
+    buffer : String_Builder;
     fseek(handle, 0, SEEK_END);
     size := ftell(handle);
     fseek(handle, 0, SEEK_SET);
@@ -103,7 +97,7 @@ libc_instance := Libc{};
 pub fs := File(Libc) {
     self = &libc_instance;
 
-    fn open(self: *Self, path: string, op_kind: openKind) -> (*void, bool) {
+    fn open(self: *Self, path: string, op_kind: Open_Kind) -> (*void, bool) {
         handle, ok := open_file(path, op_kind);
         return handle, ok;
     }
@@ -114,13 +108,13 @@ pub fs := File(Libc) {
         }
     }
 
-    fn read(self: *Self, path: string) -> (StringBuilder, bool) {
-        empty : StringBuilder;
+    fn read(self: *Self, path: string) -> (String_Builder, bool) {
+        empty : String_Builder;
         if path.ptr == null || path.len == 0 {
             log_error("path can not be empty or null\n\r");
             return empty, false;
         }
-        handle, ok := open(self, path, openKind.Read);
+        handle, ok := open(self, path, Open_Kind.Read);
         if !ok {
             log_error("Could not open {} for reading\n\r", path);
             return empty, false;
@@ -130,20 +124,20 @@ pub fs := File(Libc) {
         return content, good;
     }
 
-    fn read(self: *Self, path: *char) -> (StringBuilder, bool) {
+    fn read(self: *Self, path: *char) -> (String_Builder, bool) {
         as_string := string { ptr = path, len = strlen(path) };
         content, ok := fs.read(as_string);
         return content, ok;
     }
 
-    fn read(self: *Self, handle: *void) -> (StringBuilder, bool) {
+    fn read(self: *Self, handle: *void) -> (String_Builder, bool) {
         content, ok := read_all(handle);
         return content, ok;
     }
 
     fn write(self: *Self, path: string, content: string, append := false) -> bool {
-        mode := openKind.Write;
-        if append then mode = openKind.Append;
+        mode := Open_Kind.Write;
+        if append then mode = .Append;
         handle, ok := open(self, path, mode);
         if !ok {
             log_error("Could not open {} for writing\n\r", path);

@@ -17,9 +17,7 @@ functor := Functor(Map) {
         for i: 0..m.value.len {
            array_add(&out, f(m.value[i]));
         }
-
-        values := to_slice(out);
-        return { m.key, values };
+        return { m.key, out };
     }
 };
 
