@@ -47,6 +47,8 @@ typedef struct {
     u32 n_fns, fns_cap;
     ST_dbg_global_t *globals;
     u32 n_globals, globals_cap;
+    ST_arena_t *arena; // optional: lets the emitter format names like '[]u8'
+
 } ST_dbg_info_t;
 
 u32 ST_dbg_intern_file(ST_arena_t *arena, ST_dbg_info_t *info, ST_string_t file);

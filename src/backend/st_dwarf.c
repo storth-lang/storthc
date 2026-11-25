@@ -127,13 +127,29 @@ static u32 ST_dbg_collect_ty(ST_dbg_tys_t *tys, ST_ty_t *ty) {
     u32 idx = tys->count++;
     tys->items[idx] = ty;
 
-    if (ty->kind == ST_TY_PTR) {
+    switch (ty->kind) {
+        case ST_TY_PTR:
         ST_dbg_collect_ty(tys, ty->inner);
-    } else if (ty->kind == ST_TY_STRUCT) {
+        break;
+        case ST_TY_STRUCT:
         for (u32 i = 0; i < ty->fields.count; i++)
             ST_dbg_collect_ty(tys, ty->fields.items[i].ty);
-    } else if (ty->kind == ST_TY_SLICE || ty->kind == ST_TY_DYN_ARRAY) {
+        break;
+        case ST_TY_SLICE:
+        case ST_TY_DYN_ARRAY:
         ST_dbg_collect_ty(tys, ty->inner);
+        for (u32 i = 0; i < ty->fields.count; i++)
+            ST_dbg_collect_ty(tys, ty->fields.items[i].ty);
+        break;
+        case ST_TY_ARRAY:
+        ST_dbg_collect_ty(tys, ty->inner);
+        break;
+        case ST_TY_TAG_UNION:
+        for (u32 i = 0; i < ty->variant_tys.count; i++)
+            ST_dbg_collect_ty(tys, ty->variant_tys.items[i]);
+        break;
+        default:
+        break;
     }
 
     return idx;
@@ -146,45 +162,34 @@ static void ST_dwarf_emit_shared_tys(FILE *out) {
     fputs("    db 0x07\n", out);
     fputs("    db 1\n", out);
 
+    // 'char' (DW_ATE_unsigned_char) so a debugger prints string data as text
+    fputs("Ldbgty_chr:\n", out);
+    fputs("    db 0x03\n", out);
+    fputs("    db \"char\", 0\n", out);
+    fputs("    db 0x08\n", out);
+    fputs("    db 1\n", out);
+
     fputs("Ldbgty_u8ptr:\n", out);
     fputs("    db 0x04\n", out);
-    fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+    fputs("    dd Ldbgty_chr - Ldbg_info\n", out);
     fputs("    db 8\n", out);
 
     fputs("Ldbgty_len64:\n", out);
+    fputs("    db 0x03\n", out);
+    fputs("    db \"i64\", 0\n", out);
+    fputs("    db 0x05\n", out);
+    fputs("    db 8\n", out);
+
+    fputs("Ldbgty_u64:\n", out);
     fputs("    db 0x03\n", out);
     fputs("    db \"u64\", 0\n", out);
     fputs("    db 0x07\n", out);
     fputs("    db 8\n", out);
 }
 
-static void ST_dwarf_emit_slice_like(FILE *out, ST_dbg_tys_t *tys, u32 idx, ST_ty_t *inner) {
-    u32 inner_idx = inner ? ST_dbg_ty_lookup(tys, inner) : (u32)-1;
-    fprintf(out, "Ldbgty_%u_p:\n", idx);
-    fputs("    db 0x04\n", out);
-    if (inner_idx != (u32)-1)
-        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", inner_idx);
-    else
-        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
-    fputs("    db 8\n", out);
-
-    fprintf(out, "Ldbgty_%u:\n", idx);
-    fputs("    db 0x05\n", out);
-    fputs("    dd 16\n", out);
-    fputs("    db 0x06\n", out);
-    fputs("    db \"data\", 0\n", out);
-    fprintf(out, "    dd Ldbgty_%u_p - Ldbg_info\n", idx);
-    fputs("    dd 0\n", out);
-    fputs("    db 0x06\n", out);
-    fputs("    db \"len\", 0\n", out);
-    fputs("    dd Ldbgty_len64 - Ldbg_info\n", out);
-    fputs("    dd 8\n", out);
-    fputs("    db 0x00\n", out);
-}
-
-// @note: the name a debugger should show for a struct. A concrete trait witness's decl
-// name already carries its arguments ('Allocator(Libc)'); the type-erased witness is shown
-// as the bare trait name. Returns 0 when the type has no name.
+// @note: the name a debugger should show for a struct/enum/tag union. A concrete trait
+// witness's decl name already carries its arguments ('Allocator(Libc)'); the type-erased
+// witness is shown as the bare trait name. Returns 0 when the type has no name.
 static b8 ST_dbg_struct_name(ST_ty_t *ty, char *buf, size_t n) {
     ST_decl_t *d = ty->decl ? ty->decl : ty->trait_decl;
     if (ty->is_erased_witness && ty->trait_decl)
@@ -198,15 +203,58 @@ static b8 ST_dbg_struct_name(ST_ty_t *ty, char *buf, size_t n) {
     return 1;
 }
 
-static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
+static void ST_dwarf_write_sleb128(FILE *out, i64 v);
+
+static void ST_dwarf_ref(FILE *out, ST_dbg_tys_t *tys, ST_ty_t *ty) {
+    u32 idx = ty ? ST_dbg_ty_lookup(tys, ty) : (u32)-1;
+    if (idx != (u32)-1)
+        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", idx);
+    else
+        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+}
+
+static void ST_dwarf_member(FILE *out, ST_dbg_tys_t *tys, ST_string_t name, ST_ty_t *ty,
+                            u32 offset) {
+    fputs("    db 0x06\n", out);
+    fprintf(out, "    db \"%.*s\", 0\n", (int)name.len, name.data);
+    ST_dwarf_ref(out, tys, ty);
+    fprintf(out, "    dd %u\n", offset);
+}
+
+// A struct (abbrev 0x09 named / 0x05 anonymous) or, with 'is_union', a union (0x11).
+static void ST_dwarf_struct_head(FILE *out, u32 idx, const char *suffix, const char *name,
+                                 b8 is_union, u32 size) {
+    fprintf(out, "Ldbgty_%u%s:\n", idx, suffix);
+    if (name && name[0]) {
+        fprintf(out, "    db %s\n", is_union ? "0x11" : "0x09");
+        fprintf(out, "    db \"%s\", 0\n", name);
+    } else {
+        fprintf(out, "    db %s\n", is_union ? "0x10" : "0x05");
+    }
+    fprintf(out, "    dd %u\n", size);
+}
+
+static void ST_dwarf_emit_base(FILE *out, const char *label, u32 idx, const char *suffix,
+                               const char *name, u32 enc, u32 size) {
+    fprintf(out, "%s%u%s:\n", label, idx, suffix);
+    fputs("    db 0x03\n", out);
+    fprintf(out, "    db \"%s\", 0\n", name);
+    fprintf(out, "    db %u\n", enc);
+    fprintf(out, "    db %u\n", size > 255 ? 255 : size);
+}
+
+static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys, ST_dbg_info_t *info) {
     ST_dwarf_emit_shared_tys(out);
 
     for (u32 i = 0; i < tys->count; i++) {
         ST_ty_t *ty = tys->items[i];
+        char sname[256];
         switch (ty->kind) {
             case ST_TY_BOOL:
             case ST_TY_CHAR:
             case ST_TY_FLOAT:
+            case ST_TY_UNTYPED_INT:
+            case ST_TY_UNTYPED_FLOAT:
             case ST_TY_INT: {
                 char name[16];
                 u32 sz = ty->size ? ty->size : (ty->kind == ST_TY_FLOAT ? 8u : 4u);
@@ -217,18 +265,19 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                 } else if (ty->kind == ST_TY_CHAR) {
                     snprintf(name, sizeof(name), "char");
                     enc = 8;
-                } else if (ty->kind == ST_TY_FLOAT) {
+                } else if (ty->kind == ST_TY_FLOAT || ty->kind == ST_TY_UNTYPED_FLOAT) {
                     snprintf(name, sizeof(name), "f%u", sz * 8);
                     enc = 4;
                 } else {
-                    snprintf(name, sizeof(name), "%c%u", ty->is_signed ? 'i' : 'u', sz * 8);
-                    enc = ty->is_signed ? 5 : 7;
+                    snprintf(name, sizeof(name), "%c%u",
+                             (ty->is_signed || ty->kind == ST_TY_UNTYPED_INT) ? 'i' : 'u',
+                             sz * 8);
+                    enc = (ty->is_signed || ty->kind == ST_TY_UNTYPED_INT) ? 5 : 7;
                 }
-                fprintf(out, "Ldbgty_%u:\n", i);
-                fputs("    db 0x03\n", out);
-                fprintf(out, "    db \"%s\", 0\n", name);
-                fprintf(out, "    db %u\n", enc);
-                fprintf(out, "    db %u\n", sz);
+                ST_dwarf_emit_base(out, "Ldbgty_", i, "", name, enc, sz);
+            } break;
+            case ST_TY_TYPEID: {
+                ST_dwarf_emit_base(out, "Ldbgty_", i, "", "typeid", 7, 8);
             } break;
             case ST_TY_PTR: {
                 if (ty->inner && ty->inner->kind == ST_TY_VOID) {
@@ -237,46 +286,42 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                     fputs("    db 8\n", out);
                     break;
                 }
-                u32 inner_idx = ty->inner ? ST_dbg_ty_lookup(tys, ty->inner) : (u32)-1;
                 fprintf(out, "Ldbgty_%u:\n", i);
                 fputs("    db 0x04\n", out);
-                if (inner_idx != (u32)-1)
-                    fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", inner_idx);
-                else
-                    fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
+                ST_dwarf_ref(out, tys, ty->inner);
                 fputs("    db 8\n", out);
             } break;
             case ST_TY_STRUCT: {
-                char sname[256];
-                fprintf(out, "Ldbgty_%u:\n", i);
-                if (ST_dbg_struct_name(ty, sname, sizeof(sname))) {
-                    fputs("    db 0x09\n", out);
-                    fprintf(out, "    db \"%s\", 0\n", sname);
-                } else {
-                    fputs("    db 0x05\n", out);
-                }
-                fprintf(out, "    dd %u\n", ty->size);
+                b8 named = ST_dbg_struct_name(ty, sname, sizeof(sname));
+                b8 is_union = ty->decl && ty->decl->kind == ST_DE_STRUCT && ty->decl->struct_.is_union;
+                ST_dwarf_struct_head(out, i, "", named ? sname : NULL, is_union, ty->size);
                 for (u32 fi = 0; fi < ty->fields.count; fi++) {
                     ST_ty_field_t *f = &ty->fields.items[fi];
-                    u32 fidx = ST_dbg_ty_lookup(tys, f->ty);
-                    fputs("    db 0x06\n", out);
-                    fprintf(out, "    db \"%.*s\", 0\n", (int)f->name.len, f->name.data);
-                    if (fidx != (u32)-1)
-                        fprintf(out, "    dd Ldbgty_%u - Ldbg_info\n", fidx);
-                    else
-                        fputs("    dd Ldbgty_u8 - Ldbg_info\n", out);
-                    fprintf(out, "    dd %u\n", f->offset);
+                    ST_dwarf_member(out, tys, f->name, f->ty, f->offset);
                 }
                 fputs("    db 0x00\n", out);
             } break;
             case ST_TY_SLICE:
             case ST_TY_DYN_ARRAY: {
-                ST_dwarf_emit_slice_like(out, tys, i, ty->inner);
+                // slice: {ptr, len}; dynamic array: {items, count, capacity}
+                const char *nm = info && info->arena ? ST_ty_cstr(info->arena, ty) : NULL;
+                ST_dwarf_struct_head(out, i, "", nm, 0, ty->size);
+                for (u32 fi = 0; fi < ty->fields.count; fi++) {
+                    ST_ty_field_t *f = &ty->fields.items[fi];
+                    ST_dwarf_member(out, tys, f->name, f->ty, f->offset);
+                }
+                fputs("    db 0x00\n", out);
+            } break;
+            case ST_TY_ARRAY: {
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x0e\n", out);
+                ST_dwarf_ref(out, tys, ty->inner);
+                fputs("    db 0x0f\n", out);
+                fprintf(out, "    dq %llu\n", (unsigned long long)ty->count);
+                fputs("    db 0x00\n", out);
             } break;
             case ST_TY_STRING: {
-                fprintf(out, "Ldbgty_%u:\n", i);
-                fputs("    db 0x05\n", out);
-                fputs("    dd 16\n", out);
+                ST_dwarf_struct_head(out, i, "", "string", 0, 16);
                 fputs("    db 0x06\n", out);
                 fputs("    db \"data\", 0\n", out);
                 fputs("    dd Ldbgty_u8ptr - Ldbg_info\n", out);
@@ -286,6 +331,89 @@ static void ST_dwarf_emit_types(FILE *out, ST_dbg_tys_t *tys) {
                 fputs("    dd Ldbgty_len64 - Ldbg_info\n", out);
                 fputs("    dd 8\n", out);
                 fputs("    db 0x00\n", out);
+            } break;
+            case ST_TY_ANY: {
+                ST_dwarf_struct_head(out, i, "", "any", 0, 16);
+                fputs("    db 0x06\n", out);
+                fputs("    db \"w0\", 0\n", out);
+                fputs("    dd Ldbgty_u64 - Ldbg_info\n", out);
+                fputs("    dd 0\n", out);
+                fputs("    db 0x06\n", out);
+                fputs("    db \"w1\", 0\n", out);
+                fputs("    dd Ldbgty_u64 - Ldbg_info\n", out);
+                fputs("    dd 8\n", out);
+                fputs("    db 0x00\n", out);
+            } break;
+            case ST_TY_ENUM: {
+                u32 sz = ty->size ? ty->size : 4;
+                char bn[16];
+                snprintf(bn, sizeof(bn), "%c%u", ty->is_signed ? 'i' : 'u', sz * 8);
+                ST_dwarf_emit_base(out, "Ldbgty_", i, "_b", bn, ty->is_signed ? 5 : 7, sz);
+                fprintf(out, "Ldbgty_%u:\n", i);
+                fputs("    db 0x0c\n", out);
+                fprintf(out, "    db \"%s\", 0\n", ST_dbg_struct_name(ty, sname, sizeof(sname)) ? sname : "enum");
+                fprintf(out, "    db %u\n", sz);
+                fprintf(out, "    dd Ldbgty_%u_b - Ldbg_info\n", i);
+                if (ty->decl && ty->decl->kind == ST_DE_ENUM) {
+                    ST_variant_specs_t *vs = &ty->decl->enum_.variants;
+                    for (u32 vi = 0; vi < vs->count; vi++) {
+                        fputs("    db 0x0d\n", out);
+                        fprintf(out, "    db \"%.*s\", 0\n", (int)vs->items[vi].name.len,
+                                vs->items[vi].name.data);
+                        ST_dwarf_write_sleb128(out, vs->items[vi].computed);
+                    }
+                }
+                fputs("    db 0x00\n", out);
+            } break;
+            case ST_TY_TAG_UNION: {
+                // layout: i64 variant index at 0, payload (largest variant) at 8.
+                //
+                // Described the way DWARF 5 describes a discriminated union
+                // (DW_TAG_variant_part), so a debugger shows only the active variant
+                // and needs no pretty-printer script:
+                //
+                //   struct Name
+                //     variant_part  discr -> 'kind'
+                //       member kind : Name.kind        (the i64 tag, an enum of variant names)
+                //       variant value=0  [member Variant0 : payload @ 8]
+                //       variant value=1  [member Variant1 : payload @ 8]
+                b8 named = ST_dbg_struct_name(ty, sname, sizeof(sname));
+                ST_variant_specs_t *vs =
+                    ty->decl && ty->decl->kind == ST_DE_TAG_UNION ? &ty->decl->tag_union.variants : NULL;
+
+                fprintf(out, "Ldbgty_%u_kb:\n", i);
+                fputs("    db 0x03\n    db \"i64\", 0\n    db 0x05\n    db 8\n", out);
+                fprintf(out, "Ldbgty_%u_k:\n", i);
+                fputs("    db 0x0c\n", out);
+                fprintf(out, "    db \"%s.kind\", 0\n", named ? sname : "tag_union");
+                fputs("    db 8\n", out);
+                fprintf(out, "    dd Ldbgty_%u_kb - Ldbg_info\n", i);
+                if (vs)
+                    for (u32 vi = 0; vi < vs->count; vi++) {
+                        fputs("    db 0x0d\n", out);
+                        fprintf(out, "    db \"%.*s\", 0\n", (int)vs->items[vi].name.len,
+                                vs->items[vi].name.data);
+                        ST_dwarf_write_sleb128(out, (i64)vi);
+                    }
+                fputs("    db 0x00\n", out);
+
+                ST_dwarf_struct_head(out, i, "", named ? sname : NULL, 0, ty->size);
+                fputs("    db 0x12\n", out);
+                fprintf(out, "    dd Ldbgty_%u_d - Ldbg_info\n", i);
+                fprintf(out, "Ldbgty_%u_d:\n", i);
+                fputs("    db 0x06\n    db \"kind\", 0\n", out);
+                fprintf(out, "    dd Ldbgty_%u_k - Ldbg_info\n", i);
+                fputs("    dd 0\n", out);
+                for (u32 vi = 0; vs && vi < vs->count && vi < 255; vi++) {
+                    ST_ty_t *pt = vi < ty->variant_tys.count ? ty->variant_tys.items[vi] : NULL;
+                    fputs("    db 0x13\n", out);
+                    fprintf(out, "    db %u\n", vi);
+                    if (pt)
+                        ST_dwarf_member(out, tys, vs->items[vi].name, pt, 8);
+                    fputs("    db 0x00\n", out);
+                }
+                fputs("    db 0x00\n", out); // end variant_part
+                fputs("    db 0x00\n", out); // end struct
             } break;
             case ST_TY_FN: {
                 if (ty->size == 8 || !ty->size) {
@@ -471,6 +599,38 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
     fputs("    db 0x0b, 0x0f, 0x00\n", out);
     fputs("    db 0x0b, 0x0b\n", out);
     fputs("    db 0x00, 0x00\n", out);
+    // 0x0c: enumeration, 0x0d: enumerator, 0x0e: array, 0x0f: subrange (count),
+    // 0x10: anonymous union, 0x11: named union
+    fputs("    db 0x0c, 0x04, 0x01\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x0b, 0x0b\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x0d, 0x28, 0x00\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x1c, 0x0d\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x0e, 0x01, 0x01\n", out);
+    fputs("    db 0x49, 0x13\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x0f, 0x21, 0x00\n", out);
+    fputs("    db 0x37, 0x07\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x10, 0x17, 0x01\n", out);
+    fputs("    db 0x0b, 0x06\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x11, 0x17, 0x01\n", out);
+    fputs("    db 0x03, 0x08\n", out);
+    fputs("    db 0x0b, 0x06\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    // 0x12: variant_part (discriminant = reference to the tag member),
+    // 0x13: variant (discriminant value)
+    fputs("    db 0x12, 0x33, 0x01\n", out);
+    fputs("    db 0x15, 0x13\n", out);
+    fputs("    db 0x00, 0x00\n", out);
+    fputs("    db 0x13, 0x19, 0x01\n", out);
+    fputs("    db 0x16, 0x0b\n", out);
+    fputs("    db 0x00, 0x00\n", out);
     fputs("    db 0x00\n", out);
     fputc('\n', out);
 
@@ -504,7 +664,7 @@ void ST_dwarf_emit(FILE *out, ST_dbg_info_t *info, const char *comp_dir) {
             ST_dbg_collect_ty(&tys, info->fns[fi].vars[vi].ty);
     for (u32 gi = 0; gi < info->n_globals; gi++)
         ST_dbg_collect_ty(&tys, info->globals[gi].ty);
-    ST_dwarf_emit_types(out, &tys);
+    ST_dwarf_emit_types(out, &tys, info);
 
     for (u32 gi = 0; gi < info->n_globals; gi++) {
         ST_dbg_global_t *g = &info->globals[gi];

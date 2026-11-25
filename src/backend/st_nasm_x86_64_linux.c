@@ -1134,6 +1134,31 @@ static ST_string_t ST_nasm_qualified_label(ST_arena_t *arena, ST_string_t fn_nam
     return (ST_string_t){.data = data, .len = (u32)total};
 }
 
+// @note: debug info for parameters. The lowering receives a parameter in one or more raw
+// ABI pieces (a tag union or string arrives as several words, all named after the parameter)
+// and then copies them into a stack slot of the parameter's full type. The debugger should
+// see that slot, once, as the parameter - not the raw pieces plus a duplicate local.
+static b8 ST_fn_has_inst_named(ST_ir_fn_t *fn, ST_ir_op_t kind, ST_string_t name) {
+    ST_forrange(0, fn->blocks.count) {
+        for (ST_ir_inst_t *in = fn->blocks.items[i]->first; in; in = in->next) {
+            if (in->kind != kind)
+                continue;
+            ST_string_t n = kind == ST_IR_PARAM ? in->params.name : in->alloca_.name;
+            if (ST_string_eq(n, name))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static b8 ST_dbg_fn_has_param(ST_dbg_info_t *dbg, u32 fn_idx, ST_string_t name) {
+    ST_dbg_fn_t *f = &dbg->fns[fn_idx];
+    for (u32 i = 0; i < f->n_vars; i++)
+        if (f->vars[i].is_param && ST_string_eq(f->vars[i].name, name))
+            return 1;
+    return 0;
+}
+
 static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena,
                            ST_dbg_info_t *dbg) {
     ST_gen_ctx_t ctx;
@@ -1168,11 +1193,17 @@ static void ST_generate_fn(FILE *out, ST_ir_fn_t *fn, ST_arena_t *arena,
                               in->col, fn_idx);
             }
             if (dbg) {
-                if (in->kind == ST_IR_PARAM)
-                    ST_dbg_add_var(arena, dbg, fn_idx, in->params.name, in->ty, ST_slot(in), 1);
-                else if (in->kind == ST_IR_ALLOCA)
+                if (in->kind == ST_IR_PARAM) {
+                    if (!ST_fn_has_inst_named(fn, ST_IR_ALLOCA, in->params.name))
+                        ST_dbg_add_var(arena, dbg, fn_idx, in->params.name, in->ty, ST_slot(in), 1);
+                } else if (in->kind == ST_IR_ALLOCA) {
+                    // the first slot named like a parameter *is* that parameter; a later
+                    // slot of the same name is a shadowing local
+                    b8 is_param = ST_fn_has_inst_named(fn, ST_IR_PARAM, in->alloca_.name) &&
+                                  !ST_dbg_fn_has_param(dbg, fn_idx, in->alloca_.name);
                     ST_dbg_add_var(arena, dbg, fn_idx, in->alloca_.name, in->ty->inner,
-                                  -(i32)in->alloca_.frame_off, 0);
+                                  -(i32)in->alloca_.frame_off, is_param);
+                }
             }
             ST_generate_inst(out, &ctx, in);
         }
@@ -1262,6 +1293,7 @@ b8 ST_nasm_generate(FILE *out, ST_ir_module_t *m, ST_string_t src,
                     ST_string_t file, b8 emit_entry, b8 debug_info)
 {
     ST_dbg_info_t dbg = {0};
+    dbg.arena = m->arena;
     b8 ok = ST_nasm_generate_linux(out, m, src, file, emit_entry, &dbg);
     if (ok && debug_info) {
         char comp_dir[4096];

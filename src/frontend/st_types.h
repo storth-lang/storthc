@@ -58,6 +58,7 @@ struct ST_ty_t {
     ST_decl_t *decl;
     ST_ty_fields_t fields;
     ST_tys_t params, rets;
+    ST_tys_t variant_tys; // tag unions: payload type per variant (NULL for none), for debug info
     b8 is_variadic;
     b8 has_any_pack;
     b8 is_noreturn;

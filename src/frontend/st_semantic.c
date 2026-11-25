@@ -2608,9 +2608,8 @@ static void ST_complete_tag_union(ST_sema_t *se, ST_ty_t *t) {
     }
     ST_forrange(0, d->tag_union.variants.count) {
         ST_variant_spec_t *v = &d->tag_union.variants.items[i];
-        if (!v->payload)
-            continue;
-        ST_ty_t *pt = ST_resolve_tyexpr(se, v->payload);
+        ST_ty_t *pt = v->payload ? ST_resolve_tyexpr(se, v->payload) : NULL;
+        ST_da_append_arena(se->arena, &t->variant_tys, pt);
         if (!pt)
             continue;
         ST_complete_ty(se, pt);
