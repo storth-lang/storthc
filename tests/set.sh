@@ -12,6 +12,10 @@ if [ ! -x "$TESTER" ] || [ ! -x ../build/storthc ]; then
     make -C .. build/storthc build/st_tester || exit 1
 fi
 
+if [ "$1" = record ] && [ -f record.sth ]; then
+    exec "$TESTER" -record
+fi
+
 if [ "$1" = all ] || [ ! -f record.sth ]; then
     files=$(ls *.st)
 elif [ $# -eq 0 ]; then
