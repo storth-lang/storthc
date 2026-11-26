@@ -46,6 +46,8 @@ typedef struct {
     ST_ir_blocks_t label_blocks;
 
     ST_ty_t *ret_ty;
+    ST_ty_t **ret_decl;
+    u32 n_ret_decl;
     ST_stmts_t *cur_fn_body;
 
     ST_ht_t safe_array_roots;
@@ -3495,6 +3497,9 @@ static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s) {
                                 vty->kind == ST_TY_SLICE || vty->kind == ST_TY_DYN_ARRAY)) {
                         ST_ir_inst_t *addr = ST_lower_struct_addr(c, rv, vty);
                         u32 n_eb = ST_abi_part_count(vty);
+                        ST_ty_t *decl_ty = i < c->n_ret_decl ? c->ret_decl[i] : NULL;
+                        if (vty->kind == ST_TY_DYN_ARRAY && decl_ty && decl_ty->kind == ST_TY_SLICE)
+                            n_eb = ST_abi_part_count(decl_ty);
                         ST_forrange(0, n_eb) {
                             ST_ty_t *ebty = ST_lower_part_ty(c, vty, i);
                             if (!addr) {
@@ -4154,6 +4159,9 @@ static void ST_lower_fn_body_inner(ST_lower_ctx_t *c, ST_decl_t *d) {
 
     c->fn = fn;
     c->ret_ty = d->fn.sig.rets.count == 1 ? ST_lower_tyexpr(c, d->fn.sig.rets.items[0]) : NULL;
+    c->n_ret_decl = d->fn.sig.rets.count;
+    c->ret_decl = c->n_ret_decl ? ST_arena_push(c->arena, sizeof(*c->ret_decl) * c->n_ret_decl) : NULL;
+    ST_forrange(0, c->n_ret_decl) c->ret_decl[i] = ST_lower_tyexpr(c, d->fn.sig.rets.items[i]);
     c->cur_fn_body = &d->fn.body;
     c->defers = (ST_lower_defers_t){0};
     ST_ht_init(c->arena, &c->scope, 16);

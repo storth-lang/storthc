@@ -4190,6 +4190,20 @@ static void ST_stringify_type_arg(ST_sema_t *se, ST_expr_t *av, ST_ty_t *ty) {
     av->ty = se->tys.prim[ST_tstring];
 }
 
+static u32 ST_arg_conv_cost(ST_sema_t *se, ST_ty_t *from, ST_ty_t *to) {
+    if (!from || !to)
+        return 1;
+    if (from == to || ST_ty_equal(from, to))
+        return 0;
+    if (ST_ty_is_any(se, to))
+        return 4;
+    if ((from->kind == ST_TY_ARRAY || from->kind == ST_TY_DYN_ARRAY) && to->kind == ST_TY_SLICE)
+        return 1;
+    if (from->kind == ST_TY_ARRAY && to->kind == ST_TY_DYN_ARRAY)
+        return 2;
+    return 3;
+}
+
 static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *callee,
                                     ST_sym_t **out_sym, ST_ty_t **out_fnty) {
     ST_syms_t *ovl = ST_overload_find(se, callee->name);
@@ -4213,6 +4227,7 @@ static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *call
         arg_tys[k] = ST_type_expr(se, e->call.args.items[k].value);
 
     ST_sym_t *best = NULL;
+    u32 best_cost = 0;
     b8 ambiguous = 0;
     for (u32 k = 0; k < ovl->count; k++) {
         ST_sym_t *cand = ovl->items[k];
@@ -4228,20 +4243,24 @@ static b8 ST_type_call_try_overload(ST_sema_t *se, ST_expr_t *e, ST_expr_t *call
         if (n_args < n_params && !cand->t->is_variadic && !cand->t->has_any_pack)
             continue;
         b8 ok = 1;
+        u32 cost = 0;
         for (u32 p = 0; p < n_args && p < n_params; p++) {
             if (arg_tys[p] && cand->t->params.items[p] &&
                 !ST_ty_arg_coerces(se, arg_tys[p], cand->t->params.items[p])) {
                 ok = 0;
                 break;
             }
+            cost += ST_arg_conv_cost(se, arg_tys[p], cand->t->params.items[p]);
         }
         if (!ok)
             continue;
-        if (best) {
+        if (!best || cost < best_cost) {
+            best = cand;
+            best_cost = cost;
+            ambiguous = 0;
+        } else if (cost == best_cost) {
             ambiguous = 1;
-            continue;
         }
-        best = cand;
     }
 
     if (ambiguous) {

@@ -73,9 +73,9 @@ fn open_file(path: string, mode: Open_Kind) -> (*void, bool) {
 
 fn read_all(handle: *void) -> (String_Builder, bool) {
     buffer : String_Builder;
-    fseek(handle, 0, SEEK_END);
+    fseek(handle, 0, Libc.SEEK_END);
     size := ftell(handle);
-    fseek(handle, 0, SEEK_SET);
+    fseek(handle, 0, Libc.SEEK_SET);
     if size < 0 {
         log_error("ftell: could not get the size of the file\n\r");
         return buffer, false;

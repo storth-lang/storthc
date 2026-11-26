@@ -35,7 +35,7 @@ pub libc := Allocator(Libc) {
 // NOTE: This is the default context allocator
 pub allocator : Allocator = libc;
 
-pub fn set_allocator(a: Allocator) -> Allocator {
+pub fn set_allocator(a: Allocator) {
     allocator = a;
 }
 

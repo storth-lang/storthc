@@ -1,11 +1,11 @@
-pub fn toString(arr: [..]char) -> string {
+pub fn to_string(arr: [..]char) -> string {
     return string {
         ptr = &arr.items[0],
         len = arr.count,
     };
 }
 
-pub fn toString(arr: []char) -> string {
+pub fn to_string(arr: []char) -> string {
     return string {
         ptr = arr.ptr,
         len = arr.len,
@@ -13,14 +13,14 @@ pub fn toString(arr: []char) -> string {
 }
 
 
-pub fn toString(arr: *char) -> string {
+pub fn to_string(arr: *char) -> string {
     return string {
         ptr = arr,
         len = strlen(arr),
     };
 }
 
-pub fn toCString(arr: string) -> *char {
+pub fn to_cstring(arr: string) -> *char {
     return cstr(arr);
 }
 
@@ -82,7 +82,19 @@ pub fn chop_by_delimiter(str: *string, c: char) -> string {
     return new_str;
 }
 
+fn format_sink(s: *void, p: *char, n: u64) {
+    sb := cast(*String_Builder) s;
+    sb.add_to_builder(string { ptr = p, len = n });
+}
+
+pub fn format(fmt: string, args: $T...) -> string {
+    sb : String_Builder;
+    format_to(&sb, format_sink, fmt, ...args);
+    return sb.to_string();
+}
+
 #load "String_Builder.st";
 
 #import "Libc";
 #import "Allocator";
+#import "Logger";

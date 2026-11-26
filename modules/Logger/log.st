@@ -9,6 +9,8 @@ struct Out {
     len: i64;
     pos: i64;
     fmt: string;
+    sink: *void;
+    write: fn(sink: *void, p: *char, n: u64);
     buf: [1024]char;
 }
 
@@ -24,9 +26,17 @@ fn write_all(fd: i32, p: *char, n: u64) {
     }
 }
 
+fn out_write(o: *Out, p: *char, n: u64) {
+    if o.fd < 0 {
+        o.write(o.sink, p, n);
+    } else {
+        write_all(o.fd, p, n);
+    }
+}
+
 fn out_flush(o: *Out) {
     if o.len > 0 {
-        write_all(o.fd, &o.buf[0], cast(u64)o.len);
+        out_write(o, &o.buf[0], cast(u64)o.len);
         o.len = 0;
     }
 }
@@ -41,7 +51,7 @@ fn out_bytes(o: *Out, p: *char, n: u64) {
     if n <= 0 then return;
     if n >= 1024 {
         out_flush(o);
-        write_all(o.fd, p, n);
+        out_write(o, p, n);
         return;
     }
     if o.len + cast(i64)n > 1024 then out_flush(o);
@@ -464,6 +474,16 @@ pub fn println(fmt: string, args: $T...) {
     o.fmt = fmt;
     format_args(&o, ...args);
     out_char(&o, '\n');
+    out_flush(&o);
+}
+
+pub fn format_to(sink: *void, write: $F, fmt: string, args: $T...) {
+    o : Out;
+    o.fd = -1;
+    o.sink = sink;
+    o.write = write;
+    o.fmt = fmt;
+    format_args(&o, ...args);
     out_flush(&o);
 }
 
