@@ -8,7 +8,7 @@ GIT_HASH := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
 CFLAGS := -std=c11 -I$(SRCROOT) -Wall -Wextra -Wno-missing-field-initializers -Wno-missing-braces -Wimplicit-fallthrough -g
 CFLAGS += -MMD -MP
-CFLAGS += -DSTORTHC_VERSION_MAJOR=$(VERSION_MAJOR) -DSTORTHC_VERSION_MINOR=$(VERSION_MINOR) -DSTORTHC_VERSION_PATCH=$(VERSION_PATCH) -DSTORTHC_GIT_HASH='"$(GIT_HASH)"' -DST_STACK_SIZE=$(STACK_SIZE) -DST_DYNAMIC_LINKER_PATH='"$(DYNAMIC_LINKER_PATH)"' -DST_LIBC_LIBRARY_PATH='"$(LIBC_LIBRARY_PATH)"'
+CFLAGS += -DSTORTHC_VERSION_MAJOR=$(VERSION_MAJOR) -DSTORTHC_VERSION_MINOR=$(VERSION_MINOR) -DSTORTHC_VERSION_PATCH=$(VERSION_PATCH) -DSTORTHC_GIT_HASH='"$(GIT_HASH)"' -DST_STACK_SIZE=$(STACK_SIZE) -DST_DYNAMIC_LINKER_PATH='"$(DYNAMIC_LINKER_PATH)"' -DST_LIBC_LIBRARY_PATH='"$(LIBC_LIBRARY_PATH)"' -DST_MODULES_DIR='"$(MODULES_DIR)"'
 CFLAGS += -DST_BIND_GENERATOR=$(BIND_GENERATOR)
 LDLIBS := -lm
 
@@ -77,21 +77,8 @@ $(OBJROOT)/%.o: $(SRCROOT)/%.c | $(OBJROOT)
 install: $(TARGET)
 	install -d $(INSTALL_DIR)
 	install -m 755 $(TARGET) $(INSTALL_DIR)/storthc
-	install -d $(MODULES_DIR)/modules
-	cp -r modules/. $(MODULES_DIR)/modules/
-	@REAL_USER=$${SUDO_USER:-$$USER}; \
-	REAL_HOME=$$(getent passwd "$$REAL_USER" | cut -d: -f6); \
-	BASHRC="$$REAL_HOME/.bashrc"; \
-	LINE='export STORTHC_MODULE_PATH="$(MODULES_DIR)/modules"'; \
-	touch "$$BASHRC"; \
-	if grep -q '^export STORTHC_MODULE_PATH=' "$$BASHRC"; then \
-		sed -i "s|^export STORTHC_MODULE_PATH=.*|$$LINE|" "$$BASHRC"; \
-		echo "updated STORTHC_MODULE_PATH in $$BASHRC"; \
-	else \
-		echo "$$LINE" >> "$$BASHRC"; \
-		echo "added STORTHC_MODULE_PATH to $$BASHRC"; \
-	fi; \
-	[ -n "$$SUDO_USER" ] && chown "$$SUDO_USER":"$$(id -gn "$$SUDO_USER")" "$$BASHRC" || true
+	install -d $(MODULES_DIR)
+	cp -r modules/. $(MODULES_DIR)/
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)

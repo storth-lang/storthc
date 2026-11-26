@@ -1,6 +1,6 @@
 PREFIX ?= $(HOME)/.local
 INSTALL_DIR := $(PREFIX)/bin
-MODULES_DIR := $(PREFIX)/storthc
+MODULES_DIR := $(PREFIX)/storthc/modules
 
 CC := gcc
 
