@@ -45,7 +45,7 @@ LDLIBS   += -L$(shell $(LLVM_CONFIG) --libdir) -lclang \
             -Wl,-rpath,$(shell $(LLVM_CONFIG) --libdir)
 endif
 
-.PHONY: all test clean install
+.PHONY: all test clean install uninstall
 
 all: $(TARGET)
 
@@ -80,11 +80,15 @@ $(OBJROOT)/%.o: $(SRCROOT)/%.c | $(OBJROOT)
 
 -include $(DEP)
 
-install: $(TARGET)
+install: uninstall $(TARGET)
 	install -d $(INSTALL_DIR)
 	install -m 755 $(TARGET) $(INSTALL_DIR)/storthc
 	install -d $(MODULES_DIR)
 	cp -r modules/. $(MODULES_DIR)/
+
+uninstall:
+	$(RM) -r $(MODULES_DIR) $(INSTALL_DIR)/storthc
+
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)
