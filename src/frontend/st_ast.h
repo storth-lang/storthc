@@ -138,6 +138,7 @@ struct ST_expr_t {
     // it must resolve to the module-level symbol, never to a local or witness method
     // that happens to share the name
     b8 from_module;
+    b8 is_generic_param;
     union {
         i64 ival;
         f64 fval;

@@ -1,7 +1,13 @@
-pub fn array_reserve(arr: *[..]$T, size : i32 = 256) -> void {
-    if arr.capacity == 0 { arr.capacity = cast(i64) size; }
-    else { arr.capacity *= 2; }
-    arr.items = allocator.reallocate(arr.items, cast(u32) arr.capacity).unwrap();
+pub fn array_reserve(arr: *[..]$T, size: i32 = 256) -> void {
+    if arr.capacity == 0 {
+        arr.capacity = cast(i64) size;
+    } else {
+        arr.capacity *= 2;
+    }
+
+    bytes := cast(u32) arr.capacity * cast(u32) sizeof($T);
+
+    arr.items = allocator.reallocate(arr.items, bytes).unwrap();
 }
 
 pub fn array_add(arr: *[..]$T, item: $T) -> void {
@@ -66,11 +72,6 @@ pub fn array_insert(arr: *[..]$T, index: i32, value: $T) {
     }
     arr.items[index] = value;
     arr.count += 1;
-}
-
-pub fn peek(array: []$T) -> $T {
-    if array.len > 0 then return array[array.len - 1];
-    return cast($T)null;
 }
 
 #import "Allocator";

@@ -5,7 +5,7 @@ pub struct Entry {
 }
 
 pub struct Table {
-    entries: [..]Entry;
+    entries: [..]Entry($K, $V);
     cmp_fn: fn(a: $K, b: $K) -> bool;
     hash_fn: fn(key: $K) -> u32;
 

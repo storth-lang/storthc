@@ -3838,6 +3838,12 @@ static void ST_closure_escape_error(ST_sema_t *se, u32 line, u32 col, ST_ty_t *t
 }
 
 static ST_ty_t *ST_type_ident(ST_sema_t *se, ST_expr_t *e) {
+    if (e->is_generic_param) {
+        ST_diag_error(&se->diag, e->line, e->col,
+                      "'$" ST_sv_fmt "' is a type; it can only be passed to a 'Type_Info' parameter",
+                      ST_sv_args(e->name));
+        return NULL;
+    }
     ST_sym_t *sym = ST_sym_find_expr(se, e);
     if (!sym) {
         ST_sym_t *tsym = ST_sym_find_in(&se->templates, e->name);
@@ -4656,6 +4662,7 @@ static ST_tyexpr_t *ST_expr_as_tyexpr(ST_sema_t *se, ST_expr_t *e) {
         case ST_EX_IDENT: {
             ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
             te->name = e->name;
+            te->is_generic_param = e->is_generic_param;
             return te;
         }
         case ST_EX_UNARY: {
@@ -6118,6 +6125,7 @@ static ST_tyexpr_t *ST_expr_to_tyexpr(ST_sema_t *se, ST_expr_t *e) {
     if (e->kind == ST_EX_IDENT) {
         ST_tyexpr_t *te = ST_tyexpr_new(se->arena, ST_TE_NAME, e->line, e->col);
         te->name = e->name;
+        te->is_generic_param = e->is_generic_param;
         return te;
     }
     if (e->kind == ST_EX_UNARY && ST_string_eq_cstr(e->unary.op, "*")) {

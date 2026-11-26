@@ -978,6 +978,15 @@ static ST_expr_t *ST_parse_primary(ST_parser_t *p) {
         return e;
     }
 
+    if (ST_tok_is_symbol(t, "$") && ST_tok_is_ident(ST_tok_at(p, p->pos + 1))) {
+        ST_token_t *nt = ST_tok_at(p, p->pos + 1);
+        p->pos += 2;
+        ST_expr_t *e = ST_expr_new(p->arena, ST_EX_IDENT, t->line, t->col);
+        e->name = nt->text;
+        e->is_generic_param = 1;
+        return e;
+    }
+
     ST_perr_tok(p, t, "unexpected '" ST_sv_fmt "'; expected an expression", ST_sv_args(t->text));
     return NULL;
 }
