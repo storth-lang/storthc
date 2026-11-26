@@ -14,6 +14,7 @@ pub libc := Allocator(Libc) {
     fn allocate(self: *Self, size : u32) -> Option(*void) {
         p := malloc(cast(u64)size);
         if p == null then return .None;
+        memset(p, 0, cast(u64)size);
         return .Some(p);
     }
     fn reallocate(self: *Self, ptr: *void, size : u32) -> Option(*void) {

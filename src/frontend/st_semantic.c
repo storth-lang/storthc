@@ -7303,6 +7303,16 @@ static void ST_check_assign(ST_sema_t *se, ST_stmt_t *s) {
         return;
     }
 
+    // 'p += n' and 'p -= n' move a pointer by n elements
+    if (lt && lt->kind == ST_TY_PTR && ST_op_is(op, "+=", "-=")) {
+        if (!rt || !ST_ty_is_int(rt))
+            ST_diag_error(&se->diag, s->line, s->col,
+                          "invalid operands to '" ST_sv_fmt "': '%s' and '%s' (a pointer can only "
+                          "move by an integer)",
+                          ST_sv_args(op), ST_tstr(se, lt), rt ? ST_tstr(se, rt) : "?");
+        return;
+    }
+
     b8 arith = ST_op_is(op, "+=", "-=") || ST_op_is(op, "*=", "/=");
     if (arith) {
         if (!ST_ty_num_unify(se, lt, rt))
@@ -8645,6 +8655,7 @@ static ST_sym_kind_t ST_decl_sym_kind(ST_decl_t *d) {
 }
 
 static void ST_sema_collect(ST_sema_t *se, ST_program_t *prog) {
+    ST_propagate_struct_generics(se->arena, &prog->decls);
     ST_forrange(0, prog->decls.count) {
         ST_decl_t *d = prog->decls.items[i];
         if (!d)

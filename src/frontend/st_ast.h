@@ -535,6 +535,8 @@ ST_stmt_t *ST_stmt_new(ST_arena_t *a, ST_stmt_kind_t kind, u32 line, u32 col);
 ST_decl_t *ST_decl_new(ST_arena_t *a, ST_decl_kind_t kind, u32 line, u32 col);
 ST_tyexpr_t *ST_tyexpr_new(ST_arena_t *a, ST_tyexpr_kind_t kind, u32 line, u32 col);
 
+void ST_propagate_struct_generics(ST_arena_t *arena, ST_decls_t *decls);
+
 void ST_dump_program(FILE *out, ST_program_t *prog);
 void ST_dump_decl(FILE *out, ST_decl_t *d, u32 depth);
 void ST_dump_stmt(FILE *out, ST_stmt_t *s, u32 depth);

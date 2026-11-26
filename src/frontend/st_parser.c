@@ -312,17 +312,17 @@ static ST_tyexpr_t *ST_parse_type(ST_parser_t *p) {
         te->inner = ST_parse_type(p);
         return te->inner ? te : NULL;
     }
-    b8 is_clo = ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "closure") &&
+    // 'closure' is not a type a program can write: a 'fn(..)' is turned into a closure by the
+    // compiler where it has to hold captures. Spelled out, it is just an unknown type.
+    if (ST_tok_is_ident(t) && ST_string_eq_cstr(t->text, "closure") &&
         (ST_tok_is_symbol(ST_peek2(p), "(") ||
-         (ST_tok_is_symbol(ST_peek2(p), "&") && ST_tok_is_symbol(ST_tok_at(p, p->pos + 2), "(")));
-    if (ST_tok_is_kw(t, ST_kfn) || is_clo) {
+         (ST_tok_is_symbol(ST_peek2(p), "&") && ST_tok_is_symbol(ST_tok_at(p, p->pos + 2), "(")))) {
+        ST_perr_tok(p, t, "unknown type 'closure'");
+        return NULL;
+    }
+    if (ST_tok_is_kw(t, ST_kfn)) {
         p->pos++;
         ST_tyexpr_t *te = ST_tyexpr_new(p->arena, ST_TE_FN, t->line, t->col);
-        te->fn_is_closure = is_clo;
-        if (is_clo && ST_at_symbol(p, "&")) {
-            te->fn_closure_ref = 1;
-            p->pos++;
-        }
         if (!ST_expect_sym(p, "("))
             return NULL;
         while (!ST_at_symbol(p, ")") && p->pos < p->n_tokens) {
@@ -3456,6 +3456,7 @@ b8 ST_parse(ST_arena_t *arena, ST_tokens_t tokens, ST_string_t src, ST_string_t 
     }
     ST_forrange(0, p->nested_fns.count)
         ST_da_append_arena(arena, &out->decls, p->nested_fns.items[i]);
+    ST_propagate_struct_generics(p->arena, &out->decls);
     ST_impl_finish(p, out, file);
     return p->n_errors == 0;
 }

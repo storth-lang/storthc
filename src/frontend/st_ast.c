@@ -1,5 +1,133 @@
 #include "st_ast.h"
 
+// A struct field written with a generic struct's bare name ('entries: [..]Entry;' where 'Entry'
+// has '$K' and '$V') is shorthand for passing along the generics the two share, as if
+// '[..]Entry($K, $V)' had been written. The enclosing struct takes those generics over, so it is
+// generic in them too. A generic is listed at its first appearance in field order; generics that
+// were declared but are not used in a field keep their place at the front. It runs on the
+// declarations of one file in the parser (so 'impl' blocks see the final list) and once more over
+// the whole program for structs that name a generic struct from another module.
+typedef struct {
+    ST_decl_t **items;
+    u32 count;
+    u32 capacity;
+} ST_gp_decls_t;
+
+static ST_strings_t *ST_gp_generics(ST_decl_t *d) {
+    if (d->kind == ST_DE_STRUCT)
+        return &d->struct_.generics;
+    if (d->kind == ST_DE_TAG_UNION)
+        return &d->tag_union.generics;
+    return NULL;
+}
+
+static ST_decl_t *ST_gp_find(ST_gp_decls_t *g, ST_string_t name) {
+    ST_forrange(0, g->count) {
+        if (ST_string_eq(g->items[i]->name, name))
+            return g->items[i];
+    }
+    return NULL;
+}
+
+static void ST_gp_add(ST_arena_t *arena, ST_strings_t *out, ST_string_t name) {
+    ST_forrange(0, out->count) if (ST_string_eq(out->items[i], name)) return;
+    ST_da_append_arena(arena, out, name);
+}
+
+static void ST_gp_walk(ST_arena_t *arena, ST_gp_decls_t *g, ST_decl_t *self, ST_tyexpr_t *te,
+                       ST_strings_t *order, b8 *bare) {
+    if (!te)
+        return;
+    if (te->kind == ST_TE_NAME) {
+        if (te->is_generic_param) {
+            ST_gp_add(arena, order, te->name);
+            return;
+        }
+        if (te->module_alias.len)
+            return;
+        ST_decl_t *d = ST_gp_find(g, te->name);
+        if (d && d != self) {
+            ST_strings_t *dg = ST_gp_generics(d);
+            ST_forrange(0, dg->count) ST_gp_add(arena, order, dg->items[i]);
+            *bare = 1;
+        }
+        return;
+    }
+    if (te->kind == ST_TE_GENERIC_INST && te->is_generic_param)
+        ST_gp_add(arena, order, te->name);
+    ST_gp_walk(arena, g, self, te->inner, order, bare);
+    ST_forrange(0, te->fn_params.count) ST_gp_walk(arena, g, self, te->fn_params.items[i], order, bare);
+    ST_forrange(0, te->fn_rets.count) ST_gp_walk(arena, g, self, te->fn_rets.items[i], order, bare);
+    ST_forrange(0, te->generic_args.count)
+        ST_gp_walk(arena, g, self, te->generic_args.items[i], order, bare);
+}
+
+static void ST_gp_fields(ST_arena_t *arena, ST_gp_decls_t *g, ST_decl_t *self,
+                         ST_field_specs_t *fields, ST_strings_t *order, b8 *bare) {
+    ST_forrange(0, fields->count) {
+        ST_field_spec_t *f = &fields->items[i];
+        ST_gp_walk(arena, g, self, f->te, order, bare);
+        if (f->anon && f->anon->kind == ST_DE_STRUCT)
+            ST_gp_fields(arena, g, self, &f->anon->struct_.fields, order, bare);
+    }
+}
+
+void ST_propagate_struct_generics(ST_arena_t *arena, ST_decls_t *decls) {
+    ST_gp_decls_t gen = {0};
+    ST_forrange(0, decls->count) {
+        ST_decl_t *d = decls->items[i];
+        ST_strings_t *dg = d ? ST_gp_generics(d) : NULL;
+        if (dg && dg->count)
+            ST_da_append_arena(arena, &gen, d);
+    }
+    if (!gen.count)
+        return;
+    // a struct that picks up generics can make another one generic in turn: repeat until stable
+    for (b8 changed = 1; changed;) {
+        changed = 0;
+        ST_forrange(0, decls->count) {
+            ST_decl_t *d = decls->items[i];
+            if (!d || d->kind != ST_DE_STRUCT)
+                continue;
+            ST_strings_t order = {0};
+            b8 bare = 0;
+            ST_gp_fields(arena, &gen, d, &d->struct_.fields, &order, &bare);
+            if (!bare)
+                continue;
+            b8 grew = 0;
+            for (u32 k = 0; k < order.count; k++) {
+                b8 have = 0;
+                for (u32 j = 0; j < d->struct_.generics.count; j++)
+                    if (ST_string_eq(d->struct_.generics.items[j], order.items[k]))
+                        have = 1;
+                if (!have)
+                    grew = 1;
+            }
+            if (!grew)
+                continue;
+            ST_strings_t merged = {0};
+            for (u32 j = 0; j < d->struct_.generics.count; j++) {
+                b8 used = 0;
+                for (u32 k = 0; k < order.count; k++)
+                    if (ST_string_eq(order.items[k], d->struct_.generics.items[j]))
+                        used = 1;
+                if (!used)
+                    ST_da_append_arena(arena, &merged, d->struct_.generics.items[j]);
+            }
+            for (u32 k = 0; k < order.count; k++)
+                ST_da_append_arena(arena, &merged, order.items[k]);
+            d->struct_.generics = merged;
+            b8 listed = 0;
+            for (u32 k = 0; k < gen.count; k++)
+                if (gen.items[k] == d)
+                    listed = 1;
+            if (!listed)
+                ST_da_append_arena(arena, &gen, d);
+            changed = 1;
+        }
+    }
+}
+
 ST_expr_t *ST_expr_new(ST_arena_t *a, ST_expr_kind_t kind, u32 line, u32 col) {
     ST_expr_t *e = ST_arena_push_zeroed(a, sizeof(*e));
     e->kind = kind;

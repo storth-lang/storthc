@@ -2587,15 +2587,31 @@ static void ST_lower_body(ST_lower_ctx_t *c, ST_stmts_t *body) {
     ST_forrange(0, body->count) ST_lower_stmt(c, body->items[i]);
 }
 
+// 'p += n' / 'p -= n' on a pointer moves it by n elements, the same as 'p + n' / 'p - n'
+static ST_ir_inst_t *ST_lower_compound_value(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
+                                             ST_ir_inst_t *cur, ST_ir_inst_t *rhs) {
+    if (ty && ty->kind == ST_TY_PTR &&
+        (ST_string_eq_cstr(s->assign.op, "+=") || ST_string_eq_cstr(s->assign.op, "-="))) {
+        // widen to i64 first so a narrow or unsigned offset is not negated in its own width
+        ST_ty_t *i64t = c->sema->tys.prim[ST_ti64];
+        if (rhs->ty != i64t)
+            rhs = ST_ir_cast(c->cur, i64t, rhs, s->line, s->col);
+        if (ST_string_eq_cstr(s->assign.op, "-="))
+            rhs = ST_ir_unop(c->cur, ST_IR_NEG, i64t, rhs, s->line, s->col);
+        u32 scale = ty->inner && ty->inner->size ? ty->inner->size : 1;
+        return ST_ir_addr(c->cur, ty, cur, rhs, scale, 0, s->line, s->col);
+    }
+    ST_ir_op_t op = ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col,
+                                         ST_ty_is_float(ty), ty && !ty->is_signed);
+    return ST_ir_binop(c->cur, op, ty, cur, rhs, s->line, s->col);
+}
+
 static void ST_lower_store_assign(ST_lower_ctx_t *c, ST_stmt_t *s, ST_ty_t *ty,
                                   ST_ir_inst_t *addr) {
     ST_ir_inst_t *rhs = ST_lower_expr(c, s->assign.rhs);
     if (!ST_string_eq_cstr(s->assign.op, "=")) {
         ST_ir_inst_t *cur = ST_ir_load(c->cur, ty, addr, s->line, s->col);
-        ST_ir_op_t op =
-            ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col, ST_ty_is_float(ty),
-                                 ty && !ty->is_signed);
-        rhs = ST_ir_binop(c->cur, op, ty, cur, rhs, s->line, s->col);
+        rhs = ST_lower_compound_value(c, s, ty, cur, rhs);
     }
     ST_ir_store(c->cur, ty, addr, rhs, s->line, s->col);
 }
@@ -3407,10 +3423,7 @@ static void ST_lower_stmt_impl(ST_lower_ctx_t *c, ST_stmt_t *s) {
             ST_ir_inst_t *rhs = ST_lower_expr(c, s->assign.rhs);
             if (!ST_string_eq_cstr(s->assign.op, "=")) {
                 ST_ir_inst_t *cur = ST_ir_read_var(c->cur, bind->key, lhs->ty);
-                ST_ir_op_t op = ST_lower_compound_op(&c->diag, s->assign.op, s->line, s->col,
-                                                     ST_ty_is_float(lhs->ty),
-                                                     lhs->ty && !lhs->ty->is_signed);
-                rhs = ST_ir_binop(c->cur, op, lhs->ty, cur, rhs, s->line, s->col);
+                rhs = ST_lower_compound_value(c, s, lhs->ty, cur, rhs);
             }
             ST_ir_write_var(c->cur, bind->key, rhs);
             break;
